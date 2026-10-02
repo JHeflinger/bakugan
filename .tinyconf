@@ -1,0 +1,4 @@
+PROJECT src
+MAIN main.cpp
+MODULE imgui https://github.com/JHeflinger/minis.git imgui
+COMPILER g++
