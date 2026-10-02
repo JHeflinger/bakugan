@@ -1,0 +1,1 @@
+./.tools/tiny -f -r
