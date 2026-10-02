@@ -7,8 +7,16 @@
 #else
   #include <GL/gl.h>
 #endif
+#include <openvdb/openvdb.h>
+#include <iostream>
 
 int main() {
+    openvdb::initialize();
+    auto grid = openvdb::FloatGrid::create(0.0f);
+    grid->setTransform(openvdb::math::Transform::createLinearTransform(0.1));
+    auto acc = grid->getAccessor();
+    acc.setValue(openvdb::Coord(1, 2, 3), 5.0f);
+    std::cout << acc.getValue(openvdb::Coord(1, 2, 3)) << "\n";
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
