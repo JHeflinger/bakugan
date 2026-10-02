@@ -1,0 +1,49 @@
+name: Build and Test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Pin to a tag or commit of JHeflinger/tiny for reproducible builds
+  TINY_REF: main
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux,   os: ubuntu-latest,  platform: linux }
+          - { name: macOS,   os: macos-latest,   platform: macos }
+          - { name: Windows, os: windows-latest, platform: windows }
+    defaults:
+      run:
+        shell: ${{ matrix.platform == 'windows' && 'msys2 {0}' || 'bash' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (MinGW64)
+        if: matrix.platform == 'windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+
+      - name: Install dependencies
+        run: bash scripts/${{ matrix.platform }}/install-deps.sh
+
+      - name: Build tiny
+        run: bash scripts/get-tiny.sh
+
+      - name: Build project
+        # -f parallel compile, -d prints the final compile command (handy when a platform breaks)
+        run: ./.tools/tiny -f -d
+
+      - name: Test
+        run: ./build/bin.exe --test

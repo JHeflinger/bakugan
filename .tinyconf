@@ -2,9 +2,4 @@ PROJECT src
 MAIN main.cpp
 MODULE imgui https://github.com/JHeflinger/minis.git imgui
 COMPILER g++
-LINK openvdb
-LINK tbb
-LINK Imath
-LINK blosc
-LINK z
-LINK boost_iostreams
+RAW -std=c++17
