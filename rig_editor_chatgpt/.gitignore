@@ -1,0 +1,6 @@
+/build/
+*.user
+*.userprefs
+.DS_Store
+.vscode/
+.idea/
