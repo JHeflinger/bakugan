@@ -1,0 +1,26 @@
+@startuml Software Architecture
+
+package "UI System" <<Rectangle>> {
+    class Bullshit {
+        BULLLLSHIT
+    }
+    class Bullpiss {
+        BULLLLPISS
+    }
+}
+
+package "Core" <<Rectangle>> {
+    class TODOLATER {
+
+    }
+}
+
+package "Utilities" <<Rectangle>> {
+    class TODOLATER {
+
+    }
+}
+
+skinparam SequenceMessageAlign center
+"Bullshit"-d->"Bullpiss":This to That
+@enduml

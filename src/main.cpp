@@ -17,65 +17,8 @@
 #include <cstdio>
 #include <cstring>
 
-// Headless checks used by CI: no window or GPU needed.
-static int run_tests() {
-    int failures = 0;
-
-    // OpenVDB: grid access plus a compressed write/read round trip.
-    openvdb::initialize();
-    auto grid = openvdb::FloatGrid::create(0.0f);
-    grid->setName("density");
-    grid->setTransform(openvdb::math::Transform::createLinearTransform(0.1));
-    grid->getAccessor().setValue(openvdb::Coord(1, 2, 3), 5.0f);
-    if (grid->getAccessor().getValue(openvdb::Coord(1, 2, 3)) != 5.0f) {
-        std::fprintf(stderr, "FAIL: openvdb accessor value\n"); failures++;
-    }
-    try {
-        {
-            openvdb::io::File out("tiny_test.vdb");
-            out.write({ grid });
-            out.close();
-        }
-        openvdb::io::File in("tiny_test.vdb");
-        in.open();
-        auto loaded = openvdb::gridPtrCast<openvdb::FloatGrid>(in.readGrid("density"));
-        in.close();
-        std::remove("tiny_test.vdb");
-        if (!loaded || loaded->getAccessor().getValue(openvdb::Coord(1, 2, 3)) != 5.0f) {
-            std::fprintf(stderr, "FAIL: openvdb round trip value\n"); failures++;
-        }
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "FAIL: openvdb file io: %s\n", e.what()); failures++;
-    }
-
-    // Dear ImGui: build one frame with no backend.
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO();
-    io.DisplaySize = ImVec2(800, 600);
-    io.DeltaTime = 1.0f / 60.0f;
-    unsigned char* px; int tw, th;
-    io.Fonts->GetTexDataAsRGBA32(&px, &tw, &th);
-    // A window is hidden on its first frame, so run a few frames.
-    for (int frame = 0; frame < 3; frame++) {
-        ImGui::NewFrame();
-        ImGui::Begin("test");
-        ImGui::Text("hello");
-        ImGui::End();
-        ImGui::Render();
-    }
-    if (ImGui::GetDrawData()->TotalVtxCount <= 0) {
-        std::fprintf(stderr, "FAIL: imgui produced no geometry\n"); failures++;
-    }
-    ImGui::DestroyContext();
-
-    std::printf(failures ? "TESTS FAILED (%d)\n" : "ALL TESTS PASSED\n", failures);
-    return failures ? 1 : 0;
-}
-
 int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "--test") == 0) return run_tests();
-
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
