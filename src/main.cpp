@@ -18,7 +18,6 @@
 #include <cstring>
 
 int main(int argc, char** argv) {
-    if (argc > 1 && std::strcmp(argv[1], "--test") == 0) return run_tests();
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
