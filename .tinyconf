@@ -1,5 +1,7 @@
 PROJECT src
 MAIN main.cpp
 MODULE imgui https://github.com/JHeflinger/minis.git imgui
+MODULE imguizmo https://github.com/JHeflinger/minis.git imguizmo
+MODULE rlimgui https://github.com/JHeflinger/minis.git rlimgui
 COMPILER g++
 RAW -std=c++17
