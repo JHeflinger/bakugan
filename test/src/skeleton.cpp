@@ -4,6 +4,7 @@
 
 int Skeleton::AddJoint(int parent, Vector3 worldPos, const std::string& jointName) {
     Joint j;
+    j.id = nextId++;
     j.parent = parent;
     j.offset = WorldToLocalOffset(parent, worldPos);
     j.name = jointName.empty() ? "joint_" + std::to_string(joints.size()) : jointName;
@@ -48,6 +49,7 @@ int Skeleton::SplitBone(int child, int segments) {
         // New joint goes right before `child` (parents must precede children), with no
         // rotation of its own, so the original child's world transform is unchanged.
         Joint j;
+        j.id = nextId++;
         j.parent = parent;
         j.offset = WorldToLocalOffset(parent, Vector3Lerp(a, b, (float)s / segments));
         char suffix[16];
@@ -86,6 +88,49 @@ Vector3 Skeleton::WorldToLocalOffset(int parent, Vector3 worldPos) const {
 
 void Skeleton::ResetPose() {
     for (Joint& j : joints) j.rotation = QuaternionIdentity();
+}
+
+float SolveIK(Skeleton& s, int effector, Vector3 target, int chainLength, int iterations) {
+    if (effector <= 0 || effector >= (int)s.joints.size()) return 0.0f;
+    std::vector<int> chain;   // nearest ancestor first
+    for (int j = s.joints[effector].parent; j >= 0; j = s.joints[j].parent) {
+        if (chainLength > 0 && (int)chain.size() >= chainLength) break;
+        chain.push_back(j);
+    }
+
+    float dist = 0.0f;
+    for (int it = 0; it < iterations; it++) {
+        for (int j : chain) {
+            // Rotate joint j so the direction (j -> effector) turns toward (j -> target).
+            std::vector<Matrix> world = s.WorldTransforms();
+            Vector3 pj = MatrixPosition(world[j]), pe = MatrixPosition(world[effector]);
+            Vector3 toEnd = Vector3Subtract(pe, pj), toTarget = Vector3Subtract(target, pj);
+            if (Vector3Length(toEnd) < 1e-6f || Vector3Length(toTarget) < 1e-6f) continue;
+            Quaternion delta = QuaternionFromVector3ToVector3(Vector3Normalize(toEnd), Vector3Normalize(toTarget));
+            // world delta -> local: local' = parent^-1 * delta * parent * local
+            Quaternion parentRot = QuaternionFromMatrix(s.ParentWorld(j, world));
+            Quaternion localDelta = QuaternionMultiply(QuaternionInvert(parentRot), QuaternionMultiply(delta, parentRot));
+            Joint& jt = s.joints[j];
+            jt.rotation = ClampBallJoint(QuaternionMultiply(localDelta, jt.rotation), jt.swingLimit, jt.twistLimit);
+        }
+        dist = Vector3Distance(MatrixPosition(s.WorldTransforms()[effector]), target);
+        if (dist < 1e-4f) break;
+    }
+    return dist;
+}
+
+bool SameSkeleton(const Skeleton& a, const Skeleton& b) {
+    if (a.joints.size() != b.joints.size() || a.visible != b.visible || a.name != b.name ||
+        a.color.r != b.color.r || a.color.g != b.color.g || a.color.b != b.color.b)
+        return false;
+    for (size_t i = 0; i < a.joints.size(); i++) {
+        const Joint &x = a.joints[i], &y = b.joints[i];
+        if (x.id != y.id || x.name != y.name || x.parent != y.parent ||
+            !Vector3Equals(x.offset, y.offset) || !QuaternionEquals(x.rotation, y.rotation) ||
+            x.swingLimit != y.swingLimit || x.twistLimit != y.twistLimit)
+            return false;
+    }
+    return true;
 }
 
 Quaternion ClampBallJoint(Quaternion q, float swingLimitDeg, float twistLimitDeg) {

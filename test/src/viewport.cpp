@@ -12,6 +12,7 @@ Viewport::Viewport(std::string t, bool editable) : title(std::move(t)), rigEdita
     skeleton.name = "Skeleton";
     ResetSkeleton();
     xrayModel = true;   // see-through by default, so the armature inside is visible
+    if (!editable) selJoint = -1;
 }
 
 void Viewport::Unload() {
@@ -81,7 +82,7 @@ void Viewport::SetModel(Model m, const std::string& name, Shader lit) {
     bounds = { Vector3Add(Vector3Scale(b.min, modelScale), modelOffset),
                Vector3Add(Vector3Scale(b.max, modelScale), modelOffset) };
     FrameAll();
-    if (skeleton.joints.size() == 1) ResetSkeleton();   // nothing built yet: re-centre the root
+    if (rigEditable && skeleton.joints.size() == 1) ResetSkeleton();   // nothing built yet: re-centre the root
 }
 
 void Viewport::ClearModel() {
@@ -245,16 +246,56 @@ Vector3 Viewport::PlacementPoint(Ray ray) {
     return Vector3Add(ray.position, Vector3Scale(ray.direction, t));
 }
 
-int Viewport::PickJoint(Ray ray) const {
-    if (!skeleton.visible) return -1;
+int Viewport::PickJoint(Ray ray, const Skeleton& s, Matrix place) const {
+    if (!s.visible) return -1;
     float best = FLT_MAX, r = JointRadius() * 1.6f;
     int hit = -1;
-    std::vector<Matrix> world = skeleton.WorldTransforms();
+    std::vector<Matrix> world = s.WorldTransforms();
     for (int i = 0; i < (int)world.size(); i++) {
-        RayCollision c = GetRayCollisionSphere(ray, MatrixPosition(world[i]), r);
+        RayCollision c = GetRayCollisionSphere(ray, MatrixPosition(MatrixMultiply(world[i], place)), r);
         if (c.hit && c.distance < best) { best = c.distance; hit = i; }
     }
     return hit;
+}
+
+// ---------------------------------------------------------------- pose (right panel)
+
+Skeleton Viewport::PosedSkeleton() const {
+    Skeleton s = mirrorOf ? mirrorOf->skeleton : Skeleton{};
+    for (Joint& j : s.joints) {
+        auto it = poseRot.find(j.id);
+        if (it != poseRot.end()) j.rotation = it->second;
+    }
+    if (!s.joints.empty()) s.joints[0].offset = Vector3Add(s.joints[0].offset, poseRootOffset);
+    return s;
+}
+
+void Viewport::ResetPose() {
+    poseRot.clear();
+    poseRootOffset = { 0, 0, 0 };
+}
+
+// m: the gizmo's new matrix for the selected joint, already in armature space.
+void Viewport::ApplyPoseGizmo(const Skeleton& posed, Matrix m) {
+    std::vector<Matrix> world = posed.WorldTransforms();
+    if (gizmoOp == GizmoOp::Translate) {
+        if (selJoint == 0) {   // the root carries the whole armature
+            poseRootOffset = Vector3Add(poseRootOffset, Vector3Subtract(MatrixPosition(m), MatrixPosition(world[0])));
+            return;
+        }
+        // IK: bend the chain toward where the joint was dragged; bones keep their length
+        Skeleton solved = posed;
+        SolveIK(solved, selJoint, MatrixPosition(m), ikChain);
+        for (size_t i = 0; i < solved.joints.size(); i++)
+            if (!QuaternionEquals(solved.joints[i].rotation, posed.joints[i].rotation))
+                poseRot[solved.joints[i].id] = solved.joints[i].rotation;
+    } else {
+        Quaternion worldRot = QuaternionNormalize(QuaternionFromMatrix(m));
+        Quaternion parentRot = QuaternionFromMatrix(posed.ParentWorld(selJoint, world));
+        const Joint& j = posed.joints[selJoint];
+        poseRot[j.id] = ClampBallJoint(QuaternionMultiply(QuaternionInvert(parentRot), worldRot),
+                                       j.swingLimit, j.twistLimit);
+    }
 }
 
 // ---------------------------------------------------------------- gizmo
@@ -274,8 +315,14 @@ static Matrix FromFloat16(const float* f) {
 
 // Returns true while the gizmo is hovered or being dragged (so clicks don't fall through).
 bool Viewport::DrawGizmo(ImVec2 pos, float w, float h) {
-    if (!rigEditable || !skeleton.visible || selJoint < 0 || selJoint >= (int)skeleton.joints.size())
-        return false;
+    // Left panel edits its skeleton; the right panel poses the mirrored armature.
+    bool posing = !rigEditable && mirrorOf && showMirror;
+    if (!rigEditable && !posing) return false;
+    Skeleton posed;
+    if (posing) posed = PosedSkeleton();
+    const Skeleton& sk = posing ? posed : skeleton;
+    Matrix place = posing ? MirrorPlacement() : MatrixIdentity();
+    if (!sk.visible || selJoint < 0 || selJoint >= (int)sk.joints.size()) return false;
 
     float view[16], proj[16], xf[16];
     ToFloat16(GetCameraMatrix(camera), view);
@@ -283,17 +330,22 @@ bool Viewport::DrawGizmo(ImVec2 pos, float w, float h) {
     float top = camera.fovy * 0.5f, aspect = w / h;
     ToFloat16(ortho ? MatrixOrtho(-top * aspect, top * aspect, -top, top, RL_CULL_DISTANCE_NEAR, RL_CULL_DISTANCE_FAR)
                     : MatrixPerspective(camera.fovy * DEG2RAD, aspect, RL_CULL_DISTANCE_NEAR, RL_CULL_DISTANCE_FAR), proj);
-    std::vector<Matrix> world = skeleton.WorldTransforms();
-    ToFloat16(world[selJoint], xf);
+    std::vector<Matrix> world = sk.WorldTransforms();
+    ToFloat16(MatrixMultiply(world[selJoint], place), xf);
 
     ImGuizmo::SetOrthographic(ortho);
     ImGuizmo::SetGizmoSizeClipSpace(0.22f);
     ImGuizmo::SetDrawlist();
     ImGuizmo::SetRect(pos.x, pos.y, w, h);
     ImGuizmo::OPERATION op = gizmoOp == GizmoOp::Translate ? ImGuizmo::TRANSLATE : ImGuizmo::ROTATE;
+    // ImGuizmo's drag state is global: without a per-viewport ID, dragging the gizmo in one
+    // panel would also drive the gizmo drawn in the other.
+    ImGuizmo::PushID(this);
     if (ImGuizmo::Manipulate(view, proj, op, gizmoLocal ? ImGuizmo::LOCAL : ImGuizmo::WORLD, xf)) {
-        Matrix m = FromFloat16(xf);
-        if (gizmoOp == GizmoOp::Translate) {
+        Matrix m = MatrixMultiply(FromFloat16(xf), MatrixInvert(place));   // back to armature space
+        if (posing) {
+            ApplyPoseGizmo(posed, m);
+        } else if (gizmoOp == GizmoOp::Translate) {
             MoveJoint(selJoint, MatrixPosition(m));
         } else {
             // world rotation = parent * local  =>  local = parent^-1 * world
@@ -304,7 +356,9 @@ bool Viewport::DrawGizmo(ImVec2 pos, float w, float h) {
                                         j.swingLimit, j.twistLimit);
         }
     }
-    return ImGuizmo::IsOver() || ImGuizmo::IsUsing();
+    bool busy = ImGuizmo::IsOver() || ImGuizmo::IsUsing();
+    ImGuizmo::PopID();
+    return busy;
 }
 
 // ---------------------------------------------------------------- input
@@ -339,24 +393,25 @@ void Viewport::HandleInput(bool hovered, bool active, Vector2 local, bool gizmoB
         if (ImGui::IsKeyPressed(ImGuiKey_3) || ImGui::IsKeyPressed(ImGuiKey_Keypad3)) SnapView(0, opposite);
         if (ImGui::IsKeyPressed(ImGuiKey_7) || ImGui::IsKeyPressed(ImGuiKey_Keypad7)) SnapView(1, opposite);
         if (ImGui::IsKeyPressed(ImGuiKey_5) || ImGui::IsKeyPressed(ImGuiKey_Keypad5)) { ortho = !ortho; autoOrtho = false; }
-        if (rigEditable) {
+        if (rigEditable || mirrorOf) {
             if (ImGui::IsKeyPressed(ImGuiKey_W)) gizmoOp = GizmoOp::Translate;
             if (ImGui::IsKeyPressed(ImGuiKey_E)) gizmoOp = GizmoOp::Rotate;
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) selJoint = -1;
+        }
+        if (rigEditable && !(io.KeyCtrl || io.KeySuper)) {
             if (ImGui::IsKeyPressed(ImGuiKey_C)) AddChildBone(selJoint);
             if (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace))
                 DeleteSelectedJoint();
-            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) selJoint = -1;
         }
     }
 
-    if (!rigEditable || gizmoBusy) return;
-    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !io.KeyAlt) {
-        Ray ray = MouseRay(local);
-        if (io.KeyCtrl || io.KeySuper) {
-            AddChildBoneAt(selJoint, PlacementPoint(ray));   // Ctrl/Cmd+click: new child bone there
-        } else {
-            selJoint = PickJoint(ray);
-        }
+    if (gizmoBusy || !hovered || !ImGui::IsMouseClicked(ImGuiMouseButton_Left) || io.KeyAlt) return;
+    Ray ray = MouseRay(local);
+    if (rigEditable) {
+        if (io.KeyCtrl || io.KeySuper) AddChildBoneAt(selJoint, PlacementPoint(ray));   // new child bone there
+        else selJoint = PickJoint(ray, skeleton, MatrixIdentity());
+    } else if (mirrorOf && showMirror) {
+        selJoint = PickJoint(ray, PosedSkeleton(), MirrorPlacement());
     }
 }
 
@@ -374,14 +429,17 @@ void Viewport::DrawToolbar() {
         ImGui::SetItemTooltip("When moving a joint, carry its children along.\n"
                               "Off: children stay put and only the connected bones change.");
     } else if (mirrorOf) {
-        ImGui::Checkbox("Show armature", &showMirror);
-        ImGui::SetItemTooltip("Live view of the armature being edited in the left panel");
+        if (ImGui::RadioButton("Move/IK (W)", gizmoOp == GizmoOp::Translate)) gizmoOp = GizmoOp::Translate;
+        ImGui::SetItemTooltip("Drag a joint: inverse kinematics bends its parents to follow.\n"
+                              "Bones keep their length. Dragging the root moves the whole armature.");
         ImGui::SameLine();
-        ImGui::BeginDisabled(!showMirror);
-        ImGui::Checkbox("Fit to this model", &fitMirror);
-        ImGui::SetItemTooltip("Scale and place the armature by this model's size.\n"
-                              "Off: same world coordinates as the left panel.");
-        ImGui::EndDisabled();
+        if (ImGui::RadioButton("Rotate (E)", gizmoOp == GizmoOp::Rotate)) gizmoOp = GizmoOp::Rotate;
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(60);
+        ImGui::SliderInt("IK chain", &ikChain, 0, 10, ikChain == 0 ? "root" : "%d");
+        ImGui::SetItemTooltip("How many parent joints IK may bend (root = all the way up)");
+        ImGui::SameLine();
+        if (ImGui::Button("Reset pose")) ResetPose();
     }
     if (ImGui::Button("Frame (F)")) FrameAll();
     ImGui::SameLine();
@@ -402,6 +460,13 @@ void Viewport::DrawToolbar() {
         ImGui::Checkbox("Wireframe", &wireframe);
         ImGui::Checkbox("Grid", &showGrid);
         ImGui::Checkbox("Draw bones on top of the model", &xraySkeleton);
+        if (mirrorOf) {
+            ImGui::Checkbox("Show armature", &showMirror);
+            ImGui::Checkbox("Fit armature to this model", &fitMirror);
+            ImGui::SetItemTooltip("Scale and place the armature by this model's size.\n"
+                                  "Off: same world coordinates as the left panel.");
+        }
+        if (!rigEditable) ImGui::Checkbox("Gizmo in local axes", &gizmoLocal);
         if (hasModel && ImGui::Button("Clear model")) { ClearModel(); ImGui::CloseCurrentPopup(); }
         ImGui::EndPopup();
     }
@@ -419,6 +484,7 @@ void Viewport::DrawPanel() {
         }
     }
     UpdateCamera();
+    if (mirrorOf && selJoint >= (int)mirrorOf->skeleton.joints.size()) selJoint = -1;
     DrawToolbar();
 
     ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -449,8 +515,8 @@ void Viewport::DrawPanel() {
         dl->AddText(ImVec2(pos.x + 8, pos.y + 6), dim, modelName.c_str());
     }
     const char* help = rigEditable
-        ? "C: add child  Ctrl+click: add here  Del: delete  1/3/7: views"
-        : "Reference view: armature mirrors the left panel live";
+        ? "C: add child  Ctrl+click: add here  Del: delete  Cmd/Ctrl+Z: undo"
+        : "Drag joint: IK pose (bones keep length)  E: rotate  Cmd/Ctrl+Z: undo";
     dl->AddText(ImVec2(pos.x + 8, pos.y + h - 40), dim, help);
     dl->AddText(ImVec2(pos.x + 8, pos.y + h - 22), dim,
                 "RMB/Alt+drag: orbit  MMB/Shift+RMB: pan  Wheel: zoom");
@@ -464,7 +530,7 @@ void Viewport::DrawPanel() {
     ImGui::Dummy(ImVec2((float)w, (float)h));
     bool hovered = ImGui::IsWindowHovered() &&
                    ImGui::IsMouseHoveringRect(pos, ImVec2(pos.x + w, pos.y + h));
-    gizmoBusy |= DrawNavGizmo(pos, (float)w, hovered && !ImGuizmo::IsUsing());
+    gizmoBusy |= DrawNavGizmo(pos, (float)w, hovered && !ImGuizmo::IsUsingAny());
     for (int b = 0; b < 3; b++)
         if (hovered && ImGui::IsMouseClicked(b) && !(b == 0 && gizmoBusy)) mouseCaptured = true;
     if (!ImGui::IsMouseDown(0) && !ImGui::IsMouseDown(1) && !ImGui::IsMouseDown(2)) mouseCaptured = false;
@@ -557,7 +623,8 @@ Matrix Viewport::MirrorPlacement() const {
 void Viewport::DrawSkeleton(const Skeleton& s, int sel, Matrix place, bool showLimits) {
     if (!s.visible) return;
     float r = JointRadius();
-    std::vector<Matrix> world = s.WorldTransforms();
+    std::vector<Matrix> rest = s.WorldTransforms();   // armature space (no scale)
+    std::vector<Matrix> world = rest;
     for (Matrix& m : world) m = MatrixMultiply(m, place);
     Color bone = ColorAlpha(s.color, 0.85f);
     for (int i = 0; i < (int)s.joints.size(); i++) {
@@ -579,7 +646,7 @@ void Viewport::DrawSkeleton(const Skeleton& s, int sel, Matrix place, bool showL
     const Joint& j = s.joints[sel];
     if (j.swingLimit >= 179.0f) return;
     Vector3 pos = MatrixPosition(world[sel]);
-    Quaternion parentRot = QuaternionFromMatrix(s.ParentWorld(sel, world));
+    Quaternion parentRot = QuaternionFromMatrix(s.ParentWorld(sel, rest));
     float len = r * 7.0f, sw = j.swingLimit * DEG2RAD;
     const int N = 32;
     Vector3 prev = {};
@@ -627,7 +694,7 @@ void Viewport::Render(Shader lit, int viewPosLoc) {
         rlDrawRenderBatchActive();
         if (xraySkeleton) rlDisableDepthTest();
         if (rigEditable) DrawSkeleton(skeleton, selJoint, MatrixIdentity(), true);
-        else DrawSkeleton(*sk, mirrorOf->selJoint, MirrorPlacement(), false);
+        else DrawSkeleton(PosedSkeleton(), selJoint, MirrorPlacement(), true);
         rlDrawRenderBatchActive();
         rlEnableDepthTest();
     }

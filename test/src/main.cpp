@@ -90,11 +90,97 @@ static bool LoadAsset(const Asset& a, Model* out, std::string* err) {
     return true;
 }
 
+// Everything undo/redo covers: the rig built on the left and the pose made on the right.
+struct EditState {
+    Skeleton skeleton;
+    int leftSel = 0;
+    std::unordered_map<int, Quaternion> pose;
+    Vector3 poseRootOffset = { 0, 0, 0 };
+    int rightSel = -1;
+};
+
+static bool SameEdit(const EditState& a, const EditState& b) {   // selection doesn't count as an edit
+    if (!SameSkeleton(a.skeleton, b.skeleton) || !Vector3Equals(a.poseRootOffset, b.poseRootOffset) ||
+        a.pose.size() != b.pose.size())
+        return false;
+    for (const auto& [id, q] : a.pose) {
+        auto it = b.pose.find(id);
+        if (it == b.pose.end() || !QuaternionEquals(q, it->second)) return false;
+    }
+    return true;
+}
+
 struct App {
     std::vector<Asset> library;
     Viewport left{ "Rig  (edit skeleton)", true };
     Viewport right{ "Reference  (view only)", false };
-    App() { right.mirrorOf = &left; }   // right panel shows the left armature live
+    App() {
+        right.mirrorOf = &left;   // right panel shows the left armature live
+        committed = Capture();
+    }
+
+    // ---- undo / redo
+    // Instead of hooking every edit, each frame compares the state with the last committed one
+    // and records a step when it changed. Nothing is recorded mid-drag or mid-typing, so a
+    // whole gizmo drag or text edit becomes a single step.
+    static constexpr size_t kMaxUndo = 200;
+    std::vector<EditState> undoStack, redoStack;
+    EditState committed;
+
+    EditState Capture() const {
+        return { left.skeleton, left.selJoint, right.poseRot, right.poseRootOffset, right.selJoint };
+    }
+
+    void Restore(const EditState& st) {
+        left.skeleton = st.skeleton;
+        left.selJoint = st.leftSel < (int)st.skeleton.joints.size() ? st.leftSel : 0;
+        right.poseRot = st.pose;
+        right.poseRootOffset = st.poseRootOffset;
+        right.selJoint = st.rightSel < (int)st.skeleton.joints.size() ? st.rightSel : -1;
+    }
+
+    static bool Interacting() {
+        return ImGui::IsAnyItemActive() || ImGuizmo::IsUsingAny() || ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    }
+
+    void TrackHistory() {
+        if (Interacting()) return;
+        EditState cur = Capture();
+        if (SameEdit(cur, committed)) {   // keep the selection current, so undo restores it too
+            committed.leftSel = cur.leftSel;
+            committed.rightSel = cur.rightSel;
+            return;
+        }
+        undoStack.push_back(std::move(committed));
+        if (undoStack.size() > kMaxUndo) undoStack.erase(undoStack.begin());
+        redoStack.clear();
+        committed = std::move(cur);
+    }
+
+    void Undo() {
+        TrackHistory();   // commit anything still pending first
+        if (undoStack.empty() || Interacting()) return;
+        redoStack.push_back(Capture());
+        committed = std::move(undoStack.back());
+        undoStack.pop_back();
+        Restore(committed);
+    }
+
+    void Redo() {
+        TrackHistory();
+        if (redoStack.empty() || Interacting()) return;
+        undoStack.push_back(Capture());
+        committed = std::move(redoStack.back());
+        redoStack.pop_back();
+        Restore(committed);
+    }
+
+    void HandleUndoKeys() {
+        ImGuiIO& io = ImGui::GetIO();
+        if (io.WantTextInput || !(io.KeyCtrl || io.KeySuper)) return;   // text fields have their own undo
+        if (ImGui::IsKeyPressed(ImGuiKey_Z)) { if (io.KeyShift) Redo(); else Undo(); }
+        if (ImGui::IsKeyPressed(ImGuiKey_Y)) Redo();
+    }
     Shader lit = {};
     int viewPosLoc = -1;
     std::string status = "Drag a model file onto either panel to begin.";
@@ -224,6 +310,17 @@ struct App {
 
     void DrawHierarchy() {
         Skeleton& s = left.skeleton;
+        ImGui::SeparatorText("Edit");
+        ImGui::BeginDisabled(undoStack.empty());
+        if (ImGui::Button("Undo")) Undo();
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Cmd/Ctrl+Z  (%d steps)", (int)undoStack.size());
+        ImGui::SameLine();
+        ImGui::BeginDisabled(redoStack.empty());
+        if (ImGui::Button("Redo")) Redo();
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Cmd/Ctrl+Shift+Z or Ctrl+Y  (%d steps)", (int)redoStack.size());
+
         ImGui::SeparatorText("Skeleton hierarchy (left panel)");
         ImGui::Checkbox("##vis", &s.visible);
         ImGui::SetItemTooltip("Show skeleton");
@@ -346,6 +443,9 @@ struct App {
         DrawSidebar(sidebar, H);
         DrawViewportWindow(left, ImVec2(sidebar, 0), ImVec2(half, H), true);
         DrawViewportWindow(right, ImVec2(sidebar + half, 0), ImVec2(W - sidebar - half, H), false);
+
+        HandleUndoKeys();
+        TrackHistory();
 
         left.Render(lit, viewPosLoc);
         right.Render(lit, viewPosLoc);

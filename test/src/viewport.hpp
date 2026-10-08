@@ -2,6 +2,7 @@
 #include "skeleton.hpp"
 #include "imgui.h"
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 enum class GizmoOp { Translate, Rotate };
@@ -51,6 +52,14 @@ struct Viewport {
     bool fitMirror = true;                        // scale/place it by the two models' bounds
     Matrix MirrorPlacement() const;               // mirrored armature space -> this viewport's
 
+    // Pose of the mirrored armature (right panel). Bone lengths/structure always come live from
+    // the source; these override joint rotations (by joint id) and move the root.
+    std::unordered_map<int, Quaternion> poseRot;
+    Vector3 poseRootOffset = { 0, 0, 0 };
+    int ikChain = 0;                              // ancestors IK may rotate (0 = up to the root)
+    Skeleton PosedSkeleton() const;
+    void ResetPose();
+
     Viewport(std::string t, bool editable);
     void Unload();
 
@@ -88,7 +97,8 @@ private:
     Ray MouseRay(Vector2 local) const;
     bool RayModel(Ray ray, RayCollision* out) const;
     Vector3 PlacementPoint(Ray ray);
-    int PickJoint(Ray ray) const;
+    int PickJoint(Ray ray, const Skeleton& s, Matrix place) const;
+    void ApplyPoseGizmo(const Skeleton& posed, Matrix m);
     bool DrawGizmo(ImVec2 pos, float w, float h);
     void HandleInput(bool hovered, bool active, Vector2 local, bool gizmoBusy);
     void DrawToolbar();
