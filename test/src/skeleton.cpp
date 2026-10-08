@@ -1,5 +1,6 @@
 #include "skeleton.hpp"
 #include <cmath>
+#include <cstdio>
 
 int Skeleton::AddJoint(int parent, Vector3 worldPos, const std::string& jointName) {
     Joint j;
@@ -27,6 +28,37 @@ void Skeleton::RemoveJoint(int index) {
     for (Joint& j : kept)
         if (j.parent >= 0) j.parent = remap[j.parent];
     joints = std::move(kept);
+}
+
+void Skeleton::InsertJoint(int index, const Joint& j) {
+    for (Joint& k : joints)
+        if (k.parent >= index) k.parent++;
+    joints.insert(joints.begin() + index, j);
+}
+
+int Skeleton::SplitBone(int child, int segments) {
+    if (child <= 0 || child >= (int)joints.size() || segments < 2) return child;
+    int parent = joints[child].parent;
+    std::vector<Matrix> world = WorldTransforms();
+    Vector3 a = MatrixPosition(world[parent]), b = MatrixPosition(world[child]);
+    std::string base = joints[child].name;
+    int first = child;
+
+    for (int s = 1; s < segments; s++) {
+        // New joint goes right before `child` (parents must precede children), with no
+        // rotation of its own, so the original child's world transform is unchanged.
+        Joint j;
+        j.parent = parent;
+        j.offset = WorldToLocalOffset(parent, Vector3Lerp(a, b, (float)s / segments));
+        char suffix[16];
+        snprintf(suffix, sizeof(suffix), ".%03d", s);
+        j.name = base + suffix;
+        InsertJoint(child, j);
+        parent = child++;
+        joints[child].parent = parent;
+        joints[child].offset = WorldToLocalOffset(parent, b);
+    }
+    return first;
 }
 
 std::vector<Matrix> Skeleton::WorldTransforms() const {

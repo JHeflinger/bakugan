@@ -4,12 +4,14 @@
 #include <cfloat>
 #include <cmath>
 #include <cstring>
+#include <algorithm>
 #include <map>
 #include <tuple>
 
 Viewport::Viewport(std::string t, bool editable) : title(std::move(t)), rigEditable(editable) {
     skeleton.name = "Skeleton";
     ResetSkeleton();
+    xrayModel = true;   // see-through by default, so the armature inside is visible
 }
 
 void Viewport::Unload() {
@@ -140,6 +142,11 @@ void Viewport::DeleteSelectedJoint() {
     selJoint = parent;
 }
 
+void Viewport::SplitSelectedBone() {
+    if (selJoint <= 0 || selJoint >= (int)skeleton.joints.size()) return;   // the root has no bone
+    selJoint = skeleton.SplitBone(selJoint, splitSegments);
+}
+
 void Viewport::MoveJoint(int joint, Vector3 worldPos) {
     Skeleton& s = skeleton;
     // Unless the whole subtree should follow, pin the direct children in world space
@@ -161,9 +168,44 @@ void Viewport::UpdateCamera() {
     camera.target = focus;
     camera.position = Vector3Add(focus, { distance * cosf(p) * sinf(y), distance * sinf(p),
                                           distance * cosf(p) * cosf(y) });
-    camera.up = { 0, 1, 0 };
-    camera.fovy = 45.0f;
-    camera.projection = CAMERA_PERSPECTIVE;
+    // exact up vector (derivative w.r.t. pitch), so straight top/bottom views work
+    camera.up = { -sinf(p) * sinf(y), cosf(p), -sinf(p) * cosf(y) };
+    camera.projection = ortho ? CAMERA_ORTHOGRAPHIC : CAMERA_PERSPECTIVE;
+    // in ortho, fovy is the visible height: match what perspective shows at the focus point
+    camera.fovy = ortho ? distance * 2.0f * tanf(22.5f * DEG2RAD) : 45.0f;
+}
+
+void Viewport::CameraBasis(Vector3* forward, Vector3* right, Vector3* up) const {
+    *forward = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
+    *right = Vector3Normalize(Vector3CrossProduct(*forward, camera.up));
+    *up = Vector3CrossProduct(*right, *forward);
+}
+
+void Viewport::Orbit(float dx, float dy) {
+    yaw -= dx * 0.4f;
+    pitch = Clamp(pitch + dy * 0.4f, -90.0f, 90.0f);
+    animating = false;
+    if (autoOrtho) { ortho = false; autoOrtho = false; }   // like Blender's auto-perspective
+}
+
+static float WrapDegrees(float a) {
+    a = fmodf(a + 180.0f, 360.0f);
+    return (a < 0 ? a + 360.0f : a) - 180.0f;
+}
+
+void Viewport::SnapView(int axis, bool negative, bool flipIfAligned) {
+    float ty = 0, tp = 0;
+    if (axis == 0) ty = negative ? -90.0f : 90.0f;
+    if (axis == 1) tp = negative ? -90.0f : 90.0f;
+    if (axis == 2) ty = negative ? 180.0f : 0.0f;
+    float curYaw = animating ? targetYaw : yaw, curPitch = animating ? targetPitch : pitch;
+    bool aligned = fabsf(curPitch - tp) < 0.5f && (axis == 1 || fabsf(WrapDegrees(curYaw - ty)) < 0.5f);
+    if (aligned && flipIfAligned) { SnapView(axis, !negative, false); return; }   // view from the other side
+
+    targetYaw = curYaw + WrapDegrees(ty - curYaw);   // take the short way round
+    targetPitch = tp;
+    animating = true;
+    if (!ortho) { ortho = true; autoOrtho = true; }
 }
 
 Ray Viewport::MouseRay(Vector2 local) const {
@@ -237,11 +279,14 @@ bool Viewport::DrawGizmo(ImVec2 pos, float w, float h) {
 
     float view[16], proj[16], xf[16];
     ToFloat16(GetCameraMatrix(camera), view);
-    ToFloat16(MatrixPerspective(camera.fovy * DEG2RAD, w / h, RL_CULL_DISTANCE_NEAR, RL_CULL_DISTANCE_FAR), proj);
+    // must match the projection BeginMode3D uses
+    float top = camera.fovy * 0.5f, aspect = w / h;
+    ToFloat16(ortho ? MatrixOrtho(-top * aspect, top * aspect, -top, top, RL_CULL_DISTANCE_NEAR, RL_CULL_DISTANCE_FAR)
+                    : MatrixPerspective(camera.fovy * DEG2RAD, aspect, RL_CULL_DISTANCE_NEAR, RL_CULL_DISTANCE_FAR), proj);
     std::vector<Matrix> world = skeleton.WorldTransforms();
     ToFloat16(world[selJoint], xf);
 
-    ImGuizmo::SetOrthographic(false);
+    ImGuizmo::SetOrthographic(ortho);
     ImGuizmo::SetGizmoSizeClipSpace(0.22f);
     ImGuizmo::SetDrawlist();
     ImGuizmo::SetRect(pos.x, pos.y, w, h);
@@ -276,12 +321,10 @@ void Viewport::HandleInput(bool hovered, bool active, Vector2 local, bool gizmoB
         bool pan = ImGui::IsMouseDown(ImGuiMouseButton_Middle);
         pan |= ImGui::IsMouseDown(ImGuiMouseButton_Right) && io.KeyShift;
         if (orbit) {
-            yaw -= io.MouseDelta.x * 0.4f;
-            pitch = Clamp(pitch + io.MouseDelta.y * 0.4f, -89.0f, 89.0f);
+            if (io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f) Orbit(io.MouseDelta.x, io.MouseDelta.y);
         } else if (pan) {
-            Vector3 fwd = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
-            Vector3 right = Vector3Normalize(Vector3CrossProduct(fwd, camera.up));
-            Vector3 up = Vector3CrossProduct(right, fwd);
+            Vector3 fwd, right, up;
+            CameraBasis(&fwd, &right, &up);
             float k = distance * 0.0015f;
             focus = Vector3Add(focus, Vector3Scale(right, -io.MouseDelta.x * k));
             focus = Vector3Add(focus, Vector3Scale(up, io.MouseDelta.y * k));
@@ -290,6 +333,12 @@ void Viewport::HandleInput(bool hovered, bool active, Vector2 local, bool gizmoB
 
     if (hovered && !io.WantTextInput) {
         if (ImGui::IsKeyPressed(ImGuiKey_F)) FrameAll();
+        // Blender-style view keys (top row or keypad); Ctrl/Cmd = view from the opposite side
+        bool opposite = io.KeyCtrl || io.KeySuper;
+        if (ImGui::IsKeyPressed(ImGuiKey_1) || ImGui::IsKeyPressed(ImGuiKey_Keypad1)) SnapView(2, opposite);
+        if (ImGui::IsKeyPressed(ImGuiKey_3) || ImGui::IsKeyPressed(ImGuiKey_Keypad3)) SnapView(0, opposite);
+        if (ImGui::IsKeyPressed(ImGuiKey_7) || ImGui::IsKeyPressed(ImGuiKey_Keypad7)) SnapView(1, opposite);
+        if (ImGui::IsKeyPressed(ImGuiKey_5) || ImGui::IsKeyPressed(ImGuiKey_Keypad5)) { ortho = !ortho; autoOrtho = false; }
         if (rigEditable) {
             if (ImGui::IsKeyPressed(ImGuiKey_W)) gizmoOp = GizmoOp::Translate;
             if (ImGui::IsKeyPressed(ImGuiKey_E)) gizmoOp = GizmoOp::Rotate;
@@ -324,25 +373,52 @@ void Viewport::DrawToolbar() {
         ImGui::Checkbox("Move subtree", &moveSubtree);
         ImGui::SetItemTooltip("When moving a joint, carry its children along.\n"
                               "Off: children stay put and only the connected bones change.");
+    } else if (mirrorOf) {
+        ImGui::Checkbox("Show armature", &showMirror);
+        ImGui::SetItemTooltip("Live view of the armature being edited in the left panel");
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!showMirror);
+        ImGui::Checkbox("Fit to this model", &fitMirror);
+        ImGui::SetItemTooltip("Scale and place the armature by this model's size.\n"
+                              "Off: same world coordinates as the left panel.");
+        ImGui::EndDisabled();
     }
     if (ImGui::Button("Frame (F)")) FrameAll();
+    ImGui::SameLine();
+    ImGui::Checkbox("X-ray", &xrayModel);
+    ImGui::SetItemTooltip("See-through model, so you can see the bones inside it");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!xrayModel);
+    ImGui::SetNextItemWidth(70);
+    ImGui::SliderFloat("##xray_alpha", &xrayAlpha, 0.05f, 0.9f, "%.2f");
+    ImGui::SetItemTooltip("Model opacity in x-ray mode");
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Ortho (5)", &ortho)) autoOrtho = false;
     ImGui::SameLine();
     if (ImGui::Button("View...")) ImGui::OpenPopup("view_opts");
     if (ImGui::BeginPopup("view_opts")) {
         ImGui::Checkbox("Show model", &showModel);
         ImGui::Checkbox("Wireframe", &wireframe);
-        ImGui::SliderFloat("Model opacity", &modelAlpha, 0.1f, 1.0f);
         ImGui::Checkbox("Grid", &showGrid);
-        if (rigEditable) ImGui::Checkbox("Skeleton through model (x-ray)", &xraySkeleton);
+        ImGui::Checkbox("Draw bones on top of the model", &xraySkeleton);
+        if (hasModel && ImGui::Button("Clear model")) { ClearModel(); ImGui::CloseCurrentPopup(); }
         ImGui::EndPopup();
-    }
-    if (hasModel) {
-        ImGui::SameLine();
-        if (ImGui::Button("Clear model")) ClearModel();
     }
 }
 
 void Viewport::DrawPanel() {
+    if (animating) {   // ease toward a snapped view
+        float k = 1.0f - expf(-GetFrameTime() * 14.0f);
+        yaw += (targetYaw - yaw) * k;
+        pitch += (targetPitch - pitch) * k;
+        if (fabsf(targetYaw - yaw) < 0.05f && fabsf(targetPitch - pitch) < 0.05f) {
+            yaw = targetYaw;
+            pitch = targetPitch;
+            animating = false;
+        }
+    }
+    UpdateCamera();
     DrawToolbar();
 
     ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -373,8 +449,8 @@ void Viewport::DrawPanel() {
         dl->AddText(ImVec2(pos.x + 8, pos.y + 6), dim, modelName.c_str());
     }
     const char* help = rigEditable
-        ? "Click: select joint   C: add child bone   Ctrl+click: add child there   Del: delete"
-        : "Reference view";
+        ? "C: add child  Ctrl+click: add here  Del: delete  1/3/7: views"
+        : "Reference view: armature mirrors the left panel live";
     dl->AddText(ImVec2(pos.x + 8, pos.y + h - 40), dim, help);
     dl->AddText(ImVec2(pos.x + 8, pos.y + h - 22), dim,
                 "RMB/Alt+drag: orbit  MMB/Shift+RMB: pan  Wheel: zoom");
@@ -388,6 +464,7 @@ void Viewport::DrawPanel() {
     ImGui::Dummy(ImVec2((float)w, (float)h));
     bool hovered = ImGui::IsWindowHovered() &&
                    ImGui::IsMouseHoveringRect(pos, ImVec2(pos.x + w, pos.y + h));
+    gizmoBusy |= DrawNavGizmo(pos, (float)w, hovered && !ImGuizmo::IsUsing());
     for (int b = 0; b < 3; b++)
         if (hovered && ImGui::IsMouseClicked(b) && !(b == 0 && gizmoBusy)) mouseCaptured = true;
     if (!ImGui::IsMouseDown(0) && !ImGui::IsMouseDown(1) && !ImGui::IsMouseDown(2)) mouseCaptured = false;
@@ -397,13 +474,91 @@ void Viewport::DrawPanel() {
                 { (mouse.x - pos.x) * pixelScale, (mouse.y - pos.y) * pixelScale }, gizmoBusy);
 }
 
+// Blender-style axis widget in the top-right corner: click an axis ball to look along it
+// (click again for the opposite side), drag the widget to orbit. Returns true while it owns the mouse.
+bool Viewport::DrawNavGizmo(ImVec2 pos, float w, bool hovered) {
+    const float R = 40.0f, ball = 10.0f;
+    ImVec2 c(pos.x + w - R - 22, pos.y + R + 22);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImGuiIO& io = ImGui::GetIO();
+
+    Vector3 fwd, right, up;
+    CameraBasis(&fwd, &right, &up);
+    struct Ball { int axis; bool neg; ImVec2 p; float depth; };
+    Ball balls[6];
+    for (int i = 0; i < 6; i++) {
+        Vector3 a = { 0, 0, 0 };
+        (&a.x)[i / 2] = (i % 2) ? -1.0f : 1.0f;
+        balls[i] = { i / 2, (i % 2) == 1,
+                     ImVec2(c.x + Vector3DotProduct(a, right) * R, c.y - Vector3DotProduct(a, up) * R),
+                     Vector3DotProduct(a, fwd) };   // > 0: points away from the viewer
+    }
+    std::sort(balls, balls + 6, [](const Ball& a, const Ball& b) { return a.depth > b.depth; });  // far first
+
+    ImVec2 m = io.MousePos;
+    bool overArea = hovered && hypotf(m.x - c.x, m.y - c.y) < R + ball + 4;
+    int hot = -1;   // front-most ball under the mouse
+    if (overArea && !navDragging)
+        for (int i = 0; i < 6; i++)
+            if (hypotf(m.x - balls[i].p.x, m.y - balls[i].p.y) < ball) hot = i;
+
+    if (overArea || navDragging) dl->AddCircleFilled(c, R + ball + 4, IM_COL32(255, 255, 255, 28), 48);
+    const ImU32 colors[3] = { IM_COL32(232, 72, 85, 255), IM_COL32(135, 200, 60, 255), IM_COL32(64, 132, 232, 255) };
+    const char* names[3] = { "X", "Y", "Z" };
+    for (int i = 0; i < 6; i++) {
+        const Ball& b = balls[i];
+        ImU32 col = colors[b.axis];
+        if (!b.neg) {
+            dl->AddLine(c, b.p, col, 2.5f);
+            dl->AddCircleFilled(b.p, ball, col, 24);
+            if (i == hot) dl->AddCircle(b.p, ball, IM_COL32_WHITE, 24, 2.0f);
+            ImVec2 ts = ImGui::CalcTextSize(names[b.axis]);
+            dl->AddText(ImVec2(b.p.x - ts.x * 0.5f, b.p.y - ts.y * 0.5f), IM_COL32(20, 20, 20, 255), names[b.axis]);
+        } else {
+            dl->AddCircleFilled(b.p, ball, (col & 0x00FFFFFF) | (i == hot ? 0xC0000000 : 0x50000000), 24);
+            dl->AddCircle(b.p, ball, col, 24, 1.5f);
+            if (i == hot) {
+                char label[3] = { '-', names[b.axis][0], 0 };
+                ImVec2 ts = ImGui::CalcTextSize(label);
+                dl->AddText(ImVec2(b.p.x - ts.x * 0.5f, b.p.y - ts.y * 0.5f), IM_COL32(20, 20, 20, 255), label);
+            }
+        }
+    }
+
+    if (overArea && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (hot >= 0) SnapView(balls[hot].axis, balls[hot].neg, true);
+        else navDragging = true;
+    }
+    if (navDragging) {
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            if (io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f) Orbit(io.MouseDelta.x, io.MouseDelta.y);
+        } else {
+            navDragging = false;
+        }
+    }
+    return overArea || navDragging;
+}
+
 // ---------------------------------------------------------------- rendering
 
-void Viewport::DrawSkeleton() {
-    const Skeleton& s = skeleton;
+// Maps the mirrored armature from the source viewport's model space into this one's:
+// the source model's base centre goes to ours, scaled by the ratio of model heights.
+Matrix Viewport::MirrorPlacement() const {
+    if (!mirrorOf || !fitMirror) return MatrixIdentity();
+    const BoundingBox& from = mirrorOf->bounds;
+    float hFrom = from.max.y - from.min.y, hTo = bounds.max.y - bounds.min.y;
+    float scale = hFrom > 1e-6f ? hTo / hFrom : 1.0f;
+    Vector3 a = { (from.min.x + from.max.x) * 0.5f, from.min.y, (from.min.z + from.max.z) * 0.5f };
+    Vector3 b = { (bounds.min.x + bounds.max.x) * 0.5f, bounds.min.y, (bounds.min.z + bounds.max.z) * 0.5f };
+    return MatrixMultiply(MatrixMultiply(MatrixTranslate(-a.x, -a.y, -a.z), MatrixScale(scale, scale, scale)),
+                          MatrixTranslate(b.x, b.y, b.z));
+}
+
+void Viewport::DrawSkeleton(const Skeleton& s, int sel, Matrix place, bool showLimits) {
     if (!s.visible) return;
     float r = JointRadius();
     std::vector<Matrix> world = s.WorldTransforms();
+    for (Matrix& m : world) m = MatrixMultiply(m, place);
     Color bone = ColorAlpha(s.color, 0.85f);
     for (int i = 0; i < (int)s.joints.size(); i++) {
         int p = s.joints[i].parent;
@@ -414,17 +569,17 @@ void Viewport::DrawSkeleton() {
     }
     for (int i = 0; i < (int)s.joints.size(); i++) {
         Vector3 p = MatrixPosition(world[i]);
-        if (i == selJoint) DrawSphereEx(p, r * 1.3f, 10, 10, WHITE);
+        if (i == sel) DrawSphereEx(p, r * 1.3f, 10, 10, WHITE);
         else if (i == 0) DrawSphereEx(p, r * 1.25f, 10, 10, ColorBrightness(s.color, -0.3f));  // root
         else DrawSphereEx(p, r, 10, 10, ColorBrightness(s.color, 0.3f));
     }
 
     // Selected ball joint's swing-limit cone, in the parent's frame.
-    if (selJoint < 0 || selJoint >= (int)s.joints.size()) return;
-    const Joint& j = s.joints[selJoint];
+    if (!showLimits || sel < 0 || sel >= (int)s.joints.size()) return;
+    const Joint& j = s.joints[sel];
     if (j.swingLimit >= 179.0f) return;
-    Vector3 pos = MatrixPosition(world[selJoint]);
-    Quaternion parentRot = QuaternionFromMatrix(s.ParentWorld(selJoint, world));
+    Vector3 pos = MatrixPosition(world[sel]);
+    Quaternion parentRot = QuaternionFromMatrix(s.ParentWorld(sel, world));
     float len = r * 7.0f, sw = j.swingLimit * DEG2RAD;
     const int N = 32;
     Vector3 prev = {};
@@ -447,21 +602,32 @@ void Viewport::Render(Shader lit, int viewPosLoc) {
     BeginMode3D(camera);
 
     if (showGrid) DrawGrid(20, 0.25f);
+    rlDrawRenderBatchActive();   // grid must be drawn before a see-through model blends over it
 
     if (hasModel && showModel) {
         SetShaderValue(lit, viewPosLoc, &camera.position, SHADER_UNIFORM_VEC3);
         model.transform = ModelTransform();
-        Color tint = ColorAlpha(WHITE, modelAlpha);
-        if (modelAlpha < 0.999f) rlDisableDepthMask();
-        if (wireframe) DrawModelWires(model, { 0, 0, 0 }, 1.0f, ColorAlpha(LIGHTGRAY, modelAlpha));
-        else DrawModel(model, { 0, 0, 0 }, 1.0f, tint);
-        rlEnableDepthMask();
+        if (wireframe) {
+            DrawModelWires(model, { 0, 0, 0 }, 1.0f, ColorAlpha(LIGHTGRAY, xrayModel ? xrayAlpha : 1.0f));
+        } else if (xrayModel) {
+            // Depth-only pass first, so only the nearest surface gets blended
+            // (otherwise the inner faces stack up into a muddy mess).
+            rlColorMask(false, false, false, false);
+            DrawModel(model, { 0, 0, 0 }, 1.0f, WHITE);
+            rlColorMask(true, true, true, true);
+            DrawModel(model, { 0, 0, 0 }, 1.0f, ColorAlpha(WHITE, xrayAlpha));
+        } else {
+            DrawModel(model, { 0, 0, 0 }, 1.0f, WHITE);
+        }
     }
 
-    if (rigEditable) {
+    // Our own armature, or (read-only, updated every frame) the one we mirror.
+    const Skeleton* sk = rigEditable ? &skeleton : (mirrorOf && showMirror ? &mirrorOf->skeleton : nullptr);
+    if (sk) {
         rlDrawRenderBatchActive();
         if (xraySkeleton) rlDisableDepthTest();
-        DrawSkeleton();
+        if (rigEditable) DrawSkeleton(skeleton, selJoint, MatrixIdentity(), true);
+        else DrawSkeleton(*sk, mirrorOf->selJoint, MirrorPlacement(), false);
         rlDrawRenderBatchActive();
         rlEnableDepthTest();
     }

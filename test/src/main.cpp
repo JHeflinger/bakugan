@@ -94,6 +94,7 @@ struct App {
     std::vector<Asset> library;
     Viewport left{ "Rig  (edit skeleton)", true };
     Viewport right{ "Reference  (view only)", false };
+    App() { right.mirrorOf = &left; }   // right panel shows the left armature live
     Shader lit = {};
     int viewPosLoc = -1;
     std::string status = "Drag a model file onto either panel to begin.";
@@ -207,6 +208,10 @@ struct App {
         if (ImGui::BeginPopupContextItem()) {
             left.selJoint = index;
             if (ImGui::MenuItem("Add child bone")) left.AddChildBone(index);
+            if (ImGui::MenuItem("Split bone in 2", nullptr, false, index != 0)) {
+                left.splitSegments = 2;
+                left.SplitSelectedBone();
+            }
             if (ImGui::MenuItem("Delete (with children)", nullptr, false, index != 0)) left.DeleteSelectedJoint();
             ImGui::EndPopup();
         }
@@ -299,8 +304,18 @@ struct App {
         if (limits) j.rotation = ClampBallJoint(j.rotation, j.swingLimit, j.twistLimit);
 
         if (ImGui::Button("Reset rotation")) j.rotation = QuaternionIdentity();
-        ImGui::SameLine();
+
+        // Split the bone that ends at this joint (parent -> joint). This and Delete change
+        // the joint array, so they come last (`j` is not used after them).
+        std::string tip = sel == 0 ? "The root has no bone to split"
+                                   : "Insert joints evenly along the bone from '" + s.joints[j.parent].name + "' to this joint";
         ImGui::BeginDisabled(sel == 0);
+        ImGui::SetNextItemWidth(90);
+        ImGui::InputInt("##pieces", &left.splitSegments);
+        left.splitSegments = std::clamp(left.splitSegments, 2, 16);
+        ImGui::SameLine();
+        if (ImGui::Button("Split bone into pieces")) left.SplitSelectedBone();
+        ImGui::SetItemTooltip("%s", tip.c_str());
         if (ImGui::Button("Delete (with children)")) left.DeleteSelectedJoint();
         ImGui::EndDisabled();
         if (sel == 0) ImGui::SetItemTooltip("The root can't be deleted");

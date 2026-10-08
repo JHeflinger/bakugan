@@ -24,6 +24,10 @@ struct Skeleton {
 
     int AddJoint(int parent, Vector3 worldPos, const std::string& name = "");
     void RemoveJoint(int index);                  // removes the joint and its whole subtree
+    void InsertJoint(int index, const Joint& j);  // shifts later joints and fixes parent indices
+    // Splits the bone parent->child into `segments` equal bones by inserting joints along it.
+    // Nothing moves or rotates. Returns the first inserted joint (or child if it can't split).
+    int SplitBone(int child, int segments);
     std::vector<Matrix> WorldTransforms() const;
     Matrix ParentWorld(int index, const std::vector<Matrix>& world) const;
     Vector3 WorldToLocalOffset(int parent, Vector3 worldPos) const;
