@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <map>
 #include <tuple>
+#include <cstdint>
 
 Viewport::Viewport(std::string t, bool editable) : title(std::move(t)), rigEditable(editable) {
     skeleton.name = "Skeleton";

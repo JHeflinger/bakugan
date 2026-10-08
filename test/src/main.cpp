@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <cstdint>
 
 static const char* kLitVS = R"(#version 330
 in vec3 vertexPosition;
