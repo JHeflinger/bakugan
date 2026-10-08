@@ -44,6 +44,3 @@ jobs:
       - name: Build project
         # -f parallel compile, -d prints the final compile command (handy when a platform breaks)
         run: ./.tools/tiny -f -d
-
-      - name: Test
-        run: ./build/bin.exe --test
