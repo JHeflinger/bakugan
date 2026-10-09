@@ -10,12 +10,12 @@ if command -v apt-get >/dev/null 2>&1; then
     $SUDO apt-get update
     $SUDO apt-get install -y --no-install-recommends \
         build-essential git \
-        libglfw3-dev libgl1-mesa-dev \
+        libglfw3-dev libgl1-mesa-dev libglu1-mesa-dev \
         libopenvdb-dev libtbb-dev libimath-dev libboost-all-dev
 elif command -v pacman >/dev/null 2>&1; then
     $SUDO pacman -S --needed --noconfirm \
         base-devel git \
-        glfw mesa \
+        glfw mesa glu \
         openvdb onetbb imath boost-devel
 else
     echo "Unsupported distro: install g++, git, GLFW, OpenGL, OpenVDB, oneTBB and Imath dev packages manually." >&2
