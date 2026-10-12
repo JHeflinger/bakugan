@@ -1,15 +1,15 @@
 #include "viewport.hpp"
 #include "util/utils.hpp"
-#include "rlgl.h"
-#include "ImGuizmo.h"
+#include <ImGuizmo.h>
+#include <algorithm>
+#include <raymath.h>
+#include <cstring>
+#include <cstdint>
+#include <rlgl.h>
 #include <cfloat>
 #include <cmath>
-#include <cstring>
-#include <algorithm>
-#include <map>
 #include <tuple>
-#include <cstdint>
-#include <raymath.h>
+#include <map>
 
 namespace Bakugan {
     Viewport::Viewport(std::string t, bool editable) : m_Title(std::move(t)), m_Editable(editable) {
