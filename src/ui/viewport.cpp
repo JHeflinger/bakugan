@@ -21,6 +21,7 @@ namespace Bakugan {
 
     void Viewport::Unload() {
         if (m_TexWidth > 0) UnloadRenderTexture(m_Target);
+        UnloadOverlapTextures();
         ClearModel();
     }
 
@@ -65,6 +66,8 @@ namespace Bakugan {
         ClearModel();
         m_Model = m;
         m_HasModel = true;
+        m_ModelVersion++;
+        m_UserScale = 1.0f;
         m_ModelName = name;
         for (int i = 0; i < m_Model.materialCount; i++) m_Model.materials[i].shader = lit;
         for (int i = 0; i < m_Model.meshCount; i++) EnsureNormals(m_Model.meshes[i]);
@@ -87,11 +90,18 @@ namespace Bakugan {
         m_HasModel = false;
         m_ModelName.clear();
         m_Bounds = { { -1, 0, -1 }, { 1, 2, 1 } };
+        m_ModelVersion++;
+        m_WorldMesh.reset();
     }
 
     Matrix Viewport::ModelTransform() const {
-        return MatrixMultiply(MatrixScale(m_ModelScale, m_ModelScale, m_ModelScale),
-                              MatrixTranslate(m_ModelOffset.x, m_ModelOffset.y, m_ModelOffset.z));
+        Matrix fit = MatrixMultiply(MatrixScale(m_ModelScale, m_ModelScale, m_ModelScale),
+                                    MatrixTranslate(m_ModelOffset.x, m_ModelOffset.y, m_ModelOffset.z));
+        if (m_UserScale == 1.0f) return fit;
+        Vector3 c = Vector3Scale(Vector3Add(m_Bounds.min, m_Bounds.max), 0.5f);
+        Matrix about = MatrixMultiply(MatrixMultiply(MatrixTranslate(-c.x, -c.y, -c.z), MatrixScale(m_UserScale, m_UserScale, m_UserScale)),
+                                      MatrixTranslate(c.x, c.y, c.z));
+        return MatrixMultiply(fit, about);
     }
 
     void Viewport::FrameAll() {
@@ -603,21 +613,26 @@ namespace Bakugan {
     void Viewport::Render(Shader lit, int viewPosLoc) {
         if (m_TexWidth <= 0) return;
         UpdateCamera();
+        if (!m_Editable) UpdateOverlap();
+        else UpdateFollowOverlap();
         BeginTextureMode(m_Target);
         ClearBackground(m_Editable ? Color{ 38, 40, 46, 255 } : Color{ 34, 38, 44, 255 });
         BeginMode3D(m_Camera);
         if (m_ShowGrid) DrawGrid(20, 0.25f);
         rlDrawRenderBatchActive();
+        if (!m_Editable && m_ShowOverlap) DrawOverlapVolume();
+        else if (m_Editable && FollowingOverlap()) DrawFollowOverlap();
         if (m_HasModel && m_ShowModel) {
             SetShaderValue(lit, viewPosLoc, &m_Camera.position, SHADER_UNIFORM_VEC3);
             m_Model.transform = ModelTransform();
+            float shell = ((!m_Editable && m_ShowOverlap) || (m_Editable && FollowingOverlap())) ? fminf(m_XrayAlpha, 0.1f) : m_XrayAlpha;
             if (m_Wireframe) {
-                DrawModelWires(m_Model, { 0, 0, 0 }, 1.0f, ColorAlpha(LIGHTGRAY, m_XrayModel ? m_XrayAlpha : 1.0f));
+                DrawModelWires(m_Model, { 0, 0, 0 }, 1.0f, ColorAlpha(LIGHTGRAY, m_XrayModel ? shell : 1.0f));
             } else if (m_XrayModel) {
                 rlColorMask(false, false, false, false);
                 DrawModel(m_Model, { 0, 0, 0 }, 1.0f, WHITE);
                 rlColorMask(true, true, true, true);
-                DrawModel(m_Model, { 0, 0, 0 }, 1.0f, ColorAlpha(WHITE, m_XrayAlpha));
+                DrawModel(m_Model, { 0, 0, 0 }, 1.0f, ColorAlpha(WHITE, shell));
             } else {
                 DrawModel(m_Model, { 0, 0, 0 }, 1.0f, WHITE);
             }
@@ -633,5 +648,280 @@ namespace Bakugan {
         }
         EndMode3D();
         EndTextureMode();
+    }
+
+    std::shared_ptr<const MeshData> Viewport::WorldMesh() const {
+        if (!m_HasModel) return nullptr;
+        if (m_WorldMesh && m_WorldMeshScale == m_UserScale) return m_WorldMesh;
+        auto data = std::make_shared<MeshData>();
+        data->id = MeshData::NextId();
+        Matrix xf = ModelTransform();
+        Vector3 lo = { FLT_MAX, FLT_MAX, FLT_MAX }, hi = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+        for (int m = 0; m < m_Model.meshCount; m++) {
+            const Mesh& mesh = m_Model.meshes[m];
+            if (!mesh.vertices || mesh.vertexCount < 3) continue;
+            unsigned base = (unsigned)data->vertices.size();
+            for (int i = 0; i < mesh.vertexCount; i++) {
+                Vector3 p = Vector3Transform({ mesh.vertices[i * 3], mesh.vertices[i * 3 + 1], mesh.vertices[i * 3 + 2] }, xf);
+                data->vertices.push_back(p);
+                lo = Vector3Min(lo, p);
+                hi = Vector3Max(hi, p);
+            }
+            int tris = mesh.indices ? mesh.triangleCount : mesh.vertexCount / 3;
+            for (int t = 0; t < tris; t++)
+                for (int k = 0; k < 3; k++)
+                    data->triangles.push_back(base + (mesh.indices ? mesh.indices[t * 3 + k] : (unsigned)(t * 3 + k)));
+        }
+        if (data->triangles.empty()) return nullptr;
+        data->box = { lo, hi };
+        m_WorldMesh = data;
+        m_WorldMeshScale = m_UserScale;
+        return m_WorldMesh;
+    }
+
+    static void HashBytes(uint64_t& h, const void* data, size_t size) {
+        const unsigned char* p = (const unsigned char*)data;
+        for (size_t i = 0; i < size; i++) { h ^= p[i]; h *= 1099511628211ull; }
+    }
+
+    template <class T> static void HashValue(uint64_t& h, const T& v) { HashBytes(h, &v, sizeof(T)); }
+
+    static void HashSkeleton(uint64_t& h, const Skeleton& s) {
+        for (const Joint& j : s.Joints()) {
+            HashValue(h, j.id);
+            HashValue(h, j.parent);
+            HashValue(h, j.offset);
+            HashValue(h, j.rotation);
+        }
+        HashValue(h, s.Joints().size());
+    }
+
+    uint64_t Viewport::OverlapSignature() const {
+        uint64_t h = 1469598103934665603ull;
+        HashValue(h, m_ModelVersion);
+        HashValue(h, m_UserScale);
+        HashValue(h, m_Mirror->m_ModelVersion);
+        HashValue(h, m_OverlapResolution);
+        HashValue(h, m_OverlapErosion);
+        HashSkeleton(h, m_Mirror->m_Skeleton);
+        HashSkeleton(h, PosedSkeleton());
+        HashValue(h, MirrorPlacement());
+        return h ? h : 1;
+    }
+
+    void Viewport::UpdateOverlap() {
+        OverlapResult finished;
+        if (m_Overlap.Poll(&finished) && m_ShowOverlap) {
+            m_OverlapResult = std::move(finished);
+            m_OverlapGeneration++;
+            m_OverlapDirty = true;
+        }
+        bool ready = m_ShowOverlap && m_Mirror && m_HasModel && m_Mirror->m_HasModel;
+        if (!ready) {
+            if (!m_OverlapSlices[0].empty()) UnloadOverlapTextures();
+            m_OverlapSignature = 0;
+            m_OverlapDirty = false;
+            return;
+        }
+        uint64_t sig = OverlapSignature();
+        if (sig != m_OverlapSignature) {
+            OverlapRequest rq;
+            rq.source = m_Mirror->WorldMesh();
+            rq.target = WorldMesh();
+            Skeleton posed = PosedSkeleton();
+            rq.restWorld = m_Mirror->m_Skeleton.WorldTransforms();
+            rq.posedWorld = posed.WorldTransforms();
+            for (const Joint& j : m_Mirror->m_Skeleton.Joints()) rq.parent.push_back(j.parent);
+            rq.place = MirrorPlacement();
+            rq.params.resolution = m_OverlapResolution;
+            rq.params.erosion = m_OverlapErosion;
+            rq.signature = sig;
+            m_Overlap.Request(std::move(rq));
+            m_OverlapSignature = sig;
+        }
+        if (m_OverlapDirty) BuildOverlapTextures();
+    }
+
+    static void UnloadStack(std::vector<Texture2D> (&stack)[3]) {
+        for (auto& slices : stack) {
+            for (Texture2D& t : slices) UnloadTexture(t);
+            slices.clear();
+        }
+    }
+
+    void Viewport::UnloadOverlapTextures() {
+        UnloadStack(m_OverlapSlices);
+        UnloadStack(m_FollowSlices);
+        m_FollowGeneration = 0;
+    }
+
+    static void BuildStack(std::vector<Texture2D> (&stack)[3], const std::vector<uint8_t>& cells, const int dim[3], bool onlyOverlap, float opacity) {
+        UnloadStack(stack);
+        if (cells.empty()) return;
+        int maxDim = std::max(dim[0], std::max(dim[1], dim[2]));
+        float k = Clamp(64.0f / (float)maxDim, 0.15f, 2.0f) * opacity;
+        auto alpha = [&](float a) { return (unsigned char)Clamp(a * k * 255.0f, 0.0f, 255.0f); };
+        const Color green = { 60, 220, 110, alpha(0.022f) };
+        const Color red = { 255, 45, 45, alpha(0.30f) };
+        const Color yellow = { 255, 205, 40, alpha(0.022f) };
+        const Color clear = { green.r, green.g, green.b, 0 };
+        for (int a = 0; a < 3; a++) {
+            int b = (a + 1) % 3, c = (a + 2) % 3;
+            int W = dim[b], H = dim[c];
+            for (int n = 0; n < dim[a]; n++) {
+                Color* px = (Color*)MemAlloc((unsigned)(W * H * sizeof(Color)));
+                bool any = false;
+                for (int v = 0; v < H; v++)
+                    for (int u = 0; u < W; u++) {
+                        int co[3];
+                        co[a] = n; co[b] = u; co[c] = v;
+                        uint8_t cell = cells[((size_t)co[2] * dim[1] + co[1]) * dim[0] + co[0]];
+                        Color col = (cell == 2 || cell == 4) ? red : (onlyOverlap ? clear : (cell == 1 ? green : (cell == 3 ? yellow : clear)));
+                        any |= col.a > 0;
+                        px[v * W + u] = col;
+                    }
+                if (!any) {
+                    MemFree(px);
+                    stack[a].push_back(Texture2D{});
+                    continue;
+                }
+                Image img = { px, W, H, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
+                Texture2D tex = LoadTextureFromImage(img);
+                SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
+                SetTextureWrap(tex, TEXTURE_WRAP_CLAMP);
+                UnloadImage(img);
+                stack[a].push_back(tex);
+            }
+        }
+    }
+
+    void Viewport::BuildOverlapTextures() {
+        m_OverlapDirty = false;
+        const OverlapResult& r = m_OverlapResult;
+        if (!r.ok) { UnloadStack(m_OverlapSlices); return; }
+        BuildStack(m_OverlapSlices, r.cells, r.dim, m_OverlapOnly, m_OverlapOpacity);
+    }
+
+    static void DrawStack(const Camera3D& cam, const std::vector<Texture2D> (&stack)[3], Vector3 origin, float voxel, const int dim[3]) {
+        if (stack[0].empty()) return;
+        Vector3 fwd = Vector3Normalize(Vector3Subtract(cam.target, cam.position));
+        const float* f = &fwd.x;
+        int a = 0;
+        for (int i = 1; i < 3; i++) if (fabsf(f[i]) > fabsf(f[a])) a = i;
+        int b = (a + 1) % 3, c = (a + 2) % 3;
+        const float o[3] = { origin.x, origin.y, origin.z };
+        float half = voxel * 0.5f;
+        float b0 = o[b] - half, b1 = o[b] + (dim[b] - 0.5f) * voxel;
+        float c0 = o[c] - half, c1 = o[c] + (dim[c] - 0.5f) * voxel;
+        const float pb[4] = { b0, b1, b1, b0 }, pc[4] = { c0, c0, c1, c1 };
+        const float uv[4][2] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
+
+        rlDrawRenderBatchActive();
+        rlDisableDepthMask();
+        rlDisableBackfaceCulling();
+        rlSetBlendFactorsSeparate(RL_SRC_ALPHA, RL_ONE_MINUS_SRC_ALPHA, RL_ZERO, RL_ONE, RL_FUNC_ADD, RL_FUNC_ADD);
+        BeginBlendMode(BLEND_CUSTOM_SEPARATE);
+        int n = dim[a];
+        for (int t = 0; t < n; t++) {
+            int idx = f[a] > 0 ? n - 1 - t : t;
+            const Texture2D& tex = stack[a][idx];
+            if (tex.id == 0) continue;
+            float pa = o[a] + idx * voxel;
+            rlSetTexture(tex.id);
+            rlBegin(RL_QUADS);
+            rlColor4ub(255, 255, 255, 255);
+            for (int k = 0; k < 4; k++) {
+                float pt[3];
+                pt[a] = pa; pt[b] = pb[k]; pt[c] = pc[k];
+                rlTexCoord2f(uv[k][0], uv[k][1]);
+                rlVertex3f(pt[0], pt[1], pt[2]);
+            }
+            rlEnd();
+        }
+        rlSetTexture(0);
+        EndBlendMode();
+        rlEnableBackfaceCulling();
+        rlEnableDepthMask();
+    }
+
+    void Viewport::DrawOverlapVolume() const {
+        const OverlapResult& r = m_OverlapResult;
+        if (r.ok) DrawStack(m_Camera, m_OverlapSlices, r.origin, r.voxel, r.dim);
+    }
+
+    bool Viewport::FollowingOverlap() const {
+        return m_OverlapSource && m_OverlapSource->m_ShowOverlap && m_HasModel &&
+               m_OverlapSource->m_OverlapResult.ok && !m_OverlapSource->m_OverlapResult.sourceCells.empty();
+    }
+
+    void Viewport::UpdateFollowOverlap() {
+        const Viewport* src = m_OverlapSource;
+        if (!FollowingOverlap()) {
+            if (!m_FollowSlices[0].empty()) UnloadStack(m_FollowSlices);
+            m_FollowGeneration = 0;
+            return;
+        }
+        if (m_FollowGeneration == src->m_OverlapGeneration && m_FollowOnly == src->m_OverlapOnly &&
+            m_FollowOpacity == src->m_OverlapOpacity && !m_FollowSlices[0].empty())
+            return;
+        const OverlapResult& r = src->m_OverlapResult;
+        BuildStack(m_FollowSlices, r.sourceCells, r.sourceDim, src->m_OverlapOnly, src->m_OverlapOpacity);
+        m_FollowGeneration = src->m_OverlapGeneration;
+        m_FollowOnly = src->m_OverlapOnly;
+        m_FollowOpacity = src->m_OverlapOpacity;
+    }
+
+    void Viewport::DrawFollowOverlap() const {
+        if (!FollowingOverlap()) return;
+        const OverlapResult& r = m_OverlapSource->m_OverlapResult;
+        DrawStack(m_Camera, m_FollowSlices, r.sourceOrigin, r.sourceVoxel, r.sourceDim);
+    }
+
+    void Viewport::DrawOverlapControls() {
+        ImGui::SeparatorText("Fold overlap (right panel)");
+        bool ready = m_Mirror && m_HasModel && m_Mirror->m_HasModel;
+        if (!ready) ImGui::TextDisabled("Load a model into both panels to analyse the fold.");
+        ImGui::BeginDisabled(!m_HasModel);
+        ImGui::SliderFloat("Shape scale", &m_UserScale, 0.2f, 3.0f, "%.2fx");
+        ImGui::SetItemTooltip("Resize the right shape around its centre. The skeleton and the folded\n"
+                              "left model keep their size. Ctrl+click to type a value.");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("1x")) m_UserScale = 1.0f;
+        ImGui::EndDisabled();
+        ImGui::BeginDisabled(!ready);
+        ImGui::Checkbox("Show overlap volume", &m_ShowOverlap);
+        ImGui::SetItemTooltip("Fold the left model along the posed skeleton and colour the inside of the\n"
+                              "right model: green where the folded model fills it, yellow where it is empty,\n"
+                              "red where parts overlap or poke out of the right shape.");
+        ImGui::BeginDisabled(!m_ShowOverlap);
+        ImGui::SliderInt("Resolution", &m_OverlapResolution, 24, 160, "%d voxels");
+        ImGui::SetItemTooltip("Level set voxels along the longest side. Higher is sharper but slower.");
+        ImGui::SliderFloat("Erosion", &m_OverlapErosion, 0.0f, 2.0f, "%.2f voxels");
+        ImGui::SetItemTooltip("Shrinks the folded body this much before testing, so parts that only touch\n"
+                              "at their skin don't count as overlapping.");
+        if (ImGui::SliderFloat("Opacity", &m_OverlapOpacity, 0.1f, 2.0f, "%.2f")) m_OverlapDirty = true;
+        if (ImGui::Checkbox("Overlap only", &m_OverlapOnly)) m_OverlapDirty = true;
+        ImGui::SetItemTooltip("Hide green and yellow and show only the red.");
+        ImGui::EndDisabled();
+        ImGui::EndDisabled();
+
+        ImGui::TextColored(ImVec4(0.25f, 0.88f, 0.43f, 1), "Green");
+        ImGui::SameLine();
+        ImGui::TextUnformatted("folded model");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.16f, 1), "Yellow");
+        ImGui::SameLine();
+        ImGui::TextUnformatted("empty");
+        ImGui::TextColored(ImVec4(1.0f, 0.18f, 0.18f, 1), "Red");
+        ImGui::SameLine();
+        ImGui::TextUnformatted("overlap, or outside the right shape");
+        if (!m_ShowOverlap || !ready) return;
+        if (m_Overlap.Busy()) ImGui::TextDisabled("Analysing...");
+        if (!m_OverlapResult.message.empty()) {
+            ImGui::TextWrapped("%s", m_OverlapResult.message.c_str());
+            if (m_OverlapResult.ok) ImGui::TextDisabled("%.0f ms, %d x %d x %d voxels", m_OverlapResult.milliseconds,
+                                                         m_OverlapResult.dim[0], m_OverlapResult.dim[1], m_OverlapResult.dim[2]);
+        }
+        if (!m_XrayModel) ImGui::TextDisabled("Turn on X-ray in the right panel to see the volume.");
     }
 }

@@ -1,5 +1,6 @@
 #pragma once
 #include "data/skeleton.hpp"
+#include "data/overlap.hpp"
 #include <unordered_map>
 #include <imgui.h>
 
@@ -39,8 +40,18 @@ namespace Bakugan {
         void HandleInput(bool hovered, bool active, Vector2 local, bool gizmoBusy);
         void DrawToolbar();
         void DrawSkeleton(const Skeleton& s, int sel, Matrix place, bool showLimits);
+        std::shared_ptr<const MeshData> WorldMesh() const;
+        uint64_t OverlapSignature() const;
+        void UpdateOverlap();
+        void BuildOverlapTextures();
+        void UnloadOverlapTextures();
+        void DrawOverlapVolume() const;
+        bool FollowingOverlap() const;
+        void UpdateFollowOverlap();
+        void DrawFollowOverlap() const;
     public:
-    public:
+        void DrawOverlapControls();
+        void SetOverlapSource(const Viewport* v) { m_OverlapSource = v; }
         Vector3 RootOffset() const { return m_PoseRootOffset; }
         void SetRootOffset(Vector3 offset) { m_PoseRootOffset = offset; }
         std::unordered_map<int, Quaternion> PoseRotations() const { return m_PoseRotations; }
@@ -92,6 +103,27 @@ namespace Bakugan {
         const Viewport* m_Mirror = nullptr;
         bool m_ShowMirror = true;
         bool m_FitMirror = true;
+        float m_UserScale = 1.0f;
+        mutable float m_WorldMeshScale = 1.0f;
+        uint64_t m_ModelVersion = 0;
+        mutable std::shared_ptr<const MeshData> m_WorldMesh;
+        OverlapField m_Overlap;
+        bool m_ShowOverlap = false;
+        bool m_OverlapOnly = false;
+        int m_OverlapResolution = 64;
+        float m_OverlapErosion = 0.5f;
+        float m_OverlapOpacity = 1.0f;
+        uint64_t m_OverlapSignature = 0;
+        OverlapResult m_OverlapResult;
+        bool m_OverlapDirty = false;
+        std::string m_OverlapStatus;
+        std::vector<Texture2D> m_OverlapSlices[3];
+        uint64_t m_OverlapGeneration = 0;
+        const Viewport* m_OverlapSource = nullptr;
+        std::vector<Texture2D> m_FollowSlices[3];
+        uint64_t m_FollowGeneration = 0;
+        bool m_FollowOnly = false;
+        float m_FollowOpacity = 1.0f;
         std::unordered_map<int, Quaternion> m_PoseRotations;
         Vector3 m_PoseRootOffset = { 0, 0, 0 };
         int m_IKChain = 0;

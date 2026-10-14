@@ -91,7 +91,7 @@ namespace Bakugan {
         return s;
     }
 
-    const char* Utils::GetFragmentShader() {
+    const char* Utils::GetVertexShader() {
         return R"(#version 330
             in vec3 vertexPosition;
             in vec2 vertexTexCoord;
@@ -113,7 +113,7 @@ namespace Bakugan {
             })";
     }
 
-    const char* Utils::GetVertexShader() {
+    const char* Utils::GetFragmentShader() {
         return R"(#version 330
             in vec3 fragPos;
             in vec2 fragTexCoord;

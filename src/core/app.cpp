@@ -19,6 +19,7 @@
 namespace Bakugan {
     App::App() {
         m_Right.SetMirror(&m_Left);
+        m_Left.SetOverlapSource(&m_Right);
         m_Committed = Capture();
 	    SetTraceLogLevel(LOG_NONE);
         SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_HIGHDPI | FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT);
@@ -72,7 +73,7 @@ namespace Bakugan {
     void App::TrackHistory() {
         if (Interacting()) return;
         EditState cur = Capture();
-        if (Utils::SameEdit(cur, m_Committed)) {   // keep the selection current, so undo restores it too
+        if (Utils::SameEdit(cur, m_Committed)) {
             m_Committed.leftSel = cur.leftSel;
             m_Committed.rightSel = cur.rightSel;
             return;
@@ -84,7 +85,7 @@ namespace Bakugan {
     }
 
     void App::Undo() {
-        TrackHistory();   // commit anything still pending first
+        TrackHistory();
         if (m_UndoStack.empty() || Interacting()) return;
         m_RedoStack.push_back(Capture());
         m_Committed = std::move(m_UndoStack.back());
@@ -103,7 +104,7 @@ namespace Bakugan {
 
     void App::HandleUndoKeys() {
         ImGuiIO& io = ImGui::GetIO();
-        if (io.WantTextInput || !(io.KeyCtrl || io.KeySuper)) return;   // text fields have their own undo
+        if (io.WantTextInput || !(io.KeyCtrl || io.KeySuper)) return;
         if (ImGui::IsKeyPressed(ImGuiKey_Z)) { if (io.KeyShift) Redo(); else Undo(); }
         if (ImGui::IsKeyPressed(ImGuiKey_Y)) Redo();
     }
@@ -191,7 +192,6 @@ namespace Bakugan {
         }
     }
 
-    // ImGui wants float colours; the skeleton keeps raylib's byte Color.
     bool App::ColorEdit(const char* id, Color* c) {
         float f[3] = { c->r / 255.0f, c->g / 255.0f, c->b / 255.0f };
         if (!ImGui::ColorEdit3(id, f, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel)) return false;
@@ -256,7 +256,7 @@ namespace Bakugan {
         if (ImGui::Button(addLabel.c_str(), ImVec2(-FLT_MIN, 0))) m_Left.AddChildBone(parent);
 
         if (ImGui::BeginChild("joint_tree", ImVec2(0, 200), ImGuiChildFlags_Borders))
-            DrawJointTree(0);   // joint 0 is always the single root
+            DrawJointTree(0);
         ImGui::EndChild();
 
         if (ImGui::Button("Reset pose")) s.ResetPose();
@@ -304,7 +304,6 @@ namespace Bakugan {
         if (ImGui::DragFloat3("Position", &wp.x, 0.005f, 0, 0, "%.3f")) m_Left.MoveJoint(sel, wp);
         ImGui::SetItemTooltip("World-space position. Respects 'Move subtree'.");
 
-        // ball joint rotation, edited as Euler angles
         if (m_EulerJoint != sel || !QuaternionEquals(m_EulerQuaternion, j.rotation)) {
             m_EulerDegree = Vector3Scale(QuaternionToEuler(j.rotation), RAD2DEG);
             m_EulerJoint = sel;
@@ -324,8 +323,6 @@ namespace Bakugan {
 
         if (ImGui::Button("Reset rotation")) j.rotation = QuaternionIdentity();
 
-        // Split the bone that ends at this joint (parent -> joint). This and Delete change
-        // the joint array, so they come last (`j` is not used after them).
         std::string tip = sel == 0 ? "The root has no bone to split"
                                    : "Insert Joints() evenly along the bone from '" + s.Joints()[j.parent].name + "' to this joint";
         ImGui::BeginDisabled(sel == 0);
@@ -350,6 +347,7 @@ namespace Bakugan {
         DrawLibrary();
         DrawHierarchy();
         DrawJointInspector();
+        m_Right.DrawOverlapControls();
         ImGui::SeparatorText("Status");
         ImGui::TextWrapped("%s", m_Status.c_str());
         ImGui::End();
