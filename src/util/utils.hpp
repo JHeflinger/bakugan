@@ -14,6 +14,9 @@ namespace Bakugan {
 
         bool LoadAsset(const Asset& a, Model* out, std::string* err);
 
+        // Tolerant Wavefront OBJ reader (polygons fan-triangulated, any v/vt/vn index form, negative indices).
+        bool ReadOBJ(const std::string& path, TriMesh* out, std::string* err);
+
         // Copies every mesh of a model into one triangle soup, transformed by xf.
         TriMesh ModelToTriMesh(const Model& m, Matrix xf);
 

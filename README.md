@@ -14,6 +14,7 @@ the **Ball** view (fold preview) on the right.
 ```
 tiny            # downloads the minis modules, builds build/bin.exe
 tiny -r         # build and run
+tiny -rv        # once after adding a module (tiny caches compiled vendors)
 ```
 
 System packages: OpenVDB, TBB, Imath, Boost headers (for OpenVDB), GLFW and OpenGL, as for the original project. The
@@ -30,8 +31,18 @@ build/pipeline_test full critter      # also: quick, and torus | ball
 
 ## Using it
 
-Load a model from the library (two demo creatures and the raylib primitives), or drop an `.obj/.gltf/.glb/.iqm/.vox/.m3d`
-onto either view. The model is normalised to 2 units, and its volume sets the target sphere: the radius of the sphere
+Load a model in any of these ways:
+
+- **Open model...** opens a native file dialog (tinyfiledialogs; on Linux it needs `zenity`, `kdialog` or `yad`).
+- Type a path into the box beside it and press Enter or **Load**.
+- Pick a demo (two creatures and the raylib primitives) from the library.
+- Drop an `.obj/.gltf/.glb/.iqm/.vox/.m3d` file onto either view.
+
+Drag and drop may not work on Wayland compositors such as Hyprland. raylib's bundled GLFW is X11-only, so the app runs
+under XWayland, and drops from Wayland file managers don't always reach it. Use the dialog there.
+
+OBJ files go through our own reader, which tolerates files without normals or texture coordinates (raylib's OBJ loader
+crashes on some of those). The model is normalised to 2 units, and its volume sets the target sphere: the radius of the sphere
 with the same volume.
 
 ### Automatic tab
@@ -65,7 +76,7 @@ with the same volume.
 Everything is undoable (Cmd/Ctrl+Z, Shift+Z / Y).
 
 The **Files** panel does the following:
-- Saves and loads designs as text (Cmd/Ctrl+S saves; dropping a `.txt` loads one).
+- Saves and loads designs as text, by path or with **Save as... / Open design...** (Cmd/Ctrl+S saves).
 - Exports `<prefix>_open.obj` (the figure), `<prefix>_closed.obj` (the ball) and `<prefix>_hinges.txt`, which lists
   every pivot, axis, fold angle and joint type.
 

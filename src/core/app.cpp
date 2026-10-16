@@ -2,6 +2,7 @@
 #include "util/utils.hpp"
 #include <imgui_internal.h>
 #include <rlImGui.h>
+#include <tinyfiledialogs.h>
 #include <ImGuizmo.h>
 #include <algorithm>
 #include <raymath.h>
@@ -163,6 +164,56 @@ namespace Bakugan {
         std::string err;
         if (!Utils::LoadAsset(a, &m, &err)) { m_Status = err; return; }
         SetInputModel(m, a.name);
+    }
+
+    bool App::OpenModelFile(const std::string& path) {
+        if (path.empty()) return false;
+        if (!FileExists(path.c_str())) { m_Status = "File not found: " + path; return false; }
+        if (IsFileExtension(path.c_str(), ".txt")) {
+            snprintf(m_DesignPath, sizeof(m_DesignPath), "%s", path.c_str());
+            LoadDesign();
+            return true;
+        }
+        if (!Utils::IsModelFile(path.c_str())) { m_Status = "Unsupported file type: " + path; return false; }
+        LoadAsset(AddToLibrary({ GetFileName(path.c_str()), path }));
+        return true;
+    }
+
+    // Native file dialogs (tinyfiledialogs: zenity / kdialog / yad on Linux, the system dialogs elsewhere). They work
+    // where drag and drop doesn't, e.g. Wayland compositors talking to this XWayland window.
+    static const char* NoDialog = "No file chosen. (On Linux the file dialog needs zenity, kdialog or yad installed; you can also type a path.)";
+
+    void App::BrowseModel() {
+        if (Busy()) { m_Status = "Wait for the running job to finish (or stop it) before loading a model."; return; }
+        const char* filters[] = { "*.obj", "*.gltf", "*.glb", "*.iqm", "*.vox", "*.m3d" };
+        const char* path = tinyfd_openFileDialog("Open a model", "", 6, filters, "3D models", 0);
+        if (!path) { m_Status = NoDialog; return; }
+        snprintf(m_OpenPath, sizeof(m_OpenPath), "%s", path);
+        OpenModelFile(path);
+    }
+
+    void App::BrowseDesign(bool save) {
+        const char* filters[] = { "*.txt" };
+        const char* path = save ? tinyfd_saveFileDialog("Save design", m_DesignPath, 1, filters, "Bakugan designs")
+                                : tinyfd_openFileDialog("Load design", m_DesignPath, 1, filters, "Bakugan designs", 0);
+        if (!path) { m_Status = NoDialog; return; }
+        snprintf(m_DesignPath, sizeof(m_DesignPath), "%s", path);
+        if (save) SaveDesign();
+        else LoadDesign();
+    }
+
+    void App::BrowseExport() {
+        const char* filters[] = { "*.obj" };
+        const char* path = tinyfd_saveFileDialog("Export prefix (writes _open.obj, _closed.obj, _hinges.txt)", m_ExportPath, 1, filters, "OBJ");
+        if (!path) { m_Status = NoDialog; return; }
+        std::string p = path;
+        for (const char* suffix : { "_open.obj", "_closed.obj", ".obj" })
+            if (p.size() > strlen(suffix) && p.compare(p.size() - strlen(suffix), strlen(suffix), suffix) == 0) {
+                p.resize(p.size() - strlen(suffix));
+                break;
+            }
+        snprintf(m_ExportPath, sizeof(m_ExportPath), "%s", p.c_str());
+        ExportParts();
     }
 
     void App::SetInputModel(Model m, const std::string& name) {

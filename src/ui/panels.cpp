@@ -58,7 +58,16 @@ namespace Bakugan {
 
     void App::DrawLibrary() {
         if (!ImGui::CollapsingHeader("Model library", ImGuiTreeNodeFlags_DefaultOpen)) return;
-        ImGui::TextDisabled("Click to load, or drop .obj/.gltf/.glb files\nonto a panel. Loading resets the design.");
+        float w = ImGui::GetContentRegionAvail().x;
+        if (ImGui::Button("Open model...", ImVec2(w * 0.4f, 0))) BrowseModel();
+        ImGui::SetItemTooltip("Pick an .obj .gltf .glb .iqm .vox or .m3d file (or a design .txt).\n"
+                              "You can also drop files onto a panel. Loading resets the design.");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-ImGui::CalcTextSize("Load").x - ImGui::GetStyle().FramePadding.x * 2 - ImGui::GetStyle().ItemSpacing.x);
+        bool enter = ImGui::InputTextWithHint("##path", "or type a path", m_OpenPath, sizeof(m_OpenPath),
+                                              ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+        if ((ImGui::Button("Load") || enter) && m_OpenPath[0]) OpenModelFile(m_OpenPath);
         if (ImGui::BeginChild("library", ImVec2(0, 92), ImGuiChildFlags_Borders)) {
             for (int i = 0; i < (int)m_Library.size(); i++) {
                 ImGui::PushID(i);
@@ -281,9 +290,12 @@ namespace Bakugan {
     void App::DrawFilesPanel() {
         if (!ImGui::CollapsingHeader("Files")) return;
         ImGui::InputText("Export prefix", m_ExportPath, sizeof(m_ExportPath));
-        if (ImGui::Button("Export OBJ + hinge sheet", ImVec2(-FLT_MIN, 0))) ExportParts();
+        float half0 = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+        if (ImGui::Button("Export OBJ + hinge sheet", ImVec2(half0, 0))) ExportParts();
         ImGui::SetItemTooltip("Writes <prefix>_open.obj (figure), <prefix>_closed.obj (ball) and <prefix>_hinges.txt.\n"
                               "Uses the built pieces, or the superfrustums when none are built.");
+        ImGui::SameLine();
+        if (ImGui::Button("Export as...", ImVec2(-FLT_MIN, 0))) BrowseExport();
         ImGui::InputText("Design file", m_DesignPath, sizeof(m_DesignPath));
         float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
         if (ImGui::Button("Save design", ImVec2(half, 0))) SaveDesign();
@@ -291,6 +303,11 @@ namespace Bakugan {
         ImGui::SameLine();
         ImGui::BeginDisabled(Busy());
         if (ImGui::Button("Load design", ImVec2(-FLT_MIN, 0))) LoadDesign();
+        ImGui::EndDisabled();
+        if (ImGui::Button("Save as...", ImVec2(half, 0))) BrowseDesign(true);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(Busy());
+        if (ImGui::Button("Open design...", ImVec2(-FLT_MIN, 0))) BrowseDesign(false);
         ImGui::EndDisabled();
     }
 

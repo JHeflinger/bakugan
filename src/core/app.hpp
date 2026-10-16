@@ -51,6 +51,10 @@ namespace Bakugan {
         void HandleKeys();
         int AddToLibrary(const Asset& a);
         void LoadAsset(int index);
+        bool OpenModelFile(const std::string& path);
+        void BrowseModel();
+        void BrowseDesign(bool save);
+        void BrowseExport();
         void HandleFileDrops();
         void AcceptAssetDrop(const Viewport& vp);
         void SetInputModel(Model m, const std::string& name);
@@ -181,5 +185,6 @@ namespace Bakugan {
         std::string m_Status = "Pick a model from the library or drop a file onto a panel to begin.";
         char m_DesignPath[256] = "bakugan_design.txt";
         char m_ExportPath[256] = "bakugan_parts";
+        char m_OpenPath[512] = "";
     };
 }

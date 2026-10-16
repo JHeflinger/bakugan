@@ -4,6 +4,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 
 namespace Bakugan {
     Vector3 Rigid::Apply(Vector3 p) const {
@@ -162,6 +163,14 @@ namespace Bakugan {
             }
             case Primitive::None: {
                 if (!FileExists(a.path.c_str())) { *err = "File not found: " + a.path; return false; }
+                if (IsFileExtension(a.path.c_str(), ".obj")) {
+                    // raylib's OBJ loader crashes on some files (e.g. without texture coordinates), so read it here
+                    TriMesh t;
+                    if (!ReadOBJ(a.path, &t, err)) return false;
+                    ComputeNormals(t);
+                    *out = TriMeshToModel(t, Shader{});
+                    return true;
+                }
                 Model m = LoadModel(a.path.c_str());
                 if (m.meshCount == 0 || !IsModelValid(m)) {
                     UnloadModel(m);
@@ -173,6 +182,47 @@ namespace Bakugan {
             }
         }
         *out = LoadModelFromMesh(mesh);
+        return true;
+    }
+
+    bool Utils::ReadOBJ(const std::string& path, TriMesh* out, std::string* err) {
+        FILE* fp = fopen(path.c_str(), "r");
+        if (!fp) { *err = "Could not open " + path; return false; }
+        TriMesh t;
+        char line[4096];
+        std::vector<int> poly;
+        while (fgets(line, sizeof(line), fp)) {
+            const char* c = line;
+            while (*c == ' ' || *c == '\t') c++;
+            if (c[0] == 'v' && (c[1] == ' ' || c[1] == '\t')) {
+                Vector3 v = { 0, 0, 0 };
+                if (sscanf(c + 2, "%f %f %f", &v.x, &v.y, &v.z) >= 3) t.positions.push_back(v);
+            } else if (c[0] == 'f' && (c[1] == ' ' || c[1] == '\t')) {
+                poly.clear();
+                const char* q = c + 2;
+                while (*q) {
+                    while (*q == ' ' || *q == '\t') q++;
+                    if (!*q || *q == '\n' || *q == '\r') break;
+                    char* end = nullptr;
+                    long idx = strtol(q, &end, 10);
+                    if (end == q) break;
+                    int i = idx < 0 ? (int)t.positions.size() + (int)idx : (int)idx - 1;   // negative = relative
+                    poly.push_back(i);
+                    q = end;
+                    while (*q && *q != ' ' && *q != '\t' && *q != '\n' && *q != '\r') q++;   // skip /vt/vn
+                }
+                for (size_t k = 2; k < poly.size(); k++) {
+                    int a = poly[0], b = poly[k - 1], d = poly[k];
+                    int n = (int)t.positions.size();
+                    if (a < 0 || b < 0 || d < 0 || a >= n || b >= n || d >= n) continue;
+                    t.indices.insert(t.indices.end(), { (unsigned)a, (unsigned)b, (unsigned)d });
+                }
+            }
+        }
+        fclose(fp);
+        if (t.indices.empty()) { *err = "No faces found in " + path; return false; }
+        ComputeBounds(t);
+        *out = std::move(t);
         return true;
     }
 
