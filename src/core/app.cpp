@@ -6,10 +6,9 @@
 #include <algorithm>
 #include <raymath.h>
 #include <raylib.h>
-#include <cstdint>
 #include <imgui.h>
-#include <cfloat>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <cmath>
@@ -18,15 +17,12 @@
 
 namespace Bakugan {
     App::App() {
-        m_Right.SetMirror(&m_Left);
-        m_Left.SetOverlapSource(&m_Right);
-        m_Committed = Capture();
-	    SetTraceLogLevel(LOG_NONE);
+        SetTraceLogLevel(LOG_NONE);
         SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_HIGHDPI | FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT);
         InitWindow(1280, 720, "Bakugan Everything");
         int mon = GetCurrentMonitor();
         int mw = GetMonitorWidth(mon), mh = GetMonitorHeight(mon);
-        int w = std::min(1600, (int)(mw * 0.9f)), h = std::min(950, (int)(mh * 0.85f));
+        int w = std::min(1700, (int)(mw * 0.92f)), h = std::min(980, (int)(mh * 0.88f));
         SetWindowSize(w, h);
         SetWindowPosition((mw - w) / 2, (mh - h) / 2);
         SetExitKey(KEY_NULL);
@@ -35,16 +31,28 @@ namespace Bakugan {
         ImGui::GetIO().IniFilename = nullptr;
         m_Shader = LoadShaderFromMemory(Utils::GetVertexShader(), Utils::GetFragmentShader());
         m_ViewPositionLocation = GetShaderLocation(m_Shader, "viewPos");
+        AddToLibrary({ "Critter (demo)", "", Primitive::Critter });
+        AddToLibrary({ "Dragon (demo)", "", Primitive::Dragon });
         AddToLibrary({ "Cube", "", Primitive::Cube });
         AddToLibrary({ "Sphere", "", Primitive::Sphere });
         AddToLibrary({ "Cylinder", "", Primitive::Cylinder });
         AddToLibrary({ "Torus", "", Primitive::Torus });
         AddToLibrary({ "Knot", "", Primitive::Knot });
+        LoadAsset(0);
+        m_UndoStack.clear();
+        m_Committed = Capture();
     }
 
     App::~App() {
-        m_Left.Unload();
-        m_Right.Unload();
+        m_DecomposeJob.Stop();
+        m_FoldJob.Stop();
+        m_RestoreJob.Stop();
+        ClearRestored();
+        for (auto& [id, pm] : m_PartModels)
+            if (pm.loaded) UnloadModel(pm.model);
+        if (m_HasInput) UnloadModel(m_Input);
+        m_Figure.Unload();
+        m_Ball.Unload();
         UnloadShader(m_Shader);
         rlImGuiShutdown();
         CloseWindow();
@@ -54,16 +62,15 @@ namespace Bakugan {
         while (!WindowShouldClose()) Frame();
     }
 
+    // ---- history ---------------------------------------------------------------------------------------------------
+
     EditState App::Capture() const {
-        return { m_Left.GetSkeleton(), m_Left.SelectedJoint(), m_Right.PoseRotations(), m_Right.RootOffset(), m_Right.SelectedJoint() };
+        return { m_Design, m_Selected };
     }
 
     void App::Restore(const EditState& st) {
-        m_Left.SkeletonRef() = st.skeleton;
-        m_Left.SelectJoint(st.leftSel < (int)st.skeleton.Joints().size() ? st.leftSel : 0);
-        m_Right.PoseRotations() = st.pose;
-        m_Right.SetRootOffset(st.offset);
-        m_Right.SelectJoint(st.rightSel < (int)st.skeleton.Joints().size() ? st.rightSel : -1);
+        m_Design = st.design;
+        m_Selected = st.selected < (int)m_Design.parts.size() ? st.selected : -1;
     }
 
     bool App::Interacting() {
@@ -72,19 +79,18 @@ namespace Bakugan {
 
     void App::TrackHistory() {
         if (Interacting()) return;
-        EditState cur = Capture();
-        if (Utils::SameEdit(cur, m_Committed)) {
-            m_Committed.leftSel = cur.leftSel;
-            m_Committed.rightSel = cur.rightSel;
+        if (m_Committed.design == m_Design) {
+            m_Committed.selected = m_Selected;
             return;
         }
         m_UndoStack.push_back(std::move(m_Committed));
         if (m_UndoStack.size() > MAX_UNDO) m_UndoStack.erase(m_UndoStack.begin());
         m_RedoStack.clear();
-        m_Committed = std::move(cur);
+        m_Committed = Capture();
     }
 
     void App::Undo() {
+        if (Busy()) return;
         TrackHistory();
         if (m_UndoStack.empty() || Interacting()) return;
         m_RedoStack.push_back(Capture());
@@ -94,6 +100,7 @@ namespace Bakugan {
     }
 
     void App::Redo() {
+        if (Busy()) return;
         TrackHistory();
         if (m_RedoStack.empty() || Interacting()) return;
         m_UndoStack.push_back(Capture());
@@ -102,13 +109,46 @@ namespace Bakugan {
         Restore(m_Committed);
     }
 
-    void App::HandleUndoKeys() {
+    void App::HandleKeys() {
         ImGuiIO& io = ImGui::GetIO();
-        if (io.WantTextInput || !(io.KeyCtrl || io.KeySuper)) return;
-        if (ImGui::IsKeyPressed(ImGuiKey_Z)) { if (io.KeyShift) Redo(); else Undo(); }
-        if (ImGui::IsKeyPressed(ImGuiKey_Y)) Redo();
+        if (io.WantTextInput) return;
+        bool cmd = io.KeyCtrl || io.KeySuper;
+        if (cmd) {
+            if (ImGui::IsKeyPressed(ImGuiKey_Z)) { if (io.KeyShift) Redo(); else Undo(); }
+            if (ImGui::IsKeyPressed(ImGuiKey_Y)) Redo();
+            if (ImGui::IsKeyPressed(ImGuiKey_S)) SaveDesign();
+            return;
+        }
+        bool overView = m_Figure.Hovered() || m_Ball.Hovered();
+        if (!overView) return;
+        if (ImGui::IsKeyPressed(ImGuiKey_F)) {
+            if (m_Figure.Hovered()) m_Figure.Frame(m_InputBounds);
+            if (m_Ball.Hovered()) m_Ball.Frame(m_InputBounds);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Space)) {
+            m_FoldAnim = m_Fold > 0.5f ? 1 : 2;
+            m_FoldVelocity = 0.0f;
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_W)) m_GizmoOp = GizmoOp::Translate;
+        if (ImGui::IsKeyPressed(ImGuiKey_E)) m_GizmoOp = GizmoOp::Rotate;
+        if (ImGui::IsKeyPressed(ImGuiKey_R)) m_GizmoOp = GizmoOp::Scale;
+        if (ImGui::IsKeyPressed(ImGuiKey_Q))
+            m_Target = m_Target == EditTarget::Part ? EditTarget::Hinge : m_Target == EditTarget::Hinge ? EditTarget::Sphere : EditTarget::Part;
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) Select(-1);
+        if (m_Mode == Mode::Manual && !Busy()) {
+            if (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace)) DeleteSelected();
+            if (ImGui::IsKeyPressed(ImGuiKey_D) && io.KeyShift) DuplicateSelected();
+            if (ImGui::IsKeyPressed(ImGuiKey_A) && io.KeyShift) {
+                SuperFrustum sf;
+                sf.position = m_Shape ? m_Shape->centroid : Vector3{ 0, 1, 0 };
+                sf.size = { 0.3f, 0.3f, 0.3f };
+                Select(AddPart(sf));
+            }
+        }
     }
-    
+
+    // ---- library / input -------------------------------------------------------------------------------------------
+
     int App::AddToLibrary(const Asset& a) {
         for (int i = 0; i < (int)m_Library.size(); i++)
             if (!a.path.empty() && m_Library[i].path == a.path) return i;
@@ -116,266 +156,449 @@ namespace Bakugan {
         return (int)m_Library.size() - 1;
     }
 
-    void App::LoadInto(Viewport& vp, int assetIndex) {
-        const Asset& a = m_Library[assetIndex];
+    void App::LoadAsset(int index) {
+        if (Busy()) { m_Status = "Wait for the running job to finish (or stop it) before loading a model."; return; }
+        const Asset& a = m_Library[index];
         Model m;
         std::string err;
         if (!Utils::LoadAsset(a, &m, &err)) { m_Status = err; return; }
-        vp.SetModel(m, a.name, m_Shader);
-        m_Status = "Loaded " + a.name + " into " + (vp.Editable() ? "left" : "right") + " panel.";
+        SetInputModel(m, a.name);
+    }
+
+    void App::SetInputModel(Model m, const std::string& name) {
+        if (m_HasInput) UnloadModel(m_Input);
+        m_Input = m;
+        m_HasInput = true;
+        m_InputName = name;
+        for (int i = 0; i < m_Input.materialCount; i++) m_Input.materials[i].shader = m_Shader;
+
+        // normalise: longest side 2 units, standing on the ground, centred
+        BoundingBox b = GetModelBoundingBox(m_Input);
+        Vector3 size = Vector3Subtract(b.max, b.min);
+        float extent = fmaxf(size.x, fmaxf(size.y, size.z));
+        float s = extent > 1e-6f ? 2.0f / extent : 1.0f;
+        Vector3 off = { -(b.min.x + b.max.x) * 0.5f * s, -b.min.y * s, -(b.min.z + b.max.z) * 0.5f * s };
+        m_InputTransform = MatrixMultiply(MatrixScale(s, s, s), MatrixTranslate(off.x, off.y, off.z));
+        m_Input.transform = m_InputTransform;
+        TriMesh mesh = Utils::ModelToTriMesh(m_Input, m_InputTransform);
+        m_InputBounds = mesh.box;
+        m_Mesh = std::make_shared<const TriMesh>(std::move(mesh));
+        m_Shape = std::make_shared<const ShapeAnalysis>(AnalyzeShape(*m_Mesh, 64, 4000));
+
+        Design d;
+        if (m_Shape->ok) {
+            d.ball.center = m_Shape->centroid;
+            d.ball.radius = m_Shape->equalRadius;
+        }
+        m_Design = d;
+        m_Selected = -1;
+        m_UndoStack.clear();
+        m_RedoStack.clear();
+        m_Committed = Capture();
+        ClearRestored();
+        m_LastHistory.clear();
+        m_FoldModel = FoldModel(m_Shape, m_FoldParams);
+        m_ModelParams = m_FoldParams;
+        m_ShapesDirty = true;
+        m_AnalysisValid = false;
+        m_Figure.Frame(m_InputBounds);
+        m_Ball.Frame(m_InputBounds);
+        m_Fold = 1.0f;
+        m_Status = m_Shape->ok ? "Loaded " + name + ". " + m_Shape->message + "." : "Loaded " + name + ", but: " + m_Shape->message;
     }
 
     void App::HandleFileDrops() {
         if (!IsFileDropped()) return;
         FilePathList files = LoadDroppedFiles();
-        Vector2 m = GetMousePosition();
-        Viewport* vp = CheckCollisionPointRec(m, m_Right.ScreenRectangle()) ? &m_Right
-                     : CheckCollisionPointRec(m, m_Left.ScreenRectangle()) ? &m_Left
-                     : nullptr;
         int toLoad = -1, skipped = 0;
+        std::string design;
         for (unsigned i = 0; i < files.count; i++) {
             const char* path = files.paths[i];
+            if (IsFileExtension(path, ".txt")) { design = path; continue; }
             if (!Utils::IsModelFile(path)) { skipped++; continue; }
             int idx = AddToLibrary({ GetFileName(path), path });
             if (toLoad < 0) toLoad = idx;
         }
         UnloadDroppedFiles(files);
-
-        if (toLoad >= 0 && vp) LoadInto(*vp, toLoad);
-        else if (toLoad >= 0) m_Status = "Added to library. Drag it onto a panel to load it.";
+        if (toLoad >= 0) LoadAsset(toLoad);
+        if (!design.empty()) {
+            snprintf(m_DesignPath, sizeof(m_DesignPath), "%s", design.c_str());
+            LoadDesign();
+        }
         if (skipped) m_Status += " (" + std::to_string(skipped) + " unsupported file(s) ignored)";
     }
 
-    void App::AcceptAssetDrop(Viewport& vp) {
+    void App::AcceptAssetDrop(const Viewport& vp) {
         Rectangle r = vp.ScreenRectangle();
         ImRect rect(r.x, r.y, r.x + r.width, r.y + r.height);
         if (!ImGui::BeginDragDropTargetCustom(rect, ImGui::GetID("##viewport_drop"))) return;
-        if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("ASSET"))
-            LoadInto(vp, *(const int*)p->Data);
+        if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("ASSET")) LoadAsset(*(const int*)p->Data);
         ImGui::EndDragDropTarget();
     }
 
-    void App::DrawViewportWindow(Viewport& vp, ImVec2 pos, ImVec2 size, bool focusHint) {
-        ImGui::SetNextWindowPos(pos);
-        ImGui::SetNextWindowSize(size);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4, 4));
-        ImGuiWindowFlags flags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
-                                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
-                                 ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
-        if (focusHint) ImGui::PushStyleColor(ImGuiCol_TitleBg, ImVec4(0.25f, 0.18f, 0.08f, 1));
-        ImGui::Begin(vp.Title().c_str(), nullptr, flags);
-        if (focusHint) ImGui::PopStyleColor();
-        vp.DrawPanel();
-        AcceptAssetDrop(vp);
-        ImGui::End();
-        ImGui::PopStyleVar();
+    // ---- jobs ------------------------------------------------------------------------------------------------------
+
+    bool App::Busy() const {
+        return m_DecomposeJob.Busy() || m_FoldJob.Busy() || m_RestoreJob.Busy();
     }
 
-    void App::DrawLibrary() {
-        ImGui::SeparatorText("Model library");
-        ImGui::TextDisabled("Drag an item onto a panel, or drop files\nfrom Finder straight onto a panel.");
-        for (int i = 0; i < (int)m_Library.size(); i++) {
-            ImGui::PushID(i);
-            ImGui::Selectable(m_Library[i].name.c_str());
-            if (!m_Library[i].path.empty()) ImGui::SetItemTooltip("%s", m_Library[i].path.c_str());
-            if (ImGui::BeginDragDropSource()) {
-                ImGui::SetDragDropPayload("ASSET", &i, sizeof(int));
-                ImGui::Text("Load %s", m_Library[i].name.c_str());
-                ImGui::EndDragDropSource();
+    const Design& App::Shown() const {
+        return (Busy() && m_Preview) ? *m_Preview : m_Design;
+    }
+
+    void App::PollJobs() {
+        m_Preview.reset();
+        const JobControl* c = m_DecomposeJob.Busy() ? m_DecomposeJob.Control() : m_FoldJob.Busy() ? m_FoldJob.Control() : nullptr;
+        if (c) {
+            std::shared_ptr<const Design> p = c->Preview(nullptr);
+            if (p) {
+                // previews of a decomposition carry no sphere; keep ours
+                Design d = *p;
+                if (m_DecomposeJob.Busy()) d.ball = m_Design.ball;
+                m_Preview = std::make_shared<const Design>(std::move(d));
             }
-            if (ImGui::BeginPopupContextItem()) {
-                if (ImGui::MenuItem("Load into left panel")) LoadInto(m_Left, i);
-                if (ImGui::MenuItem("Load into right panel")) LoadInto(m_Right, i);
-                ImGui::EndPopup();
+        }
+
+        DecomposeResult dr;
+        if (m_DecomposeJob.Poll(&dr)) {
+            m_Pipeline = Pipeline::Idle;
+            m_Status = dr.message;
+            if (dr.ok) {
+                if (m_DecomposeParams.refineOnly && dr.shapes.size() == m_Design.parts.size()) {
+                    // shape refinement keeps the order, names and hinges
+                    for (size_t i = 0; i < dr.shapes.size(); i++) m_Design.parts[i].shape = dr.shapes[i];
+                } else {
+                    Design d;
+                    d.ball = m_Design.ball;
+                    for (const SuperFrustum& s : dr.shapes) d.AddPart(s, -1);
+                    m_Design = d;
+                    m_Selected = -1;
+                    BuildTree();
+                }
+                if (m_RunAll && !dr.cancelled) StartFold(false);
+                else m_RunAll = false;
+            } else {
+                m_RunAll = false;
             }
-            ImGui::PopID();
+        }
+        FoldResult fr;
+        if (m_FoldJob.Poll(&fr)) {
+            m_Pipeline = Pipeline::Idle;
+            m_Status = fr.message;
+            if (m_FoldJob.Control()) m_LastHistory = m_FoldJob.Control()->History();
+            if (fr.ok) {
+                int keepId = m_Selected >= 0 && m_Selected < (int)m_Design.parts.size() ? m_Design.parts[m_Selected].id : -1;
+                m_Design = fr.design;
+                m_Selected = keepId >= 0 ? m_Design.IndexOf(keepId) : -1;
+                m_Fold = 1.0f;
+                if (m_RunAll && !fr.cancelled) StartRestore();
+                else m_RunAll = false;
+            } else {
+                m_RunAll = false;
+            }
+        }
+        RestoreResult rr;
+        if (m_RestoreJob.Poll(&rr)) {
+            m_Pipeline = Pipeline::Idle;
+            m_RunAll = false;
+            m_Status = rr.message;
+            if (rr.ok) {
+                ClearRestored();
+                for (RestoredPart& p : rr.parts) {
+                    RestoredModel m;
+                    m.partId = p.partId;
+                    m.model = Utils::TriMeshToModel(p.mesh, m_Shader);
+                    m.mesh = std::move(p.mesh);
+                    m_Restored.push_back(std::move(m));
+                }
+                m_RestoredFor = rr.design;
+                m_ShowPieces = true;
+            }
         }
     }
 
-    bool App::ColorEdit(const char* id, Color* c) {
-        float f[3] = { c->r / 255.0f, c->g / 255.0f, c->b / 255.0f };
-        if (!ImGui::ColorEdit3(id, f, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel)) return false;
-        *c = { (unsigned char)(f[0] * 255), (unsigned char)(f[1] * 255), (unsigned char)(f[2] * 255), 255 };
+    void App::StartDecompose(bool refineOnly, int onlyIndex) {
+        if (Busy() || !m_Mesh) return;
+        m_DecomposeParams.refineOnly = refineOnly;
+        m_DecomposeParams.onlyIndex = onlyIndex;
+        DecomposeParams params = m_DecomposeParams;
+        std::vector<SuperFrustum> initial;
+        if (refineOnly)
+            for (const Part& p : m_Design.parts) initial.push_back(p.shape);
+        std::shared_ptr<const TriMesh> mesh = m_Mesh;
+        m_DecomposeJob.Start([mesh, params, initial](JobControl& c) { return Decompose(mesh, params, initial, c); });
+        m_Pipeline = Pipeline::Decompose;
+        m_Status = refineOnly ? "Fitting superfrustums to the mesh..." : "Decomposing the mesh into superfrustums...";
+    }
+
+    void App::StartFold(bool keepTree) {
+        if (Busy() || !m_Shape || !m_Shape->ok) return;
+        if (m_Design.parts.empty()) { m_Status = "There are no superfrustums to fold yet."; m_RunAll = false; return; }
+        FoldParams params = m_FoldParams;
+        params.keepTree = keepTree;
+        Design start = m_Design;
+        std::shared_ptr<const ShapeAnalysis> shape = m_Shape;
+        m_FoldJob.Start([start, shape, params](JobControl& c) { return OptimizeFold(start, shape, params, c); });
+        m_Pipeline = Pipeline::Fold;
+        m_Fold = 1.0f;
+        m_Status = "Optimising the fold (stochastic rewrite descent)...";
+    }
+
+    void App::StartRestore() {
+        if (Busy() || !m_Mesh) return;
+        if (m_Design.parts.empty()) { m_Status = "There are no parts to build."; m_RunAll = false; return; }
+        RestoreParams params = m_RestoreParams;
+        Design design = m_Design;
+        std::shared_ptr<const TriMesh> mesh = m_Mesh;
+        m_RestoreJob.Start([design, mesh, params](JobControl& c) { return RestoreDetail(design, mesh, params, c); });
+        m_Pipeline = Pipeline::Restore;
+        m_Status = "Restoring detail and building the pieces...";
+    }
+
+    void App::RunAll() {
+        if (Busy()) return;
+        m_RunAll = true;
+        StartDecompose(false, -1);
+    }
+
+    void App::BuildTree() {
+        if (!m_FoldModel.Valid() || m_Design.parts.empty()) return;
+        FoldState s = m_FoldModel.MakeState(m_Design);
+        BuildFoldTree(s, m_FoldModel);
+        int keepId = m_Selected >= 0 && m_Selected < (int)m_Design.parts.size() ? m_Design.parts[m_Selected].id : -1;
+        m_Design = s.design;
+        m_Selected = keepId >= 0 ? m_Design.IndexOf(keepId) : -1;
+        m_Fold = 1.0f;
+    }
+
+    void App::AimSelected() {
+        if (!m_FoldModel.Valid() || m_Selected < 0 || m_Selected >= (int)m_Design.parts.size()) return;
+        FoldState s = m_FoldModel.MakeState(m_Design);
+        AimHinge(s, m_FoldModel, m_Selected);
+        m_Design = s.design;
+        m_Fold = 1.0f;
+    }
+
+    void App::SnapPivotToContact(int part) {
+        if (!m_FoldModel.Valid() || part < 0 || part >= (int)m_Design.parts.size()) return;
+        int parent = m_Design.parts[part].hinge.parent;
+        if (parent < 0) return;
+        FoldState s = m_FoldModel.MakeState(m_Design);
+        Vector3 p;
+        int count = 0;
+        if (m_FoldModel.ContactPoint(s, part, parent, &p, &count)) s.design.parts[part].hinge.pivot = p;
+        else m_FoldModel.ProjectPivot(s, part);
+        m_Design.parts[part].hinge.pivot = s.design.parts[part].hinge.pivot;
+    }
+
+    void App::UpdateAnalysis() {
+        if (!m_Shape || !m_Shape->ok) { m_AnalysisValid = false; return; }
+        if (m_ModelParams != m_FoldParams) {
+            m_ModelParams = m_FoldParams;
+            m_FoldModel.SetParams(m_FoldParams);
+            m_ShapesDirty = true;
+        }
+        const Design& d = Shown();
+        bool shapes = m_ShapesDirty || m_Analysis.design.parts.size() != d.parts.size();
+        for (size_t i = 0; !shapes && i < d.parts.size(); i++)
+            shapes = d.parts[i].id != m_Analysis.design.parts[i].id || d.parts[i].shape != m_Analysis.design.parts[i].shape;
+        if (!shapes && m_AnalysisValid && m_Analysis.design == d) return;
+        if (shapes) {
+            m_Analysis = m_FoldModel.MakeState(d);
+            m_ShapesDirty = false;
+        } else {
+            m_Analysis.design = d;
+        }
+        m_Visual = FoldVisual{};
+        m_FoldModel.Evaluate(m_Analysis, &m_Metrics, &m_Visual);
+        m_AnalysisValid = !d.parts.empty();
+    }
+
+    void App::ClearRestored() {
+        for (RestoredModel& m : m_Restored) UnloadModel(m.model);
+        m_Restored.clear();
+        m_RestoredFor = Design{};
+    }
+
+    bool App::RestoredCurrent() const {
+        if (m_Restored.empty()) return false;
+        const Design& d = m_Design;
+        if (d.parts.size() != m_RestoredFor.parts.size() || !(d.ball == m_RestoredFor.ball)) return false;
+        for (size_t i = 0; i < d.parts.size(); i++)
+            if (d.parts[i].id != m_RestoredFor.parts[i].id || d.parts[i].shape != m_RestoredFor.parts[i].shape ||
+                !(d.parts[i].hinge == m_RestoredFor.parts[i].hinge))
+                return false;
         return true;
     }
 
-    void App::DrawJointTree(int index) {
-        Skeleton& s = m_Left.SkeletonRef();
-        bool leaf = true;
-        for (const Joint& j : s.Joints()) if (j.parent == index) { leaf = false; break; }
-        ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_DefaultOpen |
-                                   ImGuiTreeNodeFlags_SpanAvailWidth;
-        if (leaf) flags |= ImGuiTreeNodeFlags_Leaf;
-        if (index == m_Left.SelectedJoint()) flags |= ImGuiTreeNodeFlags_Selected;
-        bool open = ImGui::TreeNodeEx((void*)(intptr_t)(index + 1), flags, "%s", s.Joints()[index].name.c_str());
-        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) m_Left.SelectJoint(index);
-        if (ImGui::BeginPopupContextItem()) {
-            m_Left.SelectJoint(index);
-            if (ImGui::MenuItem("Add child bone")) m_Left.AddChildBone(index);
-            if (ImGui::MenuItem("Split bone in 2", nullptr, false, index != 0)) {
-                m_Left.SetSplitSegments(2);
-                m_Left.SplitSelectedBone();
+    // ---- files -----------------------------------------------------------------------------------------------------
+
+    void App::ExportParts() {
+        std::string base = m_ExportPath;
+        std::vector<const TriMesh*> meshes;
+        std::vector<std::string> names;
+        std::vector<Rigid> open, closed;
+        const Design& d = m_Restored.empty() ? m_Design : m_RestoredFor;
+        std::vector<Rigid> xf = d.Transforms(1.0f);
+        std::vector<TriMesh> coarse;
+        if (!m_Restored.empty()) {
+            for (const RestoredModel& m : m_Restored) {
+                int i = d.IndexOf(m.partId);
+                if (i < 0) continue;
+                meshes.push_back(&m.mesh);
+                names.push_back(d.parts[i].name);
+                open.push_back(Rigid{});
+                closed.push_back(xf[i]);
             }
-            if (ImGui::MenuItem("Delete (with children)", nullptr, false, index != 0)) m_Left.DeleteSelectedJoint();
-            ImGui::EndPopup();
-        }
-        if (open) {
-            for (int i = index + 1; i < (int)s.Joints().size(); i++)
-                if (s.Joints()[i].parent == index) DrawJointTree(i);
-            ImGui::TreePop();
-        }
-    }
-
-    void App::DrawHierarchy() {
-        Skeleton& s = m_Left.SkeletonRef();
-        ImGui::SeparatorText("Edit");
-        ImGui::BeginDisabled(m_UndoStack.empty());
-        if (ImGui::Button("Undo")) Undo();
-        ImGui::EndDisabled();
-        ImGui::SetItemTooltip("Cmd/Ctrl+Z  (%d steps)", (int)m_UndoStack.size());
-        ImGui::SameLine();
-        ImGui::BeginDisabled(m_RedoStack.empty());
-        if (ImGui::Button("Redo")) Redo();
-        ImGui::EndDisabled();
-        ImGui::SetItemTooltip("Cmd/Ctrl+Shift+Z or Ctrl+Y  (%d steps)", (int)m_RedoStack.size());
-
-        ImGui::SeparatorText("Skeleton hierarchy (left panel)");
-        bool v = s.IsVisible();
-        ImGui::Checkbox("##vis", &v);
-        s.SetVisibility(v);
-        ImGui::SetItemTooltip("Show skeleton");
-        ImGui::SameLine();
-        Color tc = s.GetColor();
-        ColorEdit("##col", &tc);
-        s.SetColor(tc);
-        ImGui::SameLine();
-        ImGui::Text("%d Joints()", (int)s.Joints().size());
-
-        int parent = m_Left.SelectedJoint() >= 0 ? m_Left.SelectedJoint() : 0;
-        std::string addLabel = "Add child bone to '" + s.Joints()[parent].name + "'  (C)";
-        if (ImGui::Button(addLabel.c_str(), ImVec2(-FLT_MIN, 0))) m_Left.AddChildBone(parent);
-
-        if (ImGui::BeginChild("joint_tree", ImVec2(0, 200), ImGuiChildFlags_Borders))
-            DrawJointTree(0);
-        ImGui::EndChild();
-
-        if (ImGui::Button("Reset pose")) s.ResetPose();
-        ImGui::SetItemTooltip("Set every ball joint back to its rest rotation");
-        ImGui::SameLine();
-        if (ImGui::Button("Humanoid template")) ImGui::OpenPopup("confirm_humanoid");
-        ImGui::SameLine();
-        if (ImGui::Button("Clear bones")) ImGui::OpenPopup("confirm_clear");
-
-        if (ImGui::BeginPopup("confirm_humanoid")) {
-            ImGui::Text("Replace the skeleton with a humanoid rig?");
-            if (ImGui::Button("Replace")) {
-                Color c = s.GetColor();
-                s = Utils::MakeHumanoidSkeleton(m_Left.Bounds());
-                s.SetColor(c);
-                m_Left.SelectJoint(0);
-                ImGui::CloseCurrentPopup();
+        } else {
+            // no pieces built yet: export the superfrustums themselves
+            coarse.reserve(d.parts.size());
+            for (const Part& p : d.parts) {
+                const SuperFrustum& sf = p.shape;
+                coarse.push_back(Utils::MeshImplicit([&](Vector3 q) { return sf.LocalDistance(q); }, sf.LocalBounds(), 40));
             }
-            ImGui::EndPopup();
+            for (size_t i = 0; i < d.parts.size(); i++) {
+                meshes.push_back(&coarse[i]);
+                names.push_back(d.parts[i].name);
+                open.push_back(d.parts[i].shape.Pose());
+                closed.push_back(d.parts[i].shape.Pose().Then(xf[i]));
+            }
         }
-        if (ImGui::BeginPopup("confirm_clear")) {
-            ImGui::Text("Remove every bone, keeping only the root?");
-            if (ImGui::Button("Clear")) { m_Left.ResetSkeleton(); ImGui::CloseCurrentPopup(); }
-            ImGui::EndPopup();
-        }
-    }
-
-    void App::DrawJointInspector() {
-        Skeleton& s = m_Left.SkeletonRef();
-        int sel = m_Left.SelectedJoint();
-        ImGui::SeparatorText("Selected joint");
-        if (sel < 0 || sel >= (int)s.Joints().size()) {
-            ImGui::TextDisabled("Click a joint in the left panel to select it.");
+        if (meshes.empty()) { m_Status = "Nothing to export."; return; }
+        std::string err;
+        if (!Utils::WriteOBJ(base + "_open.obj", meshes, open, names, &err) ||
+            !Utils::WriteOBJ(base + "_closed.obj", meshes, closed, names, &err)) {
+            m_Status = err;
             return;
         }
-        Joint& j = s.JointsRef()[sel];
-
-        char name[64];
-        snprintf(name, sizeof(name), "%s", j.name.c_str());
-        if (ImGui::InputText("Name", name, sizeof(name))) j.name = name;
-        ImGui::Text("Parent: %s", j.parent >= 0 ? s.Joints()[j.parent].name.c_str() : "(root of the hierarchy)");
-
-        std::vector<Matrix> world = s.WorldTransforms();
-        Vector3 wp = Utils::MatrixPosition(world[sel]);
-        if (ImGui::DragFloat3("Position", &wp.x, 0.005f, 0, 0, "%.3f")) m_Left.MoveJoint(sel, wp);
-        ImGui::SetItemTooltip("World-space position. Respects 'Move subtree'.");
-
-        if (m_EulerJoint != sel || !QuaternionEquals(m_EulerQuaternion, j.rotation)) {
-            m_EulerDegree = Vector3Scale(QuaternionToEuler(j.rotation), RAD2DEG);
-            m_EulerJoint = sel;
-            m_EulerQuaternion = j.rotation;
+        FILE* fp = fopen((base + "_hinges.txt").c_str(), "w");
+        if (fp) {
+            fprintf(fp, "Bakugan Everything - hinge sheet\n");
+            fprintf(fp, "sphere centre %.5f %.5f %.5f  radius %.5f\n\n", d.ball.center.x, d.ball.center.y, d.ball.center.z, d.ball.radius);
+            fprintf(fp, "%-14s %-14s %-8s %-30s %-30s %s\n", "part", "parent", "type", "pivot (open pose)", "axis (open pose)", "fold");
+            for (const Part& p : d.parts) {
+                const Hinge& h = p.hinge;
+                const char* parent = h.parent >= 0 ? d.parts[h.parent].name.c_str() : "-";
+                const char* type = h.parent < 0 ? "root" : h.locked ? "rigid" : "spring";
+                fprintf(fp, "%-14s %-14s %-8s %9.4f %9.4f %9.4f   %8.4f %8.4f %8.4f   %6.1f deg\n", p.name.c_str(), parent, type,
+                        h.pivot.x, h.pivot.y, h.pivot.z, h.axis.x, h.axis.y, h.axis.z, d.FoldAngle(&p - d.parts.data()) * RAD2DEG);
+            }
+            fprintf(fp, "\nSpring hinges are uni-directional: they rotate from 0 (open, the figure) up to the fold angle\n"
+                        "(closed, the ball) about +axis by the right-hand rule, and their springs push them back open.\n");
+            fclose(fp);
         }
-        if (ImGui::DragFloat3("Rotation", &m_EulerDegree.x, 0.5f, -180, 180, "%.1f deg")) {
-            Quaternion q = QuaternionFromEuler(m_EulerDegree.x * DEG2RAD, m_EulerDegree.y * DEG2RAD, m_EulerDegree.z * DEG2RAD);
-            j.rotation = Utils::ClampBallJoint(q, j.swingLimit, j.twistLimit);
-            if (!QuaternionEquals(q, j.rotation)) m_EulerDegree = Vector3Scale(QuaternionToEuler(j.rotation), RAD2DEG);
-            m_EulerQuaternion = j.rotation;
-        }
-        bool limits = ImGui::SliderFloat("Swing limit", &j.swingLimit, 0, 180, "%.0f deg");
-        ImGui::SetItemTooltip("Cone half-angle around the joint's local +Y axis");
-        limits |= ImGui::SliderFloat("Twist limit", &j.twistLimit, 0, 180, "+/- %.0f deg");
-        ImGui::SetItemTooltip("Rotation allowed about the joint's local +Y axis");
-        if (limits) j.rotation = Utils::ClampBallJoint(j.rotation, j.swingLimit, j.twistLimit);
-
-        if (ImGui::Button("Reset rotation")) j.rotation = QuaternionIdentity();
-
-        std::string tip = sel == 0 ? "The root has no bone to split"
-                                   : "Insert Joints() evenly along the bone from '" + s.Joints()[j.parent].name + "' to this joint";
-        ImGui::BeginDisabled(sel == 0);
-        ImGui::SetNextItemWidth(90);
-        int splitsegs = m_Left.SplitSegments();
-        ImGui::InputInt("##pieces", &splitsegs);
-        m_Left.SetSplitSegments(splitsegs);
-        m_Left.SetSplitSegments(std::clamp(m_Left.SplitSegments(), 2, 16));
-        ImGui::SameLine();
-        if (ImGui::Button("Split bone into pieces")) m_Left.SplitSelectedBone();
-        ImGui::SetItemTooltip("%s", tip.c_str());
-        if (ImGui::Button("Delete (with children)")) m_Left.DeleteSelectedJoint();
-        ImGui::EndDisabled();
-        if (sel == 0) ImGui::SetItemTooltip("The root can't be deleted");
+        m_Status = "Exported " + std::to_string(meshes.size()) + (m_Restored.empty() ? " superfrustum" : " restored") +
+                   " parts to " + base + "_open.obj, " + base + "_closed.obj and " + base + "_hinges.txt";
     }
 
-    void App::DrawSidebar(float width, float height) {
-        ImGui::SetNextWindowPos(ImVec2(0, 0));
-        ImGui::SetNextWindowSize(ImVec2(width, height));
-        ImGui::Begin("Inspector", nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
-                                           ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
-        DrawLibrary();
-        DrawHierarchy();
-        DrawJointInspector();
-        m_Right.DrawOverlapControls();
-        ImGui::SeparatorText("Status");
-        ImGui::TextWrapped("%s", m_Status.c_str());
-        ImGui::End();
+    void App::SaveDesign() {
+        std::string text = m_Design.Serialize();
+        if (SaveFileText(m_DesignPath, (char*)text.c_str())) m_Status = std::string("Saved the design to ") + m_DesignPath;
+        else m_Status = std::string("Could not write ") + m_DesignPath;
+    }
+
+    void App::LoadDesign() {
+        if (Busy()) return;
+        char* text = LoadFileText(m_DesignPath);
+        if (!text) { m_Status = std::string("Could not read ") + m_DesignPath; return; }
+        Design d;
+        std::string err;
+        bool ok = d.Deserialize(text, &err);
+        UnloadFileText(text);
+        if (!ok) { m_Status = err; return; }
+        m_Design = d;
+        m_Selected = -1;
+        m_Status = std::string("Loaded the design from ") + m_DesignPath + " (" + std::to_string(d.parts.size()) + " parts)";
+    }
+
+    // ---- editing helpers -------------------------------------------------------------------------------------------
+
+    void App::Select(int part) {
+        m_Selected = part >= 0 && part < (int)m_Design.parts.size() ? part : -1;
+    }
+
+    int App::AddPart(const SuperFrustum& shape) {
+        int i = m_Design.AddPart(shape, -1);
+        if (m_Design.Root() != i) {
+            // attach new parts to the selection (or the root) so they fold with it
+            int parent = m_Selected >= 0 ? m_Selected : m_Design.Root();
+            m_Design.parts[i].hinge.parent = parent;
+            m_Design.parts[i].hinge.pivot = shape.position;
+            m_Design.parts[i].hinge.locked = true;
+        }
+        return i;
+    }
+
+    void App::DeleteSelected() {
+        if (m_Selected < 0 || m_Selected >= (int)m_Design.parts.size()) return;
+        int parent = m_Design.parts[m_Selected].hinge.parent;
+        m_Design.RemovePart(m_Selected);
+        Select(parent > m_Selected ? parent - 1 : parent);
+    }
+
+    void App::DuplicateSelected() {
+        if (m_Selected < 0 || m_Selected >= (int)m_Design.parts.size()) return;
+        Part src = m_Design.parts[m_Selected];
+        SuperFrustum sf = src.shape;
+        float shift = 0.6f * fmaxf(sf.size.x, 0.1f);
+        sf.position = Vector3Add(sf.position, { shift, 0, 0 });
+        int i = m_Design.AddPart(sf, -1, src.name + "_copy");
+        Hinge h = src.hinge;
+        h.pivot = Vector3Add(h.pivot, { shift, 0, 0 });
+        m_Design.parts[i].hinge = h;
+        if (h.parent < 0 && m_Design.Root() != i) m_Design.parts[i].hinge.parent = m_Design.Root();
+        Select(i);
+    }
+
+    // ---- frame -----------------------------------------------------------------------------------------------------
+
+    void App::UpdateFoldAnimation() {
+        float dt = fminf(GetFrameTime(), 1.0f / 30.0f);
+        if (m_FoldAnim == 1) {
+            // springs push every hinge open; the hinge stops at 0 and bounces a little
+            m_FoldVelocity += (-60.0f * m_Fold - 4.0f * m_FoldVelocity) * dt;
+            m_Fold += m_FoldVelocity * dt;
+            if (m_Fold < 0.0f) { m_Fold = 0.0f; m_FoldVelocity = -m_FoldVelocity * 0.35f; }
+            if (m_Fold < 0.002f && fabsf(m_FoldVelocity) < 0.05f) { m_Fold = 0.0f; m_FoldAnim = 0; }
+        } else if (m_FoldAnim == 2) {
+            m_Fold = fminf(1.0f, m_Fold + dt * 0.7f);
+            if (m_Fold >= 1.0f) m_FoldAnim = 0;
+        }
+        if (m_Loop && m_FoldAnim == 0) {
+            m_LoopTimer += dt;
+            if (m_LoopTimer > 0.8f) {
+                m_LoopTimer = 0.0f;
+                m_FoldAnim = m_Fold > 0.5f ? 1 : 2;
+                m_FoldVelocity = 0.0f;
+            }
+        }
     }
 
     void App::Frame() {
         HandleFileDrops();
+        PollJobs();
+        UpdateAnalysis();
+        UpdateFoldAnimation();
+        PurgePartMeshes(Shown());
 
         float W = (float)GetScreenWidth(), H = (float)GetScreenHeight();
-        float sidebar = fminf(360.0f, W * 0.3f);
+        float sidebar = fminf(390.0f, W * 0.3f);
         float half = (W - sidebar) * 0.5f;
 
         rlImGuiBegin();
         ImGuizmo::BeginFrame();
         DrawSidebar(sidebar, H);
-        DrawViewportWindow(m_Left, ImVec2(sidebar, 0), ImVec2(half, H), true);
-        DrawViewportWindow(m_Right, ImVec2(sidebar + half, 0), ImVec2(W - sidebar - half, H), false);
-
-        HandleUndoKeys();
+        DrawViewportWindow(m_Figure, ImVec2(sidebar, 0), ImVec2(half, H), true);
+        DrawViewportWindow(m_Ball, ImVec2(sidebar + half, 0), ImVec2(W - sidebar - half, H), false);
+        HandleKeys();
         TrackHistory();
 
-        m_Left.Render(m_Shader, m_ViewPositionLocation);
-        m_Right.Render(m_Shader, m_ViewPositionLocation);
+        RenderFigure();
+        RenderBall();
 
         BeginDrawing();
         ClearBackground({ 20, 20, 24, 255 });
         rlImGuiEnd();
         EndDrawing();
     }
-
 }

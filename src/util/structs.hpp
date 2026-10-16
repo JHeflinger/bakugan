@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <vector>
 #include <raylib.h>
 
 namespace Bakugan {
@@ -9,12 +10,26 @@ namespace Bakugan {
         Sphere,
         Cylinder,
         Torus,
-        Knot
+        Knot,
+        Critter,
+        Dragon
     };
 
     enum class GizmoOp {
         Translate,
-        Rotate
+        Rotate,
+        Scale
+    };
+
+    enum class Mode {
+        Automatic,
+        Manual
+    };
+
+    enum class EditTarget {
+        Part,
+        Hinge,
+        Sphere
     };
 
     struct Asset {
@@ -23,13 +38,26 @@ namespace Bakugan {
         Primitive primitive = Primitive::None;
     };
 
-    struct Joint { // Ball joint, TODO:different types of joints
-        int id = -1;
-        std::string name;
-        int parent = -1;
-        Vector3 offset = { 0, 0, 0 };
+    // Indexed triangle mesh in plain arrays (no GPU state).
+    struct TriMesh {
+        std::vector<Vector3> positions;
+        std::vector<Vector3> normals;
+        std::vector<unsigned> indices;
+        BoundingBox box = {};
+        bool Empty() const { return indices.empty(); }
+    };
+
+    // Rigid transform: rotate, then translate.
+    struct Rigid {
         Quaternion rotation = { 0, 0, 0, 1 };
-        float swingLimit = 180.0f;
-        float twistLimit = 180.0f;
+        Vector3 position = { 0, 0, 0 };
+
+        Vector3 Apply(Vector3 p) const;
+        Vector3 ApplyVector(Vector3 v) const;
+        Vector3 ApplyInverse(Vector3 p) const;
+        Rigid Then(const Rigid& next) const;      // this first, then next
+        Rigid Inverse() const;
+        Matrix ToMatrix() const;
+        static Rigid AboutAxis(Vector3 pivot, Vector3 axis, float angle);
     };
 }
