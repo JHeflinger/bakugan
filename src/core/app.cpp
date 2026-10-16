@@ -338,6 +338,15 @@ namespace Bakugan {
             m_Status = fr.message;
             if (m_FoldJob.Control()) m_LastHistory = m_FoldJob.Control()->History();
             if (fr.ok) {
+                RunRecord rec;
+                rec.label = m_FoldParams.joint ? "Joint" : "Separate";
+                if (!m_RunAll) rec.label += " (refine)";
+                if (!m_FoldParams.chained) rec.label += ", no latch";
+                rec.parts = (int)fr.design.parts.size();
+                rec.hinges = fr.metrics.hinges;
+                rec.metrics = fr.metrics;
+                rec.seconds = GetTime() - m_RunStart;
+                m_Runs.push_back(rec);
                 int keepId = m_Selected >= 0 && m_Selected < (int)m_Design.parts.size() ? m_Design.parts[m_Selected].id : -1;
                 m_Design = fr.design;
                 m_Selected = keepId >= 0 ? m_Design.IndexOf(keepId) : -1;
@@ -368,11 +377,16 @@ namespace Bakugan {
         }
     }
 
-    void App::StartDecompose(bool refineOnly, int onlyIndex) {
+    void App::StartDecompose(bool refineOnly, int onlyIndex, bool coarse) {
         if (Busy() || !m_Mesh) return;
         m_DecomposeParams.refineOnly = refineOnly;
         m_DecomposeParams.onlyIndex = onlyIndex;
         DecomposeParams params = m_DecomposeParams;
+        if (coarse) {
+            // the joint pipeline only needs a starting point: its grammar adds, splits, merges and removes parts
+            params.rounds = std::min(params.rounds, 2);
+            params.iterations = std::min(params.iterations, 40);
+        }
         std::vector<SuperFrustum> initial;
         if (refineOnly)
             for (const Part& p : m_Design.parts) initial.push_back(p.shape);
@@ -392,7 +406,9 @@ namespace Bakugan {
         m_FoldJob.Start([start, shape, params](JobControl& c) { return OptimizeFold(start, shape, params, c); });
         m_Pipeline = Pipeline::Fold;
         m_Fold = 1.0f;
-        m_Status = "Optimising the fold (stochastic rewrite descent)...";
+        if (!m_RunAll) m_RunStart = GetTime();
+        m_Status = params.joint ? "Optimising the superfrustums and the fold together (stochastic rewrite descent)..."
+                                : "Optimising the fold (stochastic rewrite descent)...";
     }
 
     void App::StartRestore() {
@@ -409,7 +425,8 @@ namespace Bakugan {
     void App::RunAll() {
         if (Busy()) return;
         m_RunAll = true;
-        StartDecompose(false, -1);
+        m_RunStart = GetTime();
+        StartDecompose(false, -1, m_FoldParams.joint);
     }
 
     void App::BuildTree() {
@@ -457,11 +474,15 @@ namespace Bakugan {
         if (shapes) {
             m_Analysis = m_FoldModel.MakeState(d);
             m_ShapesDirty = false;
+            m_FitIoU = d.parts.empty() ? -1.0f : m_FoldModel.FitIoU(d);
         } else {
             m_Analysis.design = d;
         }
         m_Visual = FoldVisual{};
+        m_FoldModel.UpdateFit(m_Analysis);
         m_FoldModel.Evaluate(m_Analysis, &m_Metrics, &m_Visual);
+        m_Metrics.fitIoU = m_FitIoU;
+        m_ContactsAt = -1.0f;
         m_AnalysisValid = !d.parts.empty();
     }
 
@@ -526,14 +547,25 @@ namespace Bakugan {
         if (fp) {
             fprintf(fp, "Bakugan Everything - hinge sheet\n");
             fprintf(fp, "sphere centre %.5f %.5f %.5f  radius %.5f\n\n", d.ball.center.x, d.ball.center.y, d.ball.center.z, d.ball.radius);
-            fprintf(fp, "%-14s %-14s %-8s %-30s %-30s %s\n", "part", "parent", "type", "pivot (open pose)", "axis (open pose)", "fold");
+            ReleasePlan plan = d.Plan();
+            fprintf(fp, "%-14s %-14s %-8s %-30s %-30s %-9s %-14s %s\n", "part", "parent", "type", "pivot (open pose)", "axis (open pose)",
+                    "fold", "released by", "at / opens during");
             for (const Part& p : d.parts) {
                 const Hinge& h = p.hinge;
                 const char* parent = h.parent >= 0 ? d.parts[h.parent].name.c_str() : "-";
                 const char* type = h.parent < 0 ? "root" : h.locked ? "rigid" : "spring";
-                fprintf(fp, "%-14s %-14s %-8s %9.4f %9.4f %9.4f   %8.4f %8.4f %8.4f   %6.1f deg\n", p.name.c_str(), parent, type,
-                        h.pivot.x, h.pivot.y, h.pivot.z, h.axis.x, h.axis.y, h.axis.z, d.FoldAngle(&p - d.parts.data()) * RAD2DEG);
+                int i = (int)(&p - d.parts.data());
+                fprintf(fp, "%-14s %-14s %-8s %9.4f %9.4f %9.4f   %8.4f %8.4f %8.4f   %6.1f deg", p.name.c_str(), parent, type,
+                        h.pivot.x, h.pivot.y, h.pivot.z, h.axis.x, h.axis.y, h.axis.z, d.FoldAngle(i) * RAD2DEG);
+                if (d.Working(i) && d.chained)
+                    fprintf(fp, "  %-14s %3.0f%%  %.2f..%.2f", h.trigger >= 0 ? d.parts[h.trigger].name.c_str() : "LATCH",
+                            h.release * 100.0f, plan.start[i] / plan.total, (plan.start[i] + plan.duration[i]) / plan.total);
+                fprintf(fp, "\n");
             }
+            if (d.chained)
+                fprintf(fp, "\nSingle latch: the latch on the root holds the LATCH hinge closed. Every other spring hinge is held\n"
+                            "by a catch on the part of the hinge that releases it, and springs open once that hinge has opened by\n"
+                            "the given share of its travel. Times are fractions of the whole pop-open. Close in the reverse order.\n");
             fprintf(fp, "\nSpring hinges are uni-directional: they rotate from 0 (open, the figure) up to the fold angle\n"
                         "(closed, the ball) about +axis by the right-hand rule, and their springs push them back open.\n");
             fclose(fp);
@@ -605,7 +637,11 @@ namespace Bakugan {
 
     void App::UpdateFoldAnimation() {
         float dt = fminf(GetFrameTime(), 1.0f / 30.0f);
-        if (m_FoldAnim == 1) {
+        if (m_FoldAnim == 1 && Shown().chained) {
+            // the release chain staggers the hinges itself: run the timeline at a steady pace
+            m_Fold = fmaxf(0.0f, m_Fold - dt / 1.6f);
+            if (m_Fold <= 0.0f) m_FoldAnim = 0;
+        } else if (m_FoldAnim == 1) {
             // springs push every hinge open; the hinge stops at 0 and bounces a little
             m_FoldVelocity += (-60.0f * m_Fold - 4.0f * m_FoldVelocity) * dt;
             m_Fold += m_FoldVelocity * dt;
@@ -642,6 +678,7 @@ namespace Bakugan {
         DrawViewportWindow(m_Figure, ImVec2(sidebar, 0), ImVec2(half, H), true);
         DrawViewportWindow(m_Ball, ImVec2(sidebar + half, 0), ImVec2(W - sidebar - half, H), false);
         HandleKeys();
+        if (!Busy()) m_Design.RepairReleases();
         TrackHistory();
 
         RenderFigure();

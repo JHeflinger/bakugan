@@ -239,6 +239,50 @@ namespace Bakugan {
             }
         }
         if (m_ShowHinges && m_Mode == Mode::Manual) DrawHinges(d, d.Transforms(t), t);
+        if (m_ShowReleases && d.chained) {
+            std::vector<Rigid> xf = d.Transforms(t);
+            rlDrawRenderBatchActive();
+            rlDisableDepthTest();
+            float r = m_FoldModel.Spacing() * 0.6f;
+            for (int i = 0; i < (int)d.parts.size(); i++) {
+                if (!d.Working(i)) continue;
+                Vector3 pivot, axis;
+                d.HingeInWorld(i, xf, &pivot, &axis);
+                int tr = d.parts[i].hinge.trigger;
+                if (tr == -1) {
+                    // the latch: a red catch on the root holding the master hinge
+                    DrawCube(pivot, r * 2.5f, r * 2.5f, r * 2.5f, Color{ 235, 50, 60, 255 });
+                    DrawCubeWires(pivot, r * 2.5f, r * 2.5f, r * 2.5f, WHITE);
+                } else if (tr >= 0 && tr < (int)d.parts.size()) {
+                    Vector3 from, faxis;
+                    d.HingeInWorld(tr, xf, &from, &faxis);
+                    Color c = Color{ 230, 90, 230, 230 };
+                    DrawCylinderEx(from, pivot, r * 0.25f, r * 0.25f, 5, c);
+                    Vector3 dir = Vector3Subtract(pivot, from);
+                    float len = Vector3Length(dir);
+                    if (len > 1e-4f) {
+                        Vector3 tip = Vector3Subtract(pivot, Vector3Scale(dir, fminf(r * 2.5f, len * 0.4f) / len));
+                        DrawCylinderEx(tip, pivot, r * 0.8f, 0.0f, 8, c);
+                    }
+                }
+            }
+            rlDrawRenderBatchActive();
+            rlEnableDepthTest();
+        }
+        if (m_ShowContacts && m_AnalysisValid) {
+            if (m_ContactsAt != t || !(m_ContactsFor == d)) {
+                m_Contacts.clear();
+                m_FoldModel.MotionContacts(m_Analysis, t, &m_Contacts);
+                m_ContactsAt = t;
+                m_ContactsFor = d;
+            }
+            rlDrawRenderBatchActive();
+            rlDisableDepthTest();
+            float s = m_FoldModel.Spacing() * 0.4f;
+            for (const Vector3& p : m_Contacts) DrawCubeV(p, { s, s, s }, Color{ 255, 150, 30, 255 });
+            rlDrawRenderBatchActive();
+            rlEnableDepthTest();
+        }
         m_Ball.End3D();
     }
 
@@ -337,13 +381,17 @@ namespace Bakugan {
         ImGui::Checkbox("Loop", &m_Loop);
         if (ImGui::Button("Frame (F)")) m_Ball.Frame(m_InputBounds);
         ImGui::SameLine();
-        ImGui::Checkbox("Sphere", &m_ShowSphere);
-        ImGui::SameLine();
-        ImGui::Checkbox("Shell gaps", &m_ShowShell);
+        ImGui::Checkbox("Gaps", &m_ShowShell);
         ImGui::SetItemTooltip("When closed: red = shell not covered, amber = covered twice, green = covered");
         ImGui::SameLine();
-        ImGui::Checkbox("Lost material", &m_ShowLost);
+        ImGui::Checkbox("Lost", &m_ShowLost);
         ImGui::SetItemTooltip("When closed: material outside the sphere or colliding with another part");
+        ImGui::SameLine();
+        ImGui::Checkbox("Releases", &m_ShowReleases);
+        ImGui::SetItemTooltip("The latch (red) and which hinge releases which (magenta arrows)");
+        ImGui::SameLine();
+        ImGui::Checkbox("Contacts", &m_ShowContacts);
+        ImGui::SetItemTooltip("Pieces touching at the current fold fraction: scrub the slider to check the motion");
         ImGui::SameLine();
         ImGui::BeginDisabled(m_Restored.empty());
         ImGui::Checkbox("Pieces", &m_ShowPieces);
@@ -352,6 +400,7 @@ namespace Bakugan {
         ImGui::SameLine();
         if (ImGui::Button("View...")) ImGui::OpenPopup("ball_view");
         if (ImGui::BeginPopup("ball_view")) {
+            ImGui::Checkbox("Sphere", &m_ShowSphere);
             ImGui::Checkbox("Grid", &m_ShowGrid);
             ImGui::Checkbox("Hinges", &m_ShowHinges);
             bool ortho = m_Ball.Ortho();

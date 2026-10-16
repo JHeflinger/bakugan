@@ -27,6 +27,15 @@ namespace Bakugan {
         TriMesh mesh;
     };
 
+    // One finished optimisation, for comparing the separate and joint pipelines.
+    struct RunRecord {
+        std::string label;
+        int parts = 0;
+        int hinges = 0;
+        FoldMetrics metrics;
+        double seconds = 0.0;
+    };
+
     enum class Pipeline {
         Idle,
         Decompose,
@@ -61,7 +70,7 @@ namespace Bakugan {
         bool Busy() const;
         const Design& Shown() const;
         void PollJobs();
-        void StartDecompose(bool refineOnly, int onlyIndex);
+        void StartDecompose(bool refineOnly, int onlyIndex, bool coarse = false);
         void StartFold(bool keepTree);
         void StartRestore();
         void RunAll();
@@ -90,6 +99,8 @@ namespace Bakugan {
         void DrawHingeInspector();
         void DrawSphereInspector();
         void DrawMetrics();
+        void DrawRuns();
+        void DrawReleaseInspector();
         void DrawFoldSettings(bool manual);
         void DrawRestorePanel();
         void DrawFilesPanel();
@@ -145,6 +156,14 @@ namespace Bakugan {
         RestoreParams m_RestoreParams;
         Pipeline m_Pipeline = Pipeline::Idle;
         bool m_RunAll = false;
+        double m_RunStart = 0.0;
+        std::vector<RunRecord> m_Runs;
+        float m_FitIoU = -1.0f;
+        bool m_ShowReleases = true;
+        bool m_ShowContacts = false;
+        std::vector<Vector3> m_Contacts;
+        float m_ContactsAt = -1.0f;
+        Design m_ContactsFor;
         std::vector<float> m_LastHistory;
         std::shared_ptr<const Design> m_Preview;
         FoldParams m_ModelParams;

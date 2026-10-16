@@ -32,6 +32,9 @@ namespace Bakugan {
     //      thickest core, take its connected component, dilate back) and initialises each with PCA.
     //   2. All primitives are refined by gradient descent on a soft occupancy loss with an overlap penalty.
     //   3. Primitives whose removal lowers loss + parsimony are pruned; the unexplained residual seeds the next round.
+    // PCA initialisation of one primitive from points of the region it should cover.
+    SuperFrustum SeedPrimitiveFromPoints(const std::vector<Vector3>& points, float voxel);
+
     DecomposeResult Decompose(const std::shared_ptr<const TriMesh>& mesh, const DecomposeParams& params,
                               const std::vector<SuperFrustum>& initial, JobControl& control);
 }

@@ -14,6 +14,11 @@ namespace Bakugan {
         float angle = 0.0f;          // closed (ball) angle, radians, 0..maxAngle
         float maxAngle = PI;
         bool locked = false;         // rigid connection instead of a hinge
+        // Release chain (single latch): the master hinge (trigger -1) is held by the latch on the root; every other
+        // working hinge is held shut by a catch on the part of its trigger hinge, and springs open once that hinge
+        // has opened `release` of its travel. -2 = not assigned yet (repaired to the default chain).
+        int trigger = -2;
+        float release = 0.5f;
         bool operator==(const Hinge& o) const;
     };
 
@@ -32,11 +37,19 @@ namespace Bakugan {
         bool operator==(const Ball& o) const;
     };
 
+    // When each hinge starts and finishes opening, in units where the whole pop-open takes `total`.
+    struct ReleasePlan {
+        std::vector<float> start;
+        std::vector<float> duration;
+        float total = 1.0f;
+    };
+
     // The full folding design: superfrustum parts arranged in a hinge tree, and the target sphere.
     struct Design {
         std::vector<Part> parts;
         Ball ball;
         int nextId = 1;
+        bool chained = true;         // hinges open one after another from a single latch (else all at once)
 
         int Root() const;
         int IndexOf(int id) const;
@@ -55,6 +68,15 @@ namespace Bakugan {
         void Reroot(int part);                             // reverse the hinges on the path so `part` becomes the root
         int CountHinges() const;
         void RepairHinges();
+        bool Working(int part) const;                      // has a hinge that actually turns
+        int HingedAncestor(int part) const;                // nearest ancestor part with a working hinge, -1 if none
+        int Master() const;                                // the hinge the latch holds
+        std::vector<int> ReleaseCandidates(int part) const;  // hinges that may carry this hinge's catch
+        bool SetTrigger(int part, int trigger);            // false if it would make a release loop
+        void DefaultReleases();                            // each hinge released by the one it hangs from
+        void RepairReleases();
+        ReleasePlan Plan() const;
+        float FoldFactor(int part, float t, const ReleasePlan& plan) const;   // share of the closed angle at fold t
         std::string Serialize() const;
         bool Deserialize(const std::string& text, std::string* err);
         bool operator==(const Design& o) const;

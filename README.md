@@ -52,6 +52,21 @@ with the same volume.
    ball's radius may stray from the equal-volume radius.
 3. **Restore detail.** Builds the final pieces and exports them.
 
+The **Pipeline** choice decides how the parts and the fold are found:
+
+- **Separate** fits the superfrustums to the mesh first, then optimises how those fixed parts fold.
+- **Joint** starts from a coarse decomposition and then optimises the superfrustums and the fold together, so part
+  layouts that fit the sphere better can win.
+
+Every finished optimisation is added to **Compare runs**, with parts/hinges, shell coverage, detail kept, whether the
+motion is collision free, superfrustum fit (IoU) and time.
+
+Two options shape what counts as a valid Bakugan:
+
+- **Single latch**: one latch on the root holds one hinge. Every other hinge is caught by a neighbouring hinge and
+  springs open once that one has opened far enough, so a single release pops the whole ball.
+- **Collision-free motion**: the finished pieces may not pass through each other anywhere between figure and ball.
+
 **Run everything** does all three in a row. Every stage runs on a worker thread. The views show its progress live, and
 **Stop** keeps the best result so far.
 
@@ -69,7 +84,11 @@ with the same volume.
   - Space or **Pop open** releases the ball: the springs snap every hinge open, with a bounce.
   - **Shell gaps** shows uncovered (red) and double-covered (amber) sphere surface.
   - **Lost material** shows what gets trimmed or collides.
-- **Fold analysis (live)** re-scores the design on every edit.
+- **Release (latch chain)**: choose which hinge releases the selected one (or the latch, for a hinge on the root) and
+  how far that hinge must open first. **Default chain** releases every hinge from the one it hangs from.
+- **Fold analysis (live)** re-scores the design on every edit, including whether the motion is collision free and
+  where it is blocked. In the Ball view, **Releases** draws the latch (red) and the release arrows (magenta), and
+  **Contacts** shows pieces touching at the current fold fraction while you scrub the slider.
 - **Refine with optimiser** runs the automatic fold optimiser starting from your design. Tick *Keep my hinge tree* to
   only tune it.
 
@@ -149,6 +168,63 @@ The rules follow the paper's design guidelines:
 After every step, a repair pass clamps the angles to their stops, the radius to the leeway band, and projects pivots
 back into both parts.
 
+### Single latch (`data/design.*`)
+
+Each working hinge has a **trigger**: either the latch (exactly one "master" hinge, which must hang off the root,
+where the magnet lever is) or a neighbouring hinge. Neighbours are the hinge it hangs from, its siblings, or its
+children. A hinge's catch lets go once its trigger has opened a **release** share of its travel. The triggers form a
+tree rooted at the latch, so one release opens everything.
+
+From that tree the design derives a release timeline (`Design::Plan`):
+
+- Each spring turns at a steady rate, so bigger folds take longer and ease into their stop.
+- A hinge starts when its trigger reaches the release point.
+- The fold slider and the pop-open animation follow this timeline, and closing is the same path run in reverse.
+
+The optimiser treats the wiring as part of the design. The grammar gains **rewire** (hand a hinge's catch to another
+neighbour) and **move latch** rules, and the release points are continuous parameters.
+
+### Collision-free motion
+
+This follows the trajectory-wide collision objective of Megaro et al.'s compliant-mechanism design tool (SIGGRAPH
+2017), and the staged fold sequences and fold stops of Felton et al. (Science 2014).
+
+The motion is checked with the **finished pieces**, not the superfrustums:
+
+- **Pieces.** Each part's surviving material (inside the sphere, and not carved away by a higher-priority part when
+  closed, exactly as the restoration does) plus samples of its shell plates.
+- **Along the timeline.** Pieces are moved along the release timeline. Pairs that come closer than the sample spacing
+  count as contact, except two kinds:
+  - pairs that already touch in the open pose: the cut between neighbouring pieces;
+  - the knuckle of the hinge joining two parts.
+- **In the figure.** Shell plates must not sit inside another part's material in the open pose.
+
+During optimisation, a few moments are sampled, re-jittered every step, plus the open pose and the last approach
+into the ball. The kept result is judged at 32 moments. If the best design still isn't collision free, a **repair
+phase** keeps optimising with the motion term boosted, changing only hinges and the release chain, until it is.
+"Collision free" means at most 0.4% of the samples touch at any moment, which allows for sampling noise.
+
+### Joint shape and fold optimisation
+
+This follows Design for Descent, which optimises grammar structure and continuous parameters together rather than in
+separate stages.
+
+- **The objective** becomes fold + `wFit` × the decomposition's soft-occupancy fit loss.
+- **Continuous steps** also move superfrustum parameters: pose, size, rounding, taper, bulge and dilation. Each
+  candidate re-assigns the material to the nearest superfrustum through a cached distance matrix.
+- **Extra grammar rules:**
+
+  | Rule | What it does | Undone by |
+  | --- | --- | --- |
+  | Add part | Seeds a primitive by PCA on input material no superfrustum explains, glued rigidly to its nearest part | Remove part |
+  | Remove part | Drops a small part; its material goes to its neighbours | Add part |
+
+  Together with split and merge, these let it try different superfrustum configurations while it folds.
+
+On the critter demo, with the motion constraint on, the joint pipeline finished with 77% of the shell covered by
+superfrustums against 44% for the separate one. The restored sphere was 92% closed against 64%. Detail kept and
+collision-free motion were about the same, at a slightly lower superfrustum fit (89% vs 90% IoU).
+
 ### Detail restoration (`data/restore.*`)
 
 Each part's final piece is computed as a field in its open-pose frame:
@@ -174,5 +250,7 @@ outer sphere is the original level set, so the detail is restored. OpenVDB `volu
 - **Volume budget.** A sphere with the same volume as the figure can't hold every limb without loss. The optimiser
   trades trimmed detail against collisions and shell coverage. Widen the size leeway or change the weights to move
   that balance.
+- **Contact checks are sampled.** Motion and contact checks work at the sample spacing (about 1/30 of the model). Very
+  thin clearances below that are not resolved.
 - **Hinge hardware.** Hinges are modelled as ideal revolute joints. Pins, springs and clearances still have to be
   designed for printing.

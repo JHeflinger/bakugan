@@ -412,6 +412,10 @@ namespace Bakugan {
         }
     }
 
+    SuperFrustum SeedPrimitiveFromPoints(const std::vector<Vector3>& points, float voxel) {
+        return SeedPrimitive(points, voxel);
+    }
+
     DecomposeResult Decompose(const std::shared_ptr<const TriMesh>& mesh, const DecomposeParams& prm,
                               const std::vector<SuperFrustum>& initial, JobControl& control) {
         DecomposeResult result;

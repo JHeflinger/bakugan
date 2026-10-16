@@ -74,12 +74,14 @@ int main(int argc, char** argv) {
 
     auto meshPtr = std::make_shared<const TriMesh>(mesh);
     JobControl control;
+    bool joint = getenv("BK_JOINT") != nullptr;
     DecomposeParams dp;
     if (quick) { dp.rounds = 2; dp.iterations = 25; }
+    if (joint) { dp.rounds = 2; dp.iterations = 40; }   // the joint pipeline starts from a coarse decomposition
     DecomposeResult dr;
     {
         FILE* cache = fopen("build/decomp_cache.txt", "r");
-        if (cache && !quick && which == "critter") {
+        if (cache && !quick && !joint && which == "critter") {
             char buf[1 << 16]; size_t n = fread(buf, 1, sizeof(buf) - 1, cache); buf[n] = 0; fclose(cache);
             Design cd; std::string e2; cd.Deserialize(buf, &e2);
             for (const Part& p : cd.parts) dr.shapes.push_back(p.shape);
@@ -88,7 +90,7 @@ int main(int argc, char** argv) {
             if (cache) fclose(cache);
             dr = Decompose(meshPtr, dp, {}, control);
             Design cd; for (const SuperFrustum& s2 : dr.shapes) cd.AddPart(s2, -1);
-            if (!quick && which == "critter") { FILE* w = fopen("build/decomp_cache.txt", "w"); std::string t = cd.Serialize(); fwrite(t.data(), 1, t.size(), w); fclose(w); }
+            if (!quick && !joint && which == "critter") { FILE* w = fopen("build/decomp_cache.txt", "w"); std::string t = cd.Serialize(); fwrite(t.data(), 1, t.size(), w); fclose(w); }
         }
     }
     printf("decompose: %s\n", dr.message.c_str());
@@ -106,6 +108,9 @@ int main(int argc, char** argv) {
     if (getenv("BK_WTRIM")) fp.wTrim = atof(getenv("BK_WTRIM"));
     if (getenv("BK_TOL")) fp.volumeTolerance = atof(getenv("BK_TOL"));
     if (getenv("BK_ITERS")) fp.iterations = atoi(getenv("BK_ITERS"));
+    if (getenv("BK_WPATH")) fp.wPath = atof(getenv("BK_WPATH"));
+    if (getenv("BK_UNCHAINED")) fp.chained = false;
+    fp.joint = joint;
     FoldModel model(shape, fp);
     FoldState state = model.MakeState(design);
     BuildFoldTree(state, model);
@@ -122,6 +127,20 @@ int main(int argc, char** argv) {
     JobControl fc;
     FoldResult fr = OptimizeFold(state.design, shape, fp, fc);
     printf("fold: %s\n  loss %.4f -> %.4f  radius x%.3f\n", fr.message.c_str(), m0.loss, fr.metrics.loss, fr.metrics.radiusRatio);
+    printf("  motion: %s, worst contact %.2f%% at t=%.2f   tree start: worst %.2f%%\n", fr.metrics.foldable ? "CLEAR" : "BLOCKED",
+           fr.metrics.pathCollision * 100.0f, fr.metrics.pathWorstT, m0.pathCollision * 100.0f);
+    {
+        const Design& d = fr.design;
+        ReleasePlan plan = d.Plan();
+        printf("  latch chain (master %s):\n", d.Master() >= 0 ? d.parts[d.Master()].name.c_str() : "none");
+        for (size_t i = 0; i < d.parts.size(); i++) {
+            const Hinge& h = d.parts[i].hinge;
+            if (!d.Working((int)i)) continue;
+            printf("    %-10s released by %-10s at %3.0f%%  opens %.2f..%.2f\n", d.parts[i].name.c_str(),
+                   h.trigger >= 0 ? d.parts[h.trigger].name.c_str() : "LATCH", h.release * 100.0f, plan.start[i] / plan.total,
+                   (plan.start[i] + plan.duration[i]) / plan.total);
+        }
+    }
     std::vector<float> hist = fc.History();
     printf("  history:");
     for (size_t i = 0; i < hist.size(); i += std::max<size_t>(1, hist.size() / 10)) printf(" %.4f", hist[i]);

@@ -136,6 +136,17 @@ namespace Bakugan {
         if (ImGui::Button("Run everything", ImVec2(-FLT_MIN, 30))) RunAll();
         ImGui::EndDisabled();
         ImGui::SetItemTooltip("Decompose, build the hinge tree, optimise the fold, then restore the detail.");
+        ImGui::BeginDisabled(Busy());
+        ImGui::TextUnformatted("Pipeline");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Separate", !m_FoldParams.joint)) m_FoldParams.joint = false;
+        ImGui::SetItemTooltip("Fit the superfrustums to the mesh first, then optimise how those fixed parts fold.");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Joint", m_FoldParams.joint)) m_FoldParams.joint = true;
+        ImGui::SetItemTooltip("Start from a coarse decomposition, then optimise the superfrustums and the fold together:\n"
+                              "the descent moves primitives against fit + fold, and the grammar can add, remove, split and\n"
+                              "merge them while it rewires the hinges (Design for Descent's joint search).");
+        ImGui::EndDisabled();
 
         ImGui::SeparatorText("1  Superfrustum decomposition");
         ImGui::BeginDisabled(Busy());
@@ -157,9 +168,44 @@ namespace Bakugan {
         DrawFoldSettings(false);
         DrawMetrics();
 
+        DrawRuns();
+
         ImGui::SeparatorText("3  Restore detail");
         DrawRestorePanel();
         DrawFilesPanel();
+    }
+
+    void App::DrawRuns() {
+        if (m_Runs.empty()) return;
+        if (!ImGui::TreeNodeEx("Compare runs", ImGuiTreeNodeFlags_DefaultOpen)) return;
+        ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit;
+        if (ImGui::BeginTable("runs", 7, flags, ImVec2(0, 0))) {
+            ImGui::TableSetupColumn("run");
+            ImGui::TableSetupColumn("parts");
+            ImGui::TableSetupColumn("shell");
+            ImGui::TableSetupColumn("kept");
+            ImGui::TableSetupColumn("motion");
+            ImGui::TableSetupColumn("fit");
+            ImGui::TableSetupColumn("time");
+            ImGui::TableHeadersRow();
+            for (const RunRecord& r : m_Runs) {
+                const FoldMetrics& m = r.metrics;
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(r.label.c_str());
+                ImGui::TableNextColumn(); ImGui::Text("%d/%d", r.parts, r.hinges);
+                ImGui::SetItemTooltip("parts / working hinges");
+                ImGui::TableNextColumn(); ImGui::Text("%.0f%%", m.coverage * 100.0f);
+                ImGui::TableNextColumn(); ImGui::Text("%.0f%%", (1.0f - m.trimmed) * 100.0f);
+                ImGui::TableNextColumn();
+                if (m.foldable) ImGui::TextColored(ImVec4(0.4f, 0.85f, 0.5f, 1), "clear");
+                else ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1), "%.1f%%", m.pathCollision * 100.0f);
+                ImGui::TableNextColumn(); ImGui::Text("%.0f%%", m.fitIoU * 100.0f);
+                ImGui::TableNextColumn(); ImGui::Text("%.0fs", r.seconds);
+            }
+            ImGui::EndTable();
+        }
+        if (ImGui::SmallButton("Clear")) m_Runs.clear();
+        ImGui::TreePop();
     }
 
     void App::DrawFoldSettings(bool manual) {
@@ -173,6 +219,14 @@ namespace Bakugan {
             ImGui::TextDisabled("radius %.3f .. %.3f  (equal volume %.3f)", m_FoldModel.RadiusMin(), m_FoldModel.RadiusMax(),
                                 m_Shape->equalRadius);
         ImGui::SliderAngle("Max hinge fold", &p.maxHingeAngle, 10.0f, 180.0f);
+        ImGui::Checkbox("Single latch", &p.chained);
+        ImGui::SetItemTooltip("One latch on the root holds one hinge; every other hinge is caught by a neighbouring hinge and\n"
+                              "springs open once that one has opened far enough, so a single release pops the whole ball.\n"
+                              "The optimiser rewires who releases whom and when.");
+        ImGui::SameLine();
+        ImGui::Checkbox("Collision-free motion", &p.checkPath);
+        ImGui::SetItemTooltip("The finished pieces must not pass through each other at any moment between figure and ball\n"
+                              "(following the release timeline), and shell plates must not dig into other parts in the figure.");
         if (!manual || ImGui::TreeNode("Optimiser")) {
             ImGui::SliderInt("Iterations", &p.iterations, 10, 800);
             ImGui::SliderInt("Rewrites (K)", &p.candidates, 2, 64);
@@ -184,8 +238,10 @@ namespace Bakugan {
             ImGui::SameLine();
             ImGui::Checkbox("Allow splits", &p.allowSplit);
             ImGui::SetItemTooltip("Let the grammar cut long parts in two with a new hinge.");
-            ImGui::Checkbox("Check the folding path", &p.checkPath);
-            ImGui::SetItemTooltip("Also penalise parts passing through each other half way through the fold.");
+            if (p.joint) {
+                ImGui::SliderInt("Shapes per step", &p.shapeBlock, 1, 4);
+                ImGui::SetItemTooltip("Joint pipeline: superfrustums whose parameters are updated in each descent step.");
+            }
             if (manual) ImGui::TreePop();
         }
         if (ImGui::TreeNode("Objective weights")) {
@@ -198,7 +254,12 @@ namespace Bakugan {
             ImGui::SetItemTooltip("Extra weight on trimmed surface detail (creases, small features).");
             ImGui::SliderFloat("Collision", &p.wCollision, 0.0f, 8.0f, "%.2f");
             ImGui::SetItemTooltip("Material of different parts in the same place when closed.");
-            ImGui::SliderFloat("Path collision", &p.wPath, 0.0f, 4.0f, "%.2f");
+            ImGui::SliderFloat("Motion collision", &p.wPath, 0.0f, 8.0f, "%.2f");
+            ImGui::SetItemTooltip("Pieces touching while folding or unfolding (treated close to a hard constraint).");
+            if (p.joint) {
+                ImGui::SliderFloat("Fit (joint)", &p.wFit, 0.0f, 100.0f, "%.1f");
+                ImGui::SetItemTooltip("Joint pipeline: how strongly the superfrustums must keep reconstructing the input.");
+            }
             ImGui::SliderFloat("Pivot contact", &p.wContact, 0.0f, 4.0f, "%.2f");
             ImGui::SliderFloat("Joints inside", &p.wLink, 0.0f, 4.0f, "%.2f");
             ImGui::SetItemTooltip("Keep every hinge inside the closed sphere, so no link of a chain is cut away.");
@@ -209,7 +270,7 @@ namespace Bakugan {
             if (ImGui::Button("Defaults")) {
                 FoldParams def;
                 p.wCoverage = def.wCoverage; p.wShellOverlap = def.wShellOverlap; p.wTrim = def.wTrim; p.wDetail = def.wDetail;
-                p.wCollision = def.wCollision; p.wPath = def.wPath; p.wContact = def.wContact; p.wVolume = def.wVolume; p.wLink = def.wLink;
+                p.wCollision = def.wCollision; p.wPath = def.wPath; p.wContact = def.wContact; p.wVolume = def.wVolume; p.wLink = def.wLink; p.wFit = def.wFit;
                 p.hingeCost = def.hingeCost;
             }
             ImGui::TreePop();
@@ -248,8 +309,15 @@ namespace Bakugan {
         Meter("shell covered", m.coverage, true, "%.0f%%", "Share of the sphere's surface covered by a part's superfrustum when closed.");
         Meter("detail kept", 1.0f - m.trimmed, true, "%.0f%%", "Share of the (curvature weighted) material that stays inside the sphere.");
         Meter("colliding", m.collision, false, "%.1f%%", "Material samples that share space with another part when closed.");
-        if (m_FoldParams.checkPath) Meter("colliding mid-fold", m.pathCollision, false, "%.1f%%", "Collisions half way through folding.");
         Meter("shell doubled", m.shellOverlap, false, "%.0f%%", "Sphere surface claimed by two parts.");
+        if (m.fitIoU >= 0) Meter("superfrustum fit", m.fitIoU, true, "%.0f%%", "IoU of the superfrustums against the input shape.");
+        if (m.foldable)
+            ImGui::TextColored(ImVec4(0.4f, 0.85f, 0.5f, 1), "Motion: collision free (worst %.2f%% touching)", m.pathCollision * 100.0f);
+        else
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1), "Motion: blocked %s %.0f%% folded (%.1f%% touching)",
+                               m.pathWorstT <= 0.0f ? "in the figure," : "at", m.pathWorstT * 100.0f, m.pathCollision * 100.0f);
+        ImGui::SetItemTooltip("Checked at 32 moments along the release timeline. Turn on 'Contacts' in the Ball view\n"
+                              "and scrub the fold slider to see where pieces touch.");
         ImGui::TextDisabled("radius %.3f (x%.2f of equal volume)   pivot misfit %.2f   objective %.4f", m.radius, m.radiusRatio,
                             m.contact, m.loss);
     }
@@ -319,6 +387,7 @@ namespace Bakugan {
         DrawPartList();
         DrawPartInspector();
         DrawHingeInspector();
+        DrawReleaseInspector();
         DrawSphereInspector();
         ImGui::EndDisabled();
         ImGui::SeparatorText("Fold analysis (live)");
@@ -378,7 +447,8 @@ namespace Bakugan {
                                  : p.hinge.locked ? "  rigid" : "";
                 char label[96];
                 if (p.hinge.parent >= 0 && !p.hinge.locked)
-                    snprintf(label, sizeof(label), "%s   %.0f deg", p.name.c_str(), d.FoldAngle(i) * RAD2DEG);
+                    snprintf(label, sizeof(label), "%s   %.0f deg%s", p.name.c_str(), d.FoldAngle(i) * RAD2DEG,
+                             d.chained && p.hinge.trigger == -1 ? "  [latch]" : "");
                 else
                     snprintf(label, sizeof(label), "%s%s", p.name.c_str(), kind);
                 bool open = ImGui::TreeNodeEx("node", flags, "%s", label);
@@ -501,6 +571,43 @@ namespace Bakugan {
         if (ImGui::Button("Flip", ImVec2(-FLT_MIN, 0))) h.axis = Vector3Negate(h.axis);
         ImGui::SetItemTooltip("Fold the other way round.");
         ImGui::EndDisabled();
+    }
+
+    void App::DrawReleaseInspector() {
+        Design& d = m_Design;
+        ImGui::SeparatorText("Release (latch chain)");
+        ImGui::Checkbox("Single latch", &d.chained);
+        ImGui::SetItemTooltip("On: hinges open one after another from one latch. Off: every hinge opens at the same time.");
+        if (d.chained) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Default chain")) d.DefaultReleases();
+            ImGui::SetItemTooltip("Every hinge released by the hinge it hangs from; the biggest hinge on the root takes the latch.");
+        }
+        if (!d.chained || m_Selected < 0 || m_Selected >= (int)d.parts.size() || !d.Working(m_Selected)) {
+            if (d.chained) ImGui::TextDisabled("Select a part with a working hinge to set what releases it.");
+            return;
+        }
+        Hinge& h = d.parts[m_Selected].hinge;
+        const char* current = h.trigger == -1 ? "the latch" : (h.trigger >= 0 ? d.parts[h.trigger].name.c_str() : "(unset)");
+        if (ImGui::BeginCombo("Released by", current)) {
+            if (d.HingedAncestor(m_Selected) < 0 && ImGui::Selectable("the latch", h.trigger == -1)) d.SetTrigger(m_Selected, -1);
+            for (int j : d.ReleaseCandidates(m_Selected)) {
+                ImGui::PushID(j);
+                if (ImGui::Selectable(d.parts[j].name.c_str(), h.trigger == j)) d.SetTrigger(m_Selected, j);
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SetItemTooltip("The latch can only hold a hinge on the root. Other hinges are caught by a neighbouring hinge\n"
+                              "(the one they hang from, a sibling or a child) that does not itself wait on this one.");
+        if (h.trigger >= 0) {
+            float pct = h.release * 100.0f;
+            if (ImGui::SliderFloat("Release at", &pct, 0.0f, 100.0f, "%.0f%% of its opening")) h.release = pct / 100.0f;
+            ImGui::SetItemTooltip("How far the releasing hinge must have opened before this one springs open.");
+        }
+        ReleasePlan plan = d.Plan();
+        ImGui::TextDisabled("Opens from %.0f%% to %.0f%% of the pop-open", 100.0f * plan.start[m_Selected] / plan.total,
+                            100.0f * (plan.start[m_Selected] + plan.duration[m_Selected]) / plan.total);
     }
 
     void App::DrawSphereInspector() {

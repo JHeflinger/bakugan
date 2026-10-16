@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <sstream>
 
 namespace Bakugan {
@@ -11,7 +12,7 @@ namespace Bakugan {
 
     bool Hinge::operator==(const Hinge& o) const {
         return parent == o.parent && SameVec(pivot, o.pivot) && SameVec(axis, o.axis) && angle == o.angle &&
-               maxAngle == o.maxAngle && locked == o.locked;
+               maxAngle == o.maxAngle && locked == o.locked && trigger == o.trigger && release == o.release;
     }
 
     bool Part::operator==(const Part& o) const {
@@ -24,7 +25,7 @@ namespace Bakugan {
     }
 
     bool Design::operator==(const Design& o) const {
-        return parts == o.parts && ball == o.ball && nextId == o.nextId;
+        return parts == o.parts && ball == o.ball && nextId == o.nextId && chained == o.chained;
     }
 
     int Design::Root() const {
@@ -49,9 +50,11 @@ namespace Bakugan {
         int n = (int)parts.size();
         std::vector<Rigid> xf(n);
         std::vector<char> done(n, 0);
+        ReleasePlan plan;
+        if (chained && t < 1.0f) plan = Plan();
         for (int i : TopologicalOrder()) {
             const Hinge& h = parts[i].hinge;
-            Rigid local = Rigid::AboutAxis(h.pivot, h.axis, FoldAngle(i) * t);
+            Rigid local = Rigid::AboutAxis(h.pivot, h.axis, FoldAngle(i) * FoldFactor(i, t, plan));
             xf[i] = (h.parent >= 0 && done[h.parent]) ? local.Then(xf[h.parent]) : local;
             done[i] = 1;
         }
@@ -117,11 +120,17 @@ namespace Bakugan {
     void Design::RemovePart(int part) {
         if (part < 0 || part >= (int)parts.size()) return;
         int up = parts[part].hinge.parent;
-        for (Part& p : parts)
+        int upTrigger = parts[part].hinge.trigger;
+        for (Part& p : parts) {
             if (p.hinge.parent == part) p.hinge.parent = up;
+            if (p.hinge.trigger == part) p.hinge.trigger = upTrigger;   // inherit the removed hinge's catch
+        }
         parts.erase(parts.begin() + part);
-        for (Part& p : parts)
+        for (Part& p : parts) {
             if (p.hinge.parent > part) p.hinge.parent--;
+            if (p.hinge.trigger > part) p.hinge.trigger--;
+        }
+        RepairReleases();
     }
 
     bool Design::Reparent(int part, int parent) {
@@ -157,6 +166,142 @@ namespace Bakugan {
                 else if (p.hinge.parent == part) p.hinge.parent = 0;
             }
         }
+        DefaultReleases();
+    }
+
+    // ---- release chain -----------------------------------------------------------------------------------------------
+
+    bool Design::Working(int i) const {
+        return i >= 0 && i < (int)parts.size() && parts[i].hinge.parent >= 0 && !parts[i].hinge.locked;
+    }
+
+    int Design::HingedAncestor(int i) const {
+        int guard = 0;
+        for (int p = parts[i].hinge.parent; p >= 0 && guard++ <= (int)parts.size(); p = parts[p].hinge.parent)
+            if (Working(p)) return p;
+        return -1;
+    }
+
+    int Design::Master() const {
+        for (int i = 0; i < (int)parts.size(); i++)
+            if (Working(i) && parts[i].hinge.trigger == -1) return i;
+        return -1;
+    }
+
+    static bool ReachesThroughTriggers(const Design& d, int from, int target) {
+        int guard = 0;
+        for (int p = from; p >= 0 && guard++ <= (int)d.parts.size(); p = d.parts[p].hinge.trigger)
+            if (p == target) return true;
+        return false;
+    }
+
+    std::vector<int> Design::ReleaseCandidates(int i) const {
+        // a catch has to sit on a neighbouring part: the hinge this part hangs from, its siblings, or its children
+        std::vector<int> out;
+        if (!Working(i)) return out;
+        int up = HingedAncestor(i);
+        for (int j = 0; j < (int)parts.size(); j++) {
+            if (j == i || !Working(j)) continue;
+            int ju = HingedAncestor(j);
+            bool near = j == up || ju == i || ju == up;
+            if (near && !ReachesThroughTriggers(*this, j, i)) out.push_back(j);
+        }
+        return out;
+    }
+
+    bool Design::SetTrigger(int i, int trigger) {
+        if (!Working(i)) return false;
+        if (trigger == -1) {
+            if (HingedAncestor(i) >= 0) return false;      // the latch sits on the root
+            for (int j = 0; j < (int)parts.size(); j++)
+                if (j != i && Working(j) && parts[j].hinge.trigger == -1) parts[j].hinge.trigger = i;
+            parts[i].hinge.trigger = -1;
+            return true;
+        }
+        if (!Working(trigger) || trigger == i || ReachesThroughTriggers(*this, trigger, i)) return false;
+        parts[i].hinge.trigger = trigger;
+        return true;
+    }
+
+    void Design::DefaultReleases() {
+        int master = -1;
+        for (int i = 0; i < (int)parts.size(); i++)
+            if (Working(i) && HingedAncestor(i) < 0 && (master < 0 || parts[i].hinge.angle > parts[master].hinge.angle)) master = i;
+        for (int i = 0; i < (int)parts.size(); i++) {
+            Hinge& h = parts[i].hinge;
+            if (!Working(i)) { h.trigger = -2; continue; }
+            int up = HingedAncestor(i);
+            h.trigger = i == master ? -1 : (up >= 0 ? up : master);
+            h.release = 0.5f;
+        }
+    }
+
+    void Design::RepairReleases() {
+        int n = (int)parts.size();
+        // exactly one master, hanging from the root
+        int master = -1;
+        for (int i = 0; i < n; i++)
+            if (Working(i) && parts[i].hinge.trigger == -1) {
+                if (master < 0 && HingedAncestor(i) < 0) master = i;
+                else parts[i].hinge.trigger = -2;
+            }
+        if (master < 0)
+            for (int i = 0; i < n; i++)
+                if (Working(i) && HingedAncestor(i) < 0 && (master < 0 || parts[i].hinge.angle > parts[master].hinge.angle)) master = i;
+        if (master >= 0) parts[master].hinge.trigger = -1;
+        auto fallback = [&](int i) { int up = HingedAncestor(i); return up >= 0 ? up : master; };
+        for (int i = 0; i < n; i++) {
+            Hinge& h = parts[i].hinge;
+            h.release = std::clamp(h.release, 0.0f, 1.0f);
+            if (!Working(i)) { h.trigger = -2; continue; }
+            if (i == master) continue;
+            if (h.trigger < 0 || h.trigger >= n || h.trigger == i || !Working(h.trigger)) h.trigger = fallback(i);
+        }
+        // break loops: the fallback chain only climbs towards the master, so resetting ends them
+        for (int pass = 0; pass <= n; pass++) {
+            bool changed = false;
+            for (int i = 0; i < n; i++) {
+                if (!Working(i) || i == master) continue;
+                int guard = 0, p = parts[i].hinge.trigger;
+                while (p >= 0 && p != master && guard++ <= n) p = parts[p].hinge.trigger;
+                if (guard > n || (p != master && master >= 0)) { parts[i].hinge.trigger = fallback(i); changed = true; }
+            }
+            if (!changed) break;
+        }
+    }
+
+    ReleasePlan Design::Plan() const {
+        int n = (int)parts.size();
+        ReleasePlan plan;
+        plan.start.assign(n, 0.0f);
+        plan.duration.assign(n, 1.0f);
+        std::vector<char> state(n, 0);   // 0 todo, 1 visiting, 2 done
+        std::function<float(int)> start = [&](int i) -> float {
+            if (state[i] == 2) return plan.start[i];
+            if (state[i] == 1) return 0.0f;   // loop guard
+            state[i] = 1;
+            const Hinge& h = parts[i].hinge;
+            float s = 0.0f;
+            if (Working(h.trigger) && h.trigger != i) s = start(h.trigger) + h.release * plan.duration[h.trigger];
+            plan.start[i] = s;
+            state[i] = 2;
+            return s;
+        };
+        // springs turn at a steady rate: bigger folds take longer
+        for (int i = 0; i < n; i++) plan.duration[i] = 0.25f + FoldAngle(i) / PI;
+        plan.total = 1e-3f;
+        for (int i = 0; i < n; i++)
+            if (Working(i)) plan.total = fmaxf(plan.total, start(i) + plan.duration[i]);
+        return plan;
+    }
+
+    float Design::FoldFactor(int i, float t, const ReleasePlan& plan) const {
+        if (!chained || t >= 1.0f || plan.start.empty()) return t;
+        if (!Working(i)) return 0.0f;
+        float tau = (1.0f - t) * plan.total;
+        float x = std::clamp((tau - plan.start[i]) / plan.duration[i], 0.0f, 1.0f);
+        float opened = 1.0f - (1.0f - x) * (1.0f - x);   // the spring is quick at first, then eases into its stop
+        return 1.0f - opened;
     }
 
     int Design::CountHinges() const {
@@ -181,6 +326,7 @@ namespace Bakugan {
             for (int p = parts[i].hinge.parent; p >= 0; p = parts[p].hinge.parent)
                 if (++guard > (int)parts.size()) { parts[i].hinge.parent = -1; break; }
         }
+        RepairReleases();
     }
 
     std::string Design::Serialize() const {
@@ -189,6 +335,7 @@ namespace Bakugan {
         s << "bakugan-design 1\n";
         s << "ball " << ball.center.x << " " << ball.center.y << " " << ball.center.z << " " << ball.radius << "\n";
         s << "nextid " << nextId << "\n";
+        s << "chained " << (chained ? 1 : 0) << "\n";
         for (const Part& p : parts) {
             const SuperFrustum& f = p.shape;
             const Hinge& h = p.hinge;
@@ -201,7 +348,7 @@ namespace Bakugan {
               << f.rounding << " " << f.taper << " " << f.bulge << " " << f.dilation << " " << f.onion
               << " hinge " << h.parent << " " << h.pivot.x << " " << h.pivot.y << " " << h.pivot.z << " "
               << h.axis.x << " " << h.axis.y << " " << h.axis.z << " " << h.angle << " " << h.maxAngle << " "
-              << (h.locked ? 1 : 0) << "\n";
+              << (h.locked ? 1 : 0) << " release " << h.trigger << " " << h.release << "\n";
         }
         return s.str();
     }
@@ -219,6 +366,7 @@ namespace Bakugan {
             if (tag == "bakugan-design") header = true;
             else if (tag == "ball") ls >> d.ball.center.x >> d.ball.center.y >> d.ball.center.z >> d.ball.radius;
             else if (tag == "nextid") ls >> d.nextId;
+            else if (tag == "chained") { int c = 1; ls >> c; d.chained = c != 0; }
             else if (tag == "part") {
                 Part p;
                 int r, g, b;
@@ -236,12 +384,16 @@ namespace Bakugan {
                 if (ls.fail() || sf != "sf" || hg != "hinge") { *err = "Malformed part line: " + line.substr(0, 60); return false; }
                 p.color = { (unsigned char)r, (unsigned char)g, (unsigned char)b, 255 };
                 h.locked = locked != 0;
+                std::string rel;
+                if (ls >> rel && rel == "release") ls >> h.trigger >> h.release;   // optional (older files)
                 d.parts.push_back(p);
             }
         }
         if (!header) { *err = "Not a bakugan design file"; return false; }
-        for (Part& p : d.parts)
+        for (Part& p : d.parts) {
             if (p.hinge.parent >= (int)d.parts.size()) p.hinge.parent = -1;
+            if (p.hinge.trigger >= (int)d.parts.size()) p.hinge.trigger = -2;
+        }
         for (const Part& p : d.parts) d.nextId = std::max(d.nextId, p.id + 1);
         d.RepairHinges();
         *this = d;

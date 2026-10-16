@@ -2,6 +2,7 @@
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
 #include "fold.hpp"
+#include "decompose.hpp"
 #include "util/optim.hpp"
 #include "util/utils.hpp"
 #include <raymath.h>
@@ -162,7 +163,7 @@ namespace Bakugan {
             return axes;
         }
 
-        enum PKind { CenterX, CenterY, CenterZ, Radius, Angle, AxisU, AxisV, PivotX, PivotY, PivotZ, KindCount };
+        enum PKind { CenterX, CenterY, CenterZ, Radius, Angle, AxisU, AxisV, Release, PivotX, PivotY, PivotZ, KindCount };
 
         struct Param {
             PKind kind;
@@ -185,6 +186,7 @@ namespace Bakugan {
                     h.axis = Vector3Normalize(Vector3Add(h.axis, Vector3Scale(e, delta)));
                     break;
                 }
+                case Release: h.release += delta; break;
                 case PivotX: case PivotY: case PivotZ: (&h.pivot.x)[p.kind - PivotX] += delta; break;
                 default: break;
             }
@@ -194,10 +196,13 @@ namespace Bakugan {
 
         // ---- the fold grammar ----------------------------------------------------------------------------------
 
-        enum Rule { RuleReparent, RuleSplit, RuleMerge, RuleLock, RuleUnlock, RuleAxisSnap, RuleFlip, RuleReseat, RuleCount };
-        const char* RuleNames[RuleCount] = { "reparent", "split", "merge", "lock", "unlock", "axis snap", "flip", "reseat" };
+        enum Rule { RuleReparent, RuleSplit, RuleMerge, RuleLock, RuleUnlock, RuleAxisSnap, RuleFlip, RuleReseat,
+                    RuleRewire, RuleMaster, RuleAddPart, RuleRemovePart, RuleCount };
+        const char* RuleNames[RuleCount] = { "reparent", "split", "merge", "lock", "unlock", "axis snap", "flip", "reseat",
+                                             "rewire release", "move latch", "add part", "remove part" };
 
-        bool Structural(Rule r) { return r == RuleSplit || r == RuleMerge; }
+        // rules that change the set of superfrustums (and so the material ownership)
+        bool Structural(Rule r) { return r == RuleSplit || r == RuleMerge || r == RuleAddPart || r == RuleRemovePart; }
 
         int RandomHingedPart(const Design& d, std::mt19937& rng, bool includeLoose) {
             std::vector<int> c;
@@ -283,14 +288,6 @@ namespace Bakugan {
             for (int ch : children)
                 if (f.ToLocal(d.parts[ch].hinge.pivot).z * movedSign > 0.0f) d.parts[ch].hinge.parent = k;
 
-            // hand the material on the moved side to the new part
-            s.samples.resize(d.parts.size());
-            PartSamples& a = s.samples[i];
-            PartSamples& b = s.samples[k];
-            PartSamples keepA;
-            for (const Vector3& p : a.lattice) (f.ToLocal(p).z * movedSign > 0 ? b.lattice : keepA.lattice).push_back(p);
-            for (const DetailSample& p : a.detail) (f.ToLocal(p.position).z * movedSign > 0 ? b.detail : keepA.detail).push_back(p);
-            a = std::move(keepA);
             affected = { d.parts[i].id, d.parts[k].id };
             for (int ch : children) affected.push_back(d.parts[ch].id);
             return true;
@@ -335,10 +332,6 @@ namespace Bakugan {
             affected = { d.parts[i].id, d.parts[k].id };
             for (int ch : d.Children(k)) affected.push_back(d.parts[ch].id);
             d.parts[i].shape = merged;
-            PartSamples& dst = s.samples[i];
-            dst.lattice.insert(dst.lattice.end(), s.samples[k].lattice.begin(), s.samples[k].lattice.end());
-            dst.detail.insert(dst.detail.end(), s.samples[k].detail.begin(), s.samples[k].detail.end());
-            s.samples.erase(s.samples.begin() + k);
             d.RemovePart(k);   // children of k move up to i, keeping their pivots
             return true;
         }
@@ -386,11 +379,108 @@ namespace Bakugan {
             return true;
         }
 
+        // Release chain: hand a hinge's catch to another neighbouring hinge.
+        bool ApplyRewire(FoldState& s, std::mt19937& rng, std::vector<int>& affected) {
+            Design& d = s.design;
+            if (!d.chained) return false;
+            std::vector<int> c;
+            for (int i = 0; i < (int)d.parts.size(); i++)
+                if (d.Working(i) && d.parts[i].hinge.trigger >= 0) c.push_back(i);
+            std::shuffle(c.begin(), c.end(), rng);
+            for (int i : c) {
+                std::vector<int> js = d.ReleaseCandidates(i);
+                js.erase(std::remove(js.begin(), js.end(), d.parts[i].hinge.trigger), js.end());
+                if (js.empty()) continue;
+                int j = js[std::uniform_int_distribution<int>(0, (int)js.size() - 1)(rng)];
+                if (!d.SetTrigger(i, j)) continue;
+                d.parts[i].hinge.release = std::uniform_real_distribution<float>(0.15f, 0.85f)(rng);
+                affected = { d.parts[i].id, d.parts[j].id };
+                return true;
+            }
+            return false;
+        }
+
+        // Release chain: let the latch hold a different hinge on the root.
+        bool ApplyMaster(FoldState& s, std::mt19937& rng, std::vector<int>& affected) {
+            Design& d = s.design;
+            if (!d.chained) return false;
+            int old = d.Master();
+            std::vector<int> c;
+            for (int i = 0; i < (int)d.parts.size(); i++)
+                if (d.Working(i) && i != old && d.HingedAncestor(i) < 0) c.push_back(i);
+            if (c.empty()) return false;
+            int i = c[std::uniform_int_distribution<int>(0, (int)c.size() - 1)(rng)];
+            if (!d.SetTrigger(i, -1)) return false;
+            affected = { d.parts[i].id };
+            if (old >= 0) affected.push_back(d.parts[old].id);
+            return true;
+        }
+
+        // Joint mode: a new superfrustum for input material no primitive explains ("add anywhere"), glued rigidly to
+        // the nearest part so the fold is unchanged until the optimiser gives it a hinge.
+        bool ApplyAddPart(FoldState& s, const FoldModel& m, std::mt19937& rng, std::vector<int>& affected) {
+            Design& d = s.design;
+            if ((int)d.parts.size() >= m.Params().maxParts || d.parts.empty()) return false;
+            std::vector<SuperFrustum> shapes;
+            for (const Part& p : d.parts) shapes.push_back(p.shape);
+            std::vector<Vector3> loose = m.Fit().Unexplained(shapes);
+            if (loose.size() < 12) return false;
+            Vector3 seed = loose[std::uniform_int_distribution<int>(0, (int)loose.size() - 1)(rng)];
+            float rho = 0.3f * m.EqualRadius();
+            std::vector<Vector3> region;
+            for (const Vector3& q : loose)
+                if (Vector3DistanceSqr(q, seed) < rho * rho) region.push_back(q);
+            if (region.size() < 12) return false;
+            SuperFrustum sf = SeedPrimitiveFromPoints(region, m.Fit().Voxel());
+            int parent = 0;
+            float best = 1e30f;
+            for (int j = 0; j < (int)d.parts.size(); j++) {
+                float v = d.parts[j].shape.Distance(sf.position);
+                if (v < best) { best = v; parent = j; }
+            }
+            int k = d.AddPart(sf, parent);
+            Hinge& h = d.parts[k].hinge;
+            h.locked = true;
+            h.pivot = Vector3Lerp(sf.position, d.parts[parent].shape.position, 0.3f);
+            h.axis = Utils::AnyPerpendicular(Vector3Normalize(Vector3Subtract(sf.position, d.parts[parent].shape.position)));
+            affected = { d.parts[k].id, d.parts[parent].id };
+            return true;
+        }
+
+        // Joint mode: drop a small part; its material goes to its neighbours (reverses add / split).
+        bool ApplyRemovePart(FoldState& s, std::mt19937& rng, std::vector<int>& affected) {
+            Design& d = s.design;
+            int root = d.Root();
+            std::vector<int> c;
+            for (int i = 0; i < (int)d.parts.size(); i++)
+                if (i != root && d.parts[i].hinge.parent >= 0) c.push_back(i);
+            if (c.empty()) return false;
+            std::sort(c.begin(), c.end(), [&](int a, int b) { return s.samples[a].lattice.size() < s.samples[b].lattice.size(); });
+            c.resize(std::min<size_t>(c.size(), 3));
+            int i = c[std::uniform_int_distribution<int>(0, (int)c.size() - 1)(rng)];
+            affected = { d.parts[i].id, d.parts[d.parts[i].hinge.parent].id };
+            for (int ch : d.Children(i)) affected.push_back(d.parts[ch].id);
+            d.RemovePart(i);
+            return true;
+        }
+
         bool ApplyRule(Rule r, FoldState& s, const FoldModel& m, std::mt19937& rng, std::vector<int>& affected) {
+            bool ok = false;
+            switch (r) {
+                case RuleRewire:     ok = ApplyRewire(s, rng, affected); break;
+                case RuleMaster:     ok = ApplyMaster(s, rng, affected); break;
+                case RuleAddPart:    ok = ApplyAddPart(s, m, rng, affected); break;
+                case RuleRemovePart: ok = ApplyRemovePart(s, rng, affected); break;
+                default: break;
+            }
+            if (r >= RuleRewire) {
+                if (ok && Structural(r)) { m.Assign(s); m.UpdateFit(s); }
+                return ok;
+            }
             switch (r) {
                 case RuleReparent: return ApplyReparent(s, m, rng, affected);
-                case RuleSplit:    return ApplySplit(s, m, rng, affected);
-                case RuleMerge:    return ApplyMerge(s, m, rng, affected);
+                case RuleSplit:    ok = ApplySplit(s, m, rng, affected); if (ok) { m.Assign(s); m.UpdateFit(s); } return ok;
+                case RuleMerge:    ok = ApplyMerge(s, m, rng, affected); if (ok) { m.Assign(s); m.UpdateFit(s); } return ok;
                 case RuleLock:     return ApplyLock(s, rng, affected, true);
                 case RuleUnlock:   return ApplyLock(s, rng, affected, false);
                 case RuleAxisSnap: return ApplyAxisSnap(s, m, rng, affected);
@@ -406,8 +496,8 @@ namespace Bakugan {
         public:
             Descent(const FoldModel& model) : m_Model(model) {
                 float h = model.Spacing();
-                const float steps[KindCount] = { 0.3f * h, 0.3f * h, 0.3f * h, 0.2f * h, 0.03f, 0.03f, 0.03f, 0.3f * h, 0.3f * h, 0.3f * h };
-                const float rates[KindCount] = { 0.25f * h, 0.25f * h, 0.25f * h, 0.15f * h, 0.045f, 0.035f, 0.035f, 0.2f * h, 0.2f * h, 0.2f * h };
+                const float steps[KindCount] = { 0.3f * h, 0.3f * h, 0.3f * h, 0.2f * h, 0.03f, 0.03f, 0.03f, 0.08f, 0.3f * h, 0.3f * h, 0.3f * h };
+                const float rates[KindCount] = { 0.25f * h, 0.25f * h, 0.25f * h, 0.15f * h, 0.045f, 0.035f, 0.035f, 0.06f, 0.2f * h, 0.2f * h, 0.2f * h };
                 for (int k = 0; k < KindCount; k++) { m_Step[k] = steps[k]; m_Rate[k] = rates[k]; }
             }
 
@@ -420,7 +510,10 @@ namespace Bakugan {
                 std::shuffle(hinges.begin(), hinges.end(), rng);
                 if ((int)hinges.size() > hingeBlock) hinges.resize(hingeBlock);
                 for (int i : hinges)
-                    for (int k = Angle; k <= (pivots ? PivotZ : AxisV); k++) ps.push_back({ (PKind)k, i });
+                    for (int k = Angle; k <= (pivots ? PivotZ : Release); k++) {
+                        if (k == Release && (!d.chained || d.parts[i].hinge.trigger < 0)) continue;
+                        ps.push_back({ (PKind)k, i });
+                    }
                 return ps;
             }
 
@@ -478,6 +571,69 @@ namespace Bakugan {
                 return current;
             }
 
+            // Joint mode: descend on one superfrustum's parameters against fold + fit, with the material ownership
+            // following the primitive.
+            void ShapeStep(FoldState& s, int part, float decay) {
+                const FitModel& fit = m_Model.Fit();
+                if (!fit.Valid() || part < 0 || part >= (int)s.design.parts.size()) return;
+                std::vector<SuperFrustum> shapes;
+                for (const Part& p : s.design.parts) shapes.push_back(p.shape);
+                FitModel::Cache cache;
+                fit.Prepare(shapes, cache);
+                const float h = m_Model.Spacing(), wFit = m_Model.Params().wFit;
+                // position (3), size (3), rounding, taper, bulge, dilation, rotation (3); the hollow stays as it is
+                const int index[13] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13 };
+                const float step[14] = { 0.25f * h, 0.25f * h, 0.25f * h, 0.25f * h, 0.25f * h, 0.25f * h, 0.03f, 0.03f, 0.03f,
+                                         0.1f * h, 0, 0.02f, 0.02f, 0.02f };
+                const float rate[14] = { 0.2f * h, 0.2f * h, 0.2f * h, 0.2f * h, 0.2f * h, 0.2f * h, 0.03f, 0.03f, 0.02f,
+                                         0.08f * h, 0, 0.02f, 0.02f, 0.02f };
+                SuperFrustum base = shapes[part];
+                float p0[14];
+                base.Pack(p0);
+                p0[11] = p0[12] = p0[13] = 0.0f;
+                auto make = [&](const float* p) {
+                    SuperFrustum sf = base;
+                    sf.Unpack(p);
+                    Vector3 w = { p[11], p[12], p[13] };
+                    float a = Vector3Length(w);
+                    if (a > 1e-9f) sf.rotation = QuaternionMultiply(QuaternionFromAxisAngle(Vector3Scale(w, 1.0f / a), a), sf.rotation);
+                    sf.Repair(0.75f * h);
+                    return sf;
+                };
+                auto objective = [&](const SuperFrustum& sf) {
+                    return m_Model.EvaluateShape(s, part, sf) + wFit * fit.LocalLoss(part, sf, cache);
+                };
+                float g[14] = {};
+                tbb::parallel_for(0, 13, [&](int k) {
+                    int q = index[k];
+                    float a[14], b[14];
+                    std::copy(p0, p0 + 14, a);
+                    std::copy(p0, p0 + 14, b);
+                    a[q] += step[q];
+                    b[q] -= step[q];
+                    g[q] = (objective(make(a)) - objective(make(b))) / (2.0f * step[q]);
+                });
+                float p[14];
+                std::copy(p0, p0 + 14, p);
+                const float b1 = 0.9f, b2 = 0.999f;
+                int id = s.design.parts[part].id;
+                for (int k = 0; k < 13; k++) {
+                    int q = index[k];
+                    AdamCell& c = m_Adam[((uint64_t)id << 8) | (64 + q)];
+                    c.t++;
+                    c.m = b1 * c.m + (1 - b1) * g[q];
+                    c.v = b2 * c.v + (1 - b2) * g[q] * g[q];
+                    float mh = c.m / (1 - powf(b1, (float)c.t)), vh = c.v / (1 - powf(b2, (float)c.t));
+                    p[q] -= rate[q] * decay * mh / (sqrtf(vh) + 1e-12f);
+                }
+                s.design.parts[part].shape = make(p);
+                m_Model.Assign(s);
+                m_Model.UpdateFit(s);
+                m_Model.RepairState(s);
+                m_Model.ProjectPivot(s, part);
+                for (int ch : s.design.Children(part)) m_Model.ProjectPivot(s, ch);
+            }
+
             void Repair(FoldState& s, const std::vector<Param>& ps) const {
                 m_Model.RepairState(s);
                 std::vector<int> pivots;
@@ -513,6 +669,13 @@ namespace Bakugan {
                 if (h.parent >= 0) {
                     h.parent = trial.IndexOf(src.parts[h.parent].id);
                     if (h.parent < 0) return false;
+                }
+                if (h.trigger >= 0) {
+                    int t = trial.IndexOf(src.parts[h.trigger].id);
+                    h.trigger = t >= 0 ? t : -2;
+                } else if (h.trigger == -1) {
+                    for (Part& q : trial.parts)
+                        if (q.hinge.trigger == -1) q.hinge.trigger = -2;   // the latch moves here
                 }
                 trial.parts[di].hinge = h;
             }
@@ -551,6 +714,7 @@ namespace Bakugan {
         }
         m_DetailScale = wsum > 0 ? (float)m_Lattice.size() / wsum : 0.0f;
         m_ShellDirs = Utils::FibonacciSphere(std::max(64, p.shellSamples));
+        m_Fit.Build(f, 14000);
     }
 
     float FoldModel::RadiusMin() const { return EqualRadius() * fmaxf(0.05f, 1.0f - m_Params.volumeTolerance); }
@@ -567,28 +731,75 @@ namespace Bakugan {
         const Design& d = s.design;
         int n = (int)d.parts.size();
         s.samples.assign(n, PartSamples{});
+        s.columns = n;
+        size_t rows = m_Lattice.size() + m_Detail.size();
+        s.distance.assign(rows * n, 0.0f);
         if (n == 0) return;
-        auto nearest = [&](Vector3 p) {
-            int best = 0;
-            float bd = 1e30f;
-            for (int j = 0; j < n; j++) {
-                const SuperFrustum& f = d.parts[j].shape;
-                float lower = Vector3Distance(p, f.position) - f.BoundingRadius();
-                if (lower > bd) continue;
-                float v = f.Distance(p);
-                if (v < bd) { bd = v; best = j; }
+        std::vector<int> owner(rows);
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, rows), [&](const tbb::blocked_range<size_t>& r) {
+            for (size_t i = r.begin(); i < r.end(); i++) {
+                Vector3 p = i < m_Lattice.size() ? m_Lattice[i] : m_Detail[i - m_Lattice.size()].position;
+                float* row = &s.distance[i * n];
+                int best = 0;
+                for (int j = 0; j < n; j++) {
+                    row[j] = d.parts[j].shape.Distance(p);
+                    if (row[j] < row[best]) best = j;
+                }
+                owner[i] = best;
             }
-            return best;
-        };
-        std::vector<int> owner(m_Lattice.size()), downer(m_Detail.size());
-        tbb::parallel_for(tbb::blocked_range<size_t>(0, m_Lattice.size()), [&](const tbb::blocked_range<size_t>& r) {
-            for (size_t i = r.begin(); i < r.end(); i++) owner[i] = nearest(m_Lattice[i]);
-        });
-        tbb::parallel_for(tbb::blocked_range<size_t>(0, m_Detail.size()), [&](const tbb::blocked_range<size_t>& r) {
-            for (size_t i = r.begin(); i < r.end(); i++) downer[i] = nearest(m_Detail[i].position);
         });
         for (size_t i = 0; i < m_Lattice.size(); i++) s.samples[owner[i]].lattice.push_back(m_Lattice[i]);
-        for (size_t i = 0; i < m_Detail.size(); i++) s.samples[downer[i]].detail.push_back(m_Detail[i]);
+        for (size_t i = 0; i < m_Detail.size(); i++) s.samples[owner[m_Lattice.size() + i]].detail.push_back(m_Detail[i]);
+    }
+
+    void FoldModel::UpdateFit(FoldState& s) const {
+        if (!m_Params.joint || !m_Fit.Valid()) { s.fitLoss = 0.0f; return; }
+        std::vector<SuperFrustum> shapes;
+        for (const Part& p : s.design.parts) shapes.push_back(p.shape);
+        s.fitLoss = m_Fit.Loss(shapes);
+    }
+
+    float FoldModel::FitIoU(const Design& d) const {
+        std::vector<SuperFrustum> shapes;
+        for (const Part& p : d.parts) shapes.push_back(p.shape);
+        return m_Fit.IoU(shapes);
+    }
+
+    float FoldModel::Evaluate(const FoldState& s, FoldMetrics* metrics, FoldVisual* visual) const {
+        float fold = Evaluate(s.design, s.samples, metrics, visual);
+        float fit = m_Params.joint ? m_Params.wFit * s.fitLoss : 0.0f;
+        if (metrics) metrics->loss += fit;
+        return fold + fit;
+    }
+
+    float FoldModel::EvaluateShape(const FoldState& s, int i, const SuperFrustum& sf) const {
+        int n = s.columns;
+        if (n != (int)s.design.parts.size() || i < 0 || i >= n) return Evaluate(s.design, s.samples);
+        thread_local std::vector<PartSamples> owned;
+        owned.resize(n);
+        for (PartSamples& ps : owned) { ps.lattice.clear(); ps.detail.clear(); }
+        float reach = sf.BoundingRadius();
+        size_t rows = m_Lattice.size() + m_Detail.size();
+        for (size_t r = 0; r < rows; r++) {
+            bool lattice = r < m_Lattice.size();
+            Vector3 p = lattice ? m_Lattice[r] : m_Detail[r - m_Lattice.size()].position;
+            const float* row = &s.distance[r * n];
+            int best = -1;
+            float bd = 1e30f;
+            for (int j = 0; j < n; j++)
+                if (j != i && row[j] < bd) { bd = row[j]; best = j; }
+            float lower = Vector3Distance(p, sf.position) - reach;
+            if (lower < bd) {
+                float v = sf.Distance(p);
+                if (v < bd) { bd = v; best = i; }
+            }
+            if (best < 0) best = i;
+            if (lattice) owned[best].lattice.push_back(p);
+            else owned[best].detail.push_back(m_Detail[r - m_Lattice.size()]);
+        }
+        Design d = s.design;
+        d.parts[i].shape = sf;
+        return Evaluate(d, owned);
     }
 
     float FoldModel::CollisionLoss(const std::vector<PartSamples>& samples, const std::vector<Rigid>& xf, float* fraction,
@@ -664,10 +875,8 @@ namespace Bakugan {
         float trimLoss = trimWeight > 0 ? (float)(trim / trimWeight) : 0.0f;
 
         // material of different parts in the same place
-        float collisionFraction = 0, pathFraction = 0;
+        float collisionFraction = 0;
         float collision = CollisionLoss(samples, xf, &collisionFraction, visual ? &visual->lost : nullptr);
-        float path = 0;
-        if (P.checkPath && P.wPath > 0) path = CollisionLoss(samples, d.Transforms(0.5f), &pathFraction, nullptr, 2);
 
         // the sphere shell must be covered exactly once
         std::vector<Vector3> centre(n);
@@ -679,23 +888,53 @@ namespace Bakugan {
         double uncovered = 0, doubled = 0;
         int coveredHard = 0, doubledHard = 0;
         float shellR = R - 0.5f * m_Spacing;
+        // each covered patch of the shell becomes a plate of the part that claims it most (open-pose samples)
+        thread_local std::vector<std::vector<Vector3>> plates;
+        plates.resize(n);
+        for (auto& pl : plates) pl.clear();
         for (const Vector3& u : m_ShellDirs) {
             Vector3 y = Vector3Add(c, Vector3Scale(u, shellR));
-            float keep = 1.0f, sum = 0.0f;
+            float keep = 1.0f, sum = 0.0f, top = 0.0f;
+            int owner = -1;
             for (int j = 0; j < n; j++) {
                 if (Vector3DistanceSqr(y, centre[j]) > reach[j] * reach[j]) continue;
                 float o = Sigmoid(-d.parts[j].shape.Distance(xf[j].ApplyInverse(y)) / tauShell);
                 keep *= 1.0f - o;
                 sum += o;
+                if (o > top) { top = o; owner = j; }
             }
             uncovered += keep;
             doubled += fmaxf(sum - 1.0f, 0.0f);
             int state = keep < 0.5f ? (sum > 1.5f ? 2 : 1) : 0;
             coveredHard += state > 0;
             doubledHard += state == 2;
+            if (state > 0 && owner >= 0) plates[owner].push_back(xf[owner].ApplyInverse(y));
             if (visual) { visual->shell.push_back(y); visual->shellState.push_back((uint8_t)state); }
         }
         float K = (float)m_ShellDirs.size();
+
+        // the motion: the finished pieces must not pass through each other anywhere between figure and ball
+        float path = 0, pathWorst = 0, pathWorstT = 0;
+        bool wantPath = P.checkPath && P.wPath > 0;
+        if (wantPath || metrics) {
+            thread_local PieceSamples pieces;
+            BuildPieces(d, samples, xf, plates, pieces);
+            if (wantPath) {
+                // the open pose, the motion, and the last approach into the ball (where tucked parts meet)
+                std::vector<float> times = { 0.0f, 0.95f, 0.985f };
+                int k = std::max(1, P.pathSamples);
+                for (int q = 0; q < k; q++) times.push_back(0.92f * (q + m_Phase) / k);
+                // scaled so that even a fraction of a percent of the pieces touching costs as much as real trimming:
+                // the motion is a constraint, not a preference
+                path = m_Boost * (25.0f * MotionLoss(d, pieces, times, 2, nullptr, nullptr, nullptr) + 4.0f * pieces.openClash);
+            }
+            if (metrics) {
+                std::vector<float> dense;
+                for (int q = 0; q < 32; q++) dense.push_back(0.985f * q / 31.0f);
+                MotionLoss(d, pieces, dense, 1, &pathWorst, &pathWorstT, nullptr);
+                if (pieces.openClash > pathWorst) { pathWorst = pieces.openClash; pathWorstT = 0.0f; }
+            }
+        }
 
         // hinge pivots must sit inside both parts they join
         // ... and must stay inside the closed sphere, or the link between the parts is cut away
@@ -709,7 +948,17 @@ namespace Bakugan {
             float v = (dp + dc) / m_Spacing;
             contact += v * v;
             contactHard += v;
-            float out = fmaxf(Vector3Distance(xf[h.parent].Apply(h.pivot), c) - (R - m_Spacing), 0.0f) / m_Spacing;
+            // the spars that hold the chain together (pivot to this part's centre, parent's centre to pivot) must
+            // stay inside the closed sphere too, or the restored pieces fall apart
+            float worst = 0.0f;
+            Vector3 pivot = h.pivot, own = d.parts[i].shape.position, up = d.parts[h.parent].shape.position;
+            for (int k = 0; k <= 4; k++) {
+                float f = k / 4.0f;
+                Vector3 a = xf[i].Apply(Vector3Lerp(pivot, own, f * 0.6f));
+                Vector3 b = xf[h.parent].Apply(Vector3Lerp(pivot, up, f * 0.6f));
+                worst = fmaxf(worst, fmaxf(Vector3Distance(a, c), Vector3Distance(b, c)) - (R - m_Spacing));
+            }
+            float out = fmaxf(worst, 0.0f) / m_Spacing;
             link += out * out;
             joints++;
         }
@@ -726,7 +975,9 @@ namespace Bakugan {
             metrics->shellOverlap = doubledHard / K;
             metrics->trimmed = trimWeight > 0 ? (float)(trimHard / trimWeight) : 0.0f;
             metrics->collision = collisionFraction;
-            metrics->pathCollision = pathFraction;
+            metrics->pathCollision = pathWorst;
+            metrics->pathWorstT = pathWorstT;
+            metrics->foldable = pathWorst <= 0.004f;
             metrics->contact = joints ? (float)(contactHard / joints) : 0.0f;
             metrics->loss = loss;
             metrics->hinges = hinges;
@@ -734,6 +985,173 @@ namespace Bakugan {
             metrics->radiusRatio = R / fmaxf(EqualRadius(), 1e-6f);
         }
         return loss;
+    }
+
+    void FoldModel::BuildPieces(const Design& d, const std::vector<PartSamples>& samples, const std::vector<Rigid>& closed,
+                                const std::vector<std::vector<Vector3>>& plates, PieceSamples& out) const {
+        int n = (int)d.parts.size();
+        Vector3 c = d.ball.center;
+        float R = d.ball.radius + 0.5f * m_Spacing;
+        // same priority as the restoration: the root, then bigger superfrustums
+        std::vector<int> order(n), rank(n);
+        for (int i = 0; i < n; i++) order[i] = i;
+        int root = d.Root();
+        auto volume = [&](int i) { const Vector3& v = d.parts[i].shape.size; return v.x * v.y * v.z; };
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+            if ((a == root) != (b == root)) return a == root;
+            return volume(a) > volume(b);
+        });
+        for (int k = 0; k < n; k++) rank[order[k]] = k;
+
+        thread_local std::vector<Vector3> local, world;
+        thread_local std::vector<int> owner;
+        thread_local std::vector<uint8_t> lost, isPlate;
+        thread_local PointHash hash;
+        local.clear(); world.clear(); owner.clear(); isPlate.clear();
+        size_t plateCount = 0, buried = 0;
+        for (int i = 0; i < n; i++) {
+            for (const Vector3& p : samples[i].lattice) {
+                Vector3 q = closed[i].Apply(p);
+                if (Vector3DistanceSqr(q, c) > R * R) continue;   // trimmed by the sphere
+                local.push_back(p); world.push_back(q); owner.push_back(i); isPlate.push_back(0);
+            }
+            if (i < (int)plates.size())
+                for (const Vector3& p : plates[i]) {
+                    local.push_back(p); world.push_back(closed[i].Apply(p)); owner.push_back(i); isPlate.push_back(1);
+                    // in the figure, a plate must not sit inside material that belongs to another part
+                    plateCount++;
+                    if (m_Shape->field.Sample(p) < -0.5f * m_Spacing) {
+                        int nearest = i;
+                        float bd = d.parts[i].shape.Distance(p);
+                        for (int j = 0; j < n; j++) {
+                            if (j == i) continue;
+                            float lower = Vector3Distance(p, d.parts[j].shape.position) - d.parts[j].shape.BoundingRadius();
+                            if (lower >= bd) continue;
+                            float v = d.parts[j].shape.Distance(p);
+                            if (v < bd) { bd = v; nearest = j; }
+                        }
+                        buried += nearest != i;
+                    }
+                }
+        }
+        out.openClash = plateCount ? (float)buried / plateCount : 0.0f;
+        // where two parts claim the same space when closed, the lower priority one is carved away
+        lost.assign(world.size(), 0);
+        const float h = 0.75f * m_Spacing, h2 = h * h;
+        hash.Build(world, h);
+        for (size_t a = 0; a < world.size(); a++)
+            hash.Query(world[a], [&](int b) {
+                if (owner[b] == owner[a] || rank[owner[a]] < rank[owner[b]]) return;
+                if (Vector3DistanceSqr(world[a], world[b]) < h2) lost[a] = 1;
+            });
+        out.points.clear();
+        out.owner.clear();
+        out.plate.clear();
+        for (size_t a = 0; a < world.size(); a++)
+            if (!lost[a]) { out.points.push_back(local[a]); out.owner.push_back(owner[a]); out.plate.push_back(isPlate[a]); }
+
+        // pairs that already touch in the open pose are the cut between neighbouring pieces, not a collision
+        out.resting.clear();
+        const float r = 0.9f * m_Spacing, r2 = r * r;
+        hash.Build(out.points, r);
+        for (size_t a = 0; a < out.points.size(); a++)
+            hash.Query(out.points[a], [&](int b) {
+                if ((int)a >= b || out.owner[b] == out.owner[a]) return;
+                if (Vector3DistanceSqr(out.points[a], out.points[b]) < r2) out.resting.push_back(((uint64_t)a << 32) | (uint32_t)b);
+            });
+        std::sort(out.resting.begin(), out.resting.end());
+    }
+
+    float FoldModel::MotionLoss(const Design& d, const PieceSamples& pieces, const std::vector<float>& times, int stride,
+                                float* worst, float* worstT, std::vector<Vector3>* contacts) const {
+        int n = (int)d.parts.size();
+        if (pieces.points.empty() || times.empty()) { if (worst) *worst = 0; return 0.0f; }
+        const float h = 0.9f * m_Spacing, h2 = h * h, hard2 = 0.6f * 0.6f * m_Spacing * m_Spacing;
+        const float knuckle2 = 1.6f * 1.6f * m_Spacing * m_Spacing;
+        thread_local std::vector<Vector3> pts;
+        thread_local std::vector<int> own;
+        thread_local PointHash hash;
+        std::vector<Vector3> pivot(n), axis(n);
+        double total = 0;
+        if (worst) *worst = 0;
+        if (worstT) *worstT = 0;
+        for (float t : times) {
+            std::vector<Rigid> xf = d.Transforms(t);
+            for (int i = 0; i < n; i++)
+                if (d.parts[i].hinge.parent >= 0) {
+                    d.HingeInWorld(i, xf, &pivot[i], &axis[i]);
+                    axis[i] = Vector3Normalize(axis[i]);
+                }
+            pts.clear();
+            own.clear();
+            thread_local std::vector<int> src;
+            src.clear();
+            for (size_t k = 0; k < pieces.points.size(); k += stride) {
+                pts.push_back(xf[pieces.owner[k]].Apply(pieces.points[k]));
+                own.push_back(pieces.owner[k]);
+                src.push_back((int)k);
+            }
+            hash.Build(pts, h);
+            // distance from a point to a hinge's axis line (squared)
+            auto lineDist2 = [&](int hinge, Vector3 p) {
+                Vector3 v = Vector3Subtract(p, pivot[hinge]);
+                float along = Vector3DotProduct(v, axis[hinge]);
+                return Vector3LengthSqr(v) - along * along;
+            };
+            double loss = 0;
+            size_t hits = 0;
+            for (size_t a = 0; a < pts.size(); a++) {
+                bool hit = false;
+                int oa = own[a];
+                hash.Query(pts[a], [&](int b) {
+                    int ob = own[b];
+                    if (ob == oa) return;
+                    float d2 = Vector3DistanceSqr(pts[a], pts[b]);
+                    if (d2 >= h2) return;
+                    int sa = src[a], sb = src[b];
+                    uint64_t key = sa < sb ? (((uint64_t)sa << 32) | (uint32_t)sb) : (((uint64_t)sb << 32) | (uint32_t)sa);
+                    if (std::binary_search(pieces.resting.begin(), pieces.resting.end(), key)) return;
+                    // the knuckle of the hinge joining these two parts turns in place: not a collision
+                    int child = d.parts[oa].hinge.parent == ob ? oa : (d.parts[ob].hinge.parent == oa ? ob : -1);
+                    if (child >= 0 && lineDist2(child, pts[a]) < knuckle2 && lineDist2(child, pts[b]) < knuckle2) return;
+                    float k = 1.0f - sqrtf(d2) / h;
+                    loss += k * k;
+                    hit |= d2 < hard2;
+                });
+                if (hit) {
+                    hits++;
+                    if (contacts) contacts->push_back(pts[a]);
+                }
+            }
+            total += loss / pts.size();
+            float frac = (float)hits / pts.size();
+            if (worst && frac > *worst) { *worst = frac; if (worstT) *worstT = t; }
+        }
+        return (float)(total / times.size());
+    }
+
+    void FoldModel::MotionContacts(const FoldState& s, float t, std::vector<Vector3>* points) const {
+        const Design& d = s.design;
+        int n = (int)d.parts.size();
+        if (n == 0 || (int)s.samples.size() != n || t >= 0.999f) return;
+        std::vector<Rigid> xf = d.Transforms(1.0f);
+        std::vector<std::vector<Vector3>> plates(n);
+        const float tau = 0.5f * m_Spacing;
+        float shellR = d.ball.radius - 0.5f * m_Spacing;
+        for (const Vector3& u : m_ShellDirs) {
+            Vector3 y = Vector3Add(d.ball.center, Vector3Scale(u, shellR));
+            float keep = 1.0f, top = 0.0f;
+            int owner = -1;
+            for (int j = 0; j < n; j++) {
+                float o = Sigmoid(-d.parts[j].shape.Distance(xf[j].ApplyInverse(y)) / tau);
+                keep *= 1.0f - o;
+                if (o > top) { top = o; owner = j; }
+            }
+            if (keep < 0.5f && owner >= 0) plates[owner].push_back(xf[owner].ApplyInverse(y));
+        }
+        PieceSamples pieces;
+        BuildPieces(d, s.samples, xf, plates, pieces);
+        MotionLoss(d, pieces, { t }, 1, nullptr, nullptr, points);
     }
 
     void FoldModel::RepairState(FoldState& s) const {
@@ -785,7 +1203,8 @@ namespace Bakugan {
         int n = (int)d.parts.size();
         if (n == 0) return;
         if ((int)s.samples.size() != n) model.Assign(s);
-        for (Part& p : d.parts) { p.hinge.parent = -1; p.hinge.angle = 0; p.hinge.locked = false; }
+        d.chained = model.Params().chained;
+        for (Part& p : d.parts) { p.hinge.parent = -1; p.hinge.angle = 0; p.hinge.locked = false; p.hinge.trigger = -2; p.hinge.release = 0.5f; }
 
         int root = 0;
         for (int i = 1; i < n; i++)
@@ -793,7 +1212,7 @@ namespace Bakugan {
         // keep the root first: it is the default root everywhere else
         if (root != 0) {
             std::swap(d.parts[0], d.parts[root]);
-            std::swap(s.samples[0], s.samples[root]);
+            model.Assign(s);
             root = 0;
         }
 
@@ -941,7 +1360,10 @@ namespace Bakugan {
         if (start.parts.empty()) { result.message = "There are no superfrustums to fold. Decompose or add some first."; return result; }
         FoldModel model(shape, params);
         if (!model.Valid()) { result.message = "The model could not be analysed."; return result; }
-        FoldState state = model.MakeState(start);
+        Design initial = start;
+        initial.chained = params.chained;
+        FoldState state = model.MakeState(initial);
+        model.UpdateFit(state);
 
         int roots = 0;
         for (const Part& p : state.design.parts) roots += p.hinge.parent < 0;
@@ -950,19 +1372,29 @@ namespace Bakugan {
             BuildFoldTree(state, model);
         }
         model.RepairState(state);
+        // The kept result is judged at fixed moments plus a dense check of the whole motion, since the moments sampled
+        // while descending change from step to step.
+        auto score = [&](const FoldState& st) {
+            model.SetMotionPhase(0.5f);
+            FoldMetrics m;
+            float v = model.Evaluate(st, &m);
+            return v + (params.checkPath ? params.wPath * 10.0f * m.pathCollision : 0.0f);
+        };
         float loss = model.Evaluate(state);
         FoldState best = state;
-        float bestLoss = loss;
+        float bestLoss = score(state);
         control.PushLoss(loss);
         control.Publish(state.design);
 
         std::mt19937 rng(params.seed);
         Descent descent(model);
         std::vector<Rule> rules = { RuleLock, RuleUnlock, RuleAxisSnap, RuleFlip, RuleReseat };
+        if (params.chained) { rules.push_back(RuleRewire); rules.push_back(RuleRewire); rules.push_back(RuleMaster); }
         if (!params.keepTree) {
             rules.push_back(RuleReparent);
             rules.push_back(RuleMerge);
             if (params.allowSplit) rules.push_back(RuleSplit);
+            if (params.joint) { rules.push_back(RuleAddPart); rules.push_back(RuleRemovePart); }
         }
         int applied = 0;
         int iterations = std::max(1, params.iterations);
@@ -973,12 +1405,20 @@ namespace Bakugan {
                      (int)state.design.parts.size(), state.design.CountHinges());
             control.SetStage(stage);
 
+            // sample different moments of the motion every step (fixed within the step)
+            model.SetMotionPhase(std::uniform_real_distribution<float>(0.05f, 0.95f)(rng));
+            loss = model.Evaluate(state);
+
             // continuous step on a random block of hinges plus the sphere
             int hinges = state.design.CountHinges();
             int block = std::clamp(hinges / 3, std::min(3, hinges), 6);
             std::vector<Param> ps = descent.Block(state.design, block, rng, it % 4 == 0);
             std::vector<float> g = descent.Gradient(state, ps);
             descent.Step(state, ps, g, decay);
+            // joint mode: the superfrustums move too, judged by fold and fit together
+            if (params.joint && !state.design.parts.empty())
+                for (int b = 0; b < std::max(1, params.shapeBlock); b++)
+                    descent.ShapeStep(state, std::uniform_int_distribution<int>(0, (int)state.design.parts.size() - 1)(rng), decay);
             loss = model.Evaluate(state);
 
             // grammar rewrites: sample K, settle each, apply the compatible improving ones
@@ -1030,22 +1470,97 @@ namespace Bakugan {
                 }
             }
 
-            if (loss < bestLoss) { bestLoss = loss; best = state; }
+            if (it % 2 == 1 || it == iterations - 1) {
+                float sc = score(state);
+                if (sc < bestLoss) { bestLoss = sc; best = state; }
+            }
             control.PushLoss(loss);
             control.SetProgress((it + 1) / (float)iterations);
             if (it % 3 == 0 || it == iterations - 1) control.Publish(state.design);
         }
 
+        // Repair phase (projection to the motion constraint): if the motion is not collision free yet, keep going with
+        // the motion term boosted, touching only hinges and the release chain, until it is.
+        FoldMetrics check;
+        model.SetMotionPhase(0.5f);
+        model.Evaluate(best, &check);
+        int repairs = 0;
+        if (params.checkPath && !check.foldable && !control.Cancelled()) {
+            state = best;
+            model.SetMotionBoost(5.0f);
+            std::vector<Rule> gentle = { RuleReseat, RuleFlip, RuleAxisSnap, RuleLock, RuleUnlock };
+            if (params.chained) { gentle.push_back(RuleRewire); gentle.push_back(RuleRewire); gentle.push_back(RuleMaster); }
+            auto motionScore = [&](const FoldState& st, FoldMetrics* m) {
+                model.SetMotionPhase(0.5f);
+                float v = model.Evaluate(st, m);
+                return v + params.wPath * 50.0f * m->pathCollision;
+            };
+            FoldMetrics bm;
+            float bestRepair = motionScore(best, &bm);
+            FoldState repaired = best;
+            const int budget = std::max(40, iterations / 3);
+            for (int it = 0; it < budget && !control.Cancelled(); it++) {
+                char stage[96];
+                snprintf(stage, sizeof(stage), "Repairing the motion %d / %d", it + 1, budget);
+                control.SetStage(stage);
+                model.SetMotionPhase(std::uniform_real_distribution<float>(0.05f, 0.95f)(rng));
+                int hinges = state.design.CountHinges();
+                std::vector<Param> ps = descent.Block(state.design, std::clamp(hinges / 2, std::min(3, hinges), 8), rng, it % 3 == 0);
+                std::vector<Param> hingeOnly;
+                for (const Param& p : ps) if (p.part >= 0) hingeOnly.push_back(p);
+                std::vector<float> g = descent.Gradient(state, hingeOnly);
+                descent.Step(state, hingeOnly, g, 0.6f);
+                loss = model.Evaluate(state);
+                if (it % 4 == 3) {
+                    int K = std::max(4, params.candidates / 2);
+                    std::vector<Candidate> cands(K);
+                    std::vector<unsigned> seeds(K);
+                    for (int k = 0; k < K; k++) seeds[k] = (unsigned)rng();
+                    tbb::parallel_for(0, K, [&](int k) {
+                        std::mt19937 local(seeds[k]);
+                        Candidate& c = cands[k];
+                        for (int attempt = 0; attempt < 6 && !c.valid; attempt++) {
+                            c.state = state;
+                            c.affected.clear();
+                            c.rule = gentle[std::uniform_int_distribution<int>(0, (int)gentle.size() - 1)(local)];
+                            c.valid = ApplyRule(c.rule, c.state, model, local, c.affected);
+                        }
+                        if (!c.valid) return;
+                        model.RepairState(c.state);
+                        c.loss = model.Evaluate(c.state);
+                    });
+                    for (Candidate& c : cands)
+                        if (c.valid && c.loss < loss) { state = c.state; loss = c.loss; repairs++; }
+                }
+                FoldMetrics m;
+                float sc = motionScore(state, &m);
+                if (sc < bestRepair) { bestRepair = sc; repaired = state; bm = m; }
+                control.PushLoss(loss);
+                control.SetProgress(1.0f);
+                if (it % 3 == 0) control.Publish(state.design);
+                if (bm.foldable) break;
+            }
+            model.SetMotionBoost(1.0f);
+            // keep the repaired design only if it actually made the motion better
+            if (bm.pathCollision < check.pathCollision) best = repaired;
+        }
+
         result.design = best.design;
+        model.SetMotionPhase(0.5f);
         model.Evaluate(best, &result.metrics);
+        result.metrics.fitIoU = model.FitIoU(best.design);
         result.ok = true;
         result.cancelled = control.Cancelled();
         result.rewritesApplied = applied;
         result.milliseconds = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-        char buf[200];
-        snprintf(buf, sizeof(buf), "%sFold optimised in %.1f s: shell %.0f%% covered, %.1f%% detail trimmed, %.1f%% colliding, %d hinges, %d rewrites.",
-                 result.cancelled ? "(stopped) " : "", result.milliseconds / 1000.0, result.metrics.coverage * 100.0f,
-                 result.metrics.trimmed * 100.0f, result.metrics.collision * 100.0f, result.metrics.hinges, applied);
+        char motion[64];
+        if (result.metrics.foldable) snprintf(motion, sizeof(motion), "motion collision free");
+        else snprintf(motion, sizeof(motion), "motion blocked at %.0f%% folded", result.metrics.pathWorstT * 100.0f);
+        char buf[280];
+        snprintf(buf, sizeof(buf), "%s%s optimised in %.1f s: %d parts, shell %.0f%% covered, %.1f%% detail trimmed, %s, fit IoU %.0f%%, %d hinges, %d rewrites.",
+                 result.cancelled ? "(stopped) " : "", params.joint ? "Shapes and fold" : "Fold", result.milliseconds / 1000.0,
+                 (int)best.design.parts.size(), result.metrics.coverage * 100.0f, result.metrics.trimmed * 100.0f, motion,
+                 result.metrics.fitIoU * 100.0f, result.metrics.hinges, applied);
         result.message = buf;
         (void)RuleNames;
         return result;
