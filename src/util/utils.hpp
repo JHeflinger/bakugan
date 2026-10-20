@@ -12,7 +12,8 @@ namespace Bakugan {
 
         bool IsModelFile(const char* path);
 
-        bool LoadAsset(const Asset& a, Model* out, std::string* err);
+        // Loads a model file for the reference overlay.
+        bool LoadModelFile(const std::string& path, Model* out, std::string* err);
 
         // Tolerant Wavefront OBJ reader (polygons fan-triangulated, any v/vt/vn index form, negative indices).
         bool ReadOBJ(const std::string& path, TriMesh* out, std::string* err);
@@ -24,6 +25,10 @@ namespace Bakugan {
 
         void ComputeBounds(TriMesh& mesh);
 
+        // Welds coincident vertices, drops degenerate triangles and cancels duplicated faces (pairs facing opposite
+        // ways are both removed), so level set meshes come out with clean, two-sided edges.
+        void CleanMesh(TriMesh& mesh);
+
         // Uploads a triangle mesh as a raylib model. Large meshes are split, since raylib indices are 16 bit.
         Model TriMeshToModel(const TriMesh& mesh, Shader lit);
 
@@ -33,8 +38,6 @@ namespace Bakugan {
         // Samples f over a box and meshes its zero level set.
         TriMesh MeshImplicit(const std::function<float(Vector3)>& f, BoundingBox box, int resolution);
 
-        std::vector<Vector3> FibonacciSphere(int count);
-
         Color PartColor(int index);
 
         Vector3 QuaternionToEulerDegrees(Quaternion q);
@@ -43,7 +46,7 @@ namespace Bakugan {
 
         Vector3 AnyPerpendicular(Vector3 v);
 
-        bool WriteOBJ(const std::string& path, const std::vector<const TriMesh*>& meshes, const std::vector<Rigid>& transforms,
-                      const std::vector<std::string>& names, std::string* err);
+        // Binary STL, one facet per triangle.
+        bool WriteSTL(const std::string& path, const TriMesh& mesh, std::string* err);
     }
 }

@@ -4,82 +4,125 @@
 #include <vector>
 
 namespace Bakugan {
-    // A spring loaded, uni-directional revolute hinge joining a part to its parent. In the open pose (the figure) the
-    // spring holds the hinge at 0. Folding rotates the part about `axis` through `pivot` by `angle` (only positive
-    // rotation is possible, up to maxAngle). Pivot and axis are given in the open pose and move with the parent.
+    // One superfrustum of the design. Lengths are millimetres; the pose is the design pose (how it was modelled).
+    struct Shape {
+        int id = 0;
+        std::string name;
+        int group = -1;              // id of the group it belongs to
+        SuperFrustum sf;
+        Op op = Op::Union;           // Cut removes it from the rest of its group
+        Color color = WHITE;
+        bool operator==(const Shape& o) const;
+    };
+
+    // Groups nest. A top level group (parent -1) is a body: one rigid object that hinges as a whole and prints as one
+    // part. A group inside a body is a feature: its shapes (and sub features) are unioned, optionally with a smooth
+    // blend, and the result is added to or cut from the enclosing group.
+    struct Group {
+        int id = 0;
+        std::string name;
+        int parent = -1;             // id of the enclosing group, -1 = body
+        Op op = Op::Union;
+        float blend = 0.0f;          // smooth union radius of its members (mm)
+        Color color = WHITE;
+        bool operator==(const Group& o) const;
+    };
+
+    // A revolute joint between two bodies. The child turns about `axis` through `pivot` (both in the design pose,
+    // carried by the parent body) by the hinge angle: 0 is the design pose, `start` the open position and `end` the
+    // closed one. The whole closing motion runs a fraction t from 0 to 1; this hinge moves while t is in [t0, t1].
+    // With hardware on it is built as a door (butt) hinge: knuckles alternating between the two bodies around a pin,
+    // each set carried by a leaf that fuses into its body, and clearance cut around the other body's knuckles.
     struct Hinge {
-        int parent = -1;
+        int id = 0;
+        std::string name;
+        int parent = -1;             // body ids
+        int child = -1;
         Vector3 pivot = { 0, 0, 0 };
         Vector3 axis = { 1, 0, 0 };
-        float angle = 0.0f;          // closed (ball) angle, radians, 0..maxAngle
-        float maxAngle = PI;
-        bool locked = false;         // rigid connection instead of a hinge
-        // Release chain (single latch): the master hinge (trigger -1) is held by the latch on the root; every other
-        // working hinge is held shut by a catch on the part of its trigger hinge, and springs open once that hinge
-        // has opened `release` of its travel. -2 = not assigned yet (repaired to the default chain).
-        int trigger = -2;
-        float release = 0.5f;
+        float start = 0.0f;          // open angle (radians), -2pi..2pi
+        float end = PI * 0.5f;       // closed angle; |end - start| <= 2pi
+        float t0 = 0.0f;
+        float t1 = 1.0f;
+        bool hardware = true;
+        float length = 24.0f;        // along the axis
+        float radius = 3.0f;         // knuckle outer radius
+        float pinRadius = 1.2f;
+        float clearance = 0.4f;      // print gap between the two bodies' moving surfaces
+        int knuckles = 3;            // alternating, the parent takes the first and last
+        PinStyle pin = PinStyle::Separate;
+        float leafLength = 8.0f;     // from the axis into the body
+        float leafThickness = 2.0f;
+        bool autoLeaves = true;      // aim each leaf at the centre of its body
+        float leafAngle[2] = { 0.0f, 0.0f };   // manual leaf directions (parent, child) about the axis
         bool operator==(const Hinge& o) const;
     };
 
-    struct Part {
-        int id = 0;
-        std::string name;
-        SuperFrustum shape;          // in the open pose (world space of the figure)
-        Hinge hinge;
-        Color color = WHITE;
-        bool operator==(const Part& o) const;
+    // Knuckle layout along the hinge axis (offsets from the pivot).
+    struct Knuckle {
+        float lo = 0.0f;
+        float hi = 0.0f;
+        bool child = false;          // which body carries it
     };
 
-    struct Ball {
-        Vector3 center = { 0, 1, 0 };
-        float radius = 1.0f;
-        bool operator==(const Ball& o) const;
-    };
-
-    // When each hinge starts and finishes opening, in units where the whole pop-open takes `total`.
-    struct ReleasePlan {
-        std::vector<float> start;
-        std::vector<float> duration;
-        float total = 1.0f;
-    };
-
-    // The full folding design: superfrustum parts arranged in a hinge tree, and the target sphere.
     struct Design {
-        std::vector<Part> parts;
-        Ball ball;
+        std::vector<Shape> shapes;
+        std::vector<Group> groups;
+        std::vector<Hinge> hinges;
         int nextId = 1;
-        bool chained = true;         // hinges open one after another from a single latch (else all at once)
 
-        int Root() const;
-        int IndexOf(int id) const;
-        // Part transforms from the open pose to the pose at fold fraction t (0 = figure, 1 = ball).
-        std::vector<Rigid> Transforms(float t) const;
-        void HingeInWorld(int part, const std::vector<Rigid>& xf, Vector3* pivot, Vector3* axis) const;
-        float FoldAngle(int part) const;     // effective closed angle (0 when locked / unattached)
-        std::vector<int> Children(int part) const;
-        std::vector<int> Subtree(int part) const;          // part and all its descendants
-        bool IsDescendant(int part, int ancestor) const;
-        std::vector<int> TopologicalOrder() const;         // parents before children
-        int Depth(int part) const;
-        int AddPart(const SuperFrustum& shape, int parent, const std::string& name = "");
-        void RemovePart(int part);                         // children move to the removed part's parent
-        bool Reparent(int part, int parent);
-        void Reroot(int part);                             // reverse the hinges on the path so `part` becomes the root
-        int CountHinges() const;
-        void RepairHinges();
-        bool Working(int part) const;                      // has a hinge that actually turns
-        int HingedAncestor(int part) const;                // nearest ancestor part with a working hinge, -1 if none
-        int Master() const;                                // the hinge the latch holds
-        std::vector<int> ReleaseCandidates(int part) const;  // hinges that may carry this hinge's catch
-        bool SetTrigger(int part, int trigger);            // false if it would make a release loop
-        void DefaultReleases();                            // each hinge released by the one it hangs from
-        void RepairReleases();
-        ReleasePlan Plan() const;
-        float FoldFactor(int part, float t, const ReleasePlan& plan) const;   // share of the closed angle at fold t
+        int ShapeIndex(int id) const;
+        int GroupIndex(int id) const;
+        int HingeIndex(int id) const;
+        int BodyOf(int groupId) const;                     // id of the top level group containing it, -1 if none
+        int ShapeBody(int shapeIndex) const;
+        std::vector<int> Bodies() const;                   // indices of the top level groups
+        bool Inside(int groupId, int ancestorId) const;    // groupId is ancestorId or nested in it
+        std::vector<int> DirectShapes(int groupId) const;  // shape indices
+        std::vector<int> ChildGroups(int groupId) const;   // group indices
+        std::vector<int> GroupShapes(int groupId) const;   // every shape index in it, recursively
+        std::string GroupPath(int groupId) const;          // "Body / Feature"
+        int ParentHinge(int bodyId) const;                 // hinge index that turns this body, -1 if none
+        bool CanHinge(int parent, int child, int ignoreHinge = -1) const;
+        float HingeFraction(int hinge, float t, bool ease) const;
+        float HingeAngle(int hinge, float t, bool ease) const;
+        // Body transforms from the design pose to the pose at fraction t, indexed like `groups` (features take their
+        // body's transform).
+        std::vector<Rigid> Transforms(float t, bool ease) const;
+        std::vector<Rigid> PoseTransforms(ExportPose pose, bool ease) const;
+        void HingeInWorld(int hinge, const std::vector<Rigid>& xf, Vector3* pivot, Vector3* axis) const;
+        Vector3 LeafDirection(int hinge, bool child) const;   // unit, perpendicular to the axis, design pose
+        float AutoLeafAngle(int hinge, bool child) const;
+        std::vector<Knuckle> Knuckles(int hinge) const;
+        // Head of a separate pin, past the last knuckle: axial range from the pivot and radius.
+        void PinHead(int hinge, float* from, float* to, float* radius) const;
+        bool AddsMaterial(int shapeIndex) const;           // unioned, and not inside a cut feature
+        BoundingBox BodyBounds(int bodyId) const;          // design pose, added material only
+        BoundingBox Bounds() const;
+
+        int AddGroup(const std::string& name, int parent);
+        int AddShape(const SuperFrustum& sf, int groupId, const std::string& name = "", Op op = Op::Union);
+        int AddHinge(int parent, int child);
+        void RemoveShape(int index);
+        void RemoveGroup(int index);                       // with everything in it and its hinges
+        void RemoveHinge(int index);
+        bool MoveShape(int index, int groupId);
+        bool MoveGroup(int index, int parentId);           // -1 makes it a body
+        int GroupItems(const std::vector<int>& shapeIds, const std::vector<int>& groupIds);   // new group id
+        void Ungroup(int index);
+        int DuplicateShape(int index, Vector3 offset);
+        int DuplicateGroup(int index, int parentId, Vector3 offset);
+        void Repair();
+        std::string UniqueName(const std::string& base) const;
+        Color NextColor() const;
+
         std::string Serialize() const;
         bool Deserialize(const std::string& text, std::string* err);
         bool operator==(const Design& o) const;
         bool operator!=(const Design& o) const { return !(*this == o); }
     };
+
+    // Starting points for the template list.
+    std::vector<std::string> TemplateNames();
+    Design MakeTemplate(int index);
 }

@@ -46,8 +46,8 @@ namespace Bakugan {
         Camera3D m_Camera = {};
         float m_Yaw = 35.0f;
         float m_Pitch = 20.0f;
-        float m_Distance = 5.5f;
-        Vector3 m_Focus = { 0, 1, 0 };
+        float m_Distance = 180.0f;   // millimetres
+        Vector3 m_Focus = { 0, 20, 0 };
         bool m_Ortho = false;
         bool m_AutoOrtho = false;
         bool m_Animating = false;

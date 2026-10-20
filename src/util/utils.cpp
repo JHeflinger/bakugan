@@ -3,6 +3,10 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <array>
+#include <cstdint>
+#include <cstring>
+#include <unordered_map>
 #include <cstdio>
 #include <cstdlib>
 
@@ -104,84 +108,23 @@ namespace Bakugan {
                 out.indices.push_back(base + (mesh.indices ? mesh.indices[t * 3 + k] : (unsigned)(t * 3 + k)));
     }
 
-    static void AddPiece(TriMesh& out, Mesh m, Vector3 scale, Vector3 rotDeg, Vector3 pos) {
-        Matrix xf = MatrixMultiply(MatrixMultiply(MatrixScale(scale.x, scale.y, scale.z),
-                                                  MatrixRotateXYZ(Vector3Scale(rotDeg, DEG2RAD))),
-                                   MatrixTranslate(pos.x, pos.y, pos.z));
-        AppendMesh(out, m, xf);
-        UnloadMesh(m);
-    }
-
-    // A chunky four legged creature built from primitives.
-    static TriMesh MakeCritter() {
-        TriMesh t;
-        AddPiece(t, GenMeshCube(1.3f, 0.65f, 0.75f), { 1, 1, 1 }, { 0, 0, 0 }, { 0, 0.95f, 0 });                  // torso
-        AddPiece(t, GenMeshSphere(0.42f, 20, 20), { 1, 1, 1 }, { 0, 0, 0 }, { 0.9f, 1.45f, 0 });                   // head
-        AddPiece(t, GenMeshCube(0.35f, 0.22f, 0.3f), { 1, 1, 1 }, { 0, 0, 0 }, { 1.32f, 1.36f, 0 });               // snout
-        AddPiece(t, GenMeshCone(0.12f, 0.35f, 12), { 1, 1, 1 }, { 0, 0, -15 }, { 0.85f, 1.78f, 0.2f });            // ears
-        AddPiece(t, GenMeshCone(0.12f, 0.35f, 12), { 1, 1, 1 }, { 0, 0, -15 }, { 0.85f, 1.78f, -0.2f });
-        for (int sx = -1; sx <= 1; sx += 2)
-            for (int sz = -1; sz <= 1; sz += 2)
-                AddPiece(t, GenMeshCylinder(0.14f, 0.75f, 16), { 1, 1, 1 }, { 0, 0, 0 }, { 0.45f * sx, 0.0f, 0.24f * sz });
-        AddPiece(t, GenMeshCylinder(0.09f, 0.8f, 12), { 1, 1, 1 }, { 0, 0, 55 }, { -0.6f, 1.05f, 0 });             // tail
-        return t;
-    }
-
-    // A small winged dragon.
-    static TriMesh MakeDragon() {
-        TriMesh t;
-        AddPiece(t, GenMeshSphere(0.5f, 24, 24), { 1.4f, 0.95f, 0.9f }, { 0, 0, 0 }, { 0, 1.0f, 0 });            // body
-        AddPiece(t, GenMeshCylinder(0.16f, 0.7f, 14), { 1, 1, 1 }, { 0, 0, -35 }, { 0.5f, 1.2f, 0 });            // neck
-        AddPiece(t, GenMeshSphere(0.25f, 18, 18), { 1.5f, 0.9f, 0.9f }, { 0, 0, 0 }, { 0.95f, 1.85f, 0 });       // head
-        AddPiece(t, GenMeshCone(0.07f, 0.3f, 10), { 1, 1, 1 }, { 0, 0, 30 }, { 0.85f, 2.02f, 0.12f });          // horns
-        AddPiece(t, GenMeshCone(0.07f, 0.3f, 10), { 1, 1, 1 }, { 0, 0, 30 }, { 0.85f, 2.02f, -0.12f });
-        AddPiece(t, GenMeshCube(0.7f, 0.06f, 1.1f), { 1, 1, 1 }, { 25, 0, 0 }, { -0.05f, 1.45f, 0.85f });      // wings
-        AddPiece(t, GenMeshCube(0.7f, 0.06f, 1.1f), { 1, 1, 1 }, { -25, 0, 0 }, { -0.05f, 1.45f, -0.85f });
-        AddPiece(t, GenMeshCylinder(0.15f, 0.6f, 14), { 1, 1, 1 }, { 0, 0, 70 }, { -0.55f, 0.95f, 0 });          // tail
-        AddPiece(t, GenMeshCylinder(0.1f, 0.55f, 12), { 1, 1, 1 }, { 0, 0, 100 }, { -1.1f, 0.75f, 0 });
-        AddPiece(t, GenMeshCone(0.12f, 0.3f, 10), { 1, 1, 1 }, { 0, 0, 100 }, { -1.6f, 0.68f, 0 });
-        for (int sx = -1; sx <= 1; sx += 2)
-            for (int sz = -1; sz <= 1; sz += 2)
-                AddPiece(t, GenMeshCylinder(0.12f, 0.65f, 14), { 1, 1, 1 }, { 0, 0, 0 }, { 0.32f * sx, 0.0f, 0.28f * sz });
-        return t;
-    }
-
-    bool Utils::LoadAsset(const Asset& a, Model* out, std::string* err) {
-        Mesh mesh = {};
-        switch (a.primitive) {
-            case Primitive::Cube:     mesh = GenMeshCube(1, 1, 1); break;
-            case Primitive::Sphere:   mesh = GenMeshSphere(0.5f, 24, 24); break;
-            case Primitive::Cylinder: mesh = GenMeshCylinder(0.3f, 1.5f, 24); break;
-            case Primitive::Torus:    mesh = GenMeshTorus(0.3f, 1.0f, 24, 32); break;
-            case Primitive::Knot:     mesh = GenMeshKnot(0.5f, 1.5f, 64, 128); break;
-            case Primitive::Critter:
-            case Primitive::Dragon: {
-                TriMesh t = a.primitive == Primitive::Critter ? MakeCritter() : MakeDragon();
-                ComputeNormals(t);
-                *out = TriMeshToModel(t, Shader{});
-                return true;
-            }
-            case Primitive::None: {
-                if (!FileExists(a.path.c_str())) { *err = "File not found: " + a.path; return false; }
-                if (IsFileExtension(a.path.c_str(), ".obj")) {
-                    // raylib's OBJ loader crashes on some files (e.g. without texture coordinates), so read it here
-                    TriMesh t;
-                    if (!ReadOBJ(a.path, &t, err)) return false;
-                    ComputeNormals(t);
-                    *out = TriMeshToModel(t, Shader{});
-                    return true;
-                }
-                Model m = LoadModel(a.path.c_str());
-                if (m.meshCount == 0 || !IsModelValid(m)) {
-                    UnloadModel(m);
-                    *err = "Could not load " + a.name;
-                    return false;
-                }
-                *out = m;
-                return true;
-            }
+    bool Utils::LoadModelFile(const std::string& path, Model* out, std::string* err) {
+        if (!FileExists(path.c_str())) { *err = "File not found: " + path; return false; }
+        if (IsFileExtension(path.c_str(), ".obj")) {
+            // raylib's OBJ loader crashes on some files (e.g. without texture coordinates), so read it here
+            TriMesh t;
+            if (!ReadOBJ(path, &t, err)) return false;
+            ComputeNormals(t);
+            *out = TriMeshToModel(t, Shader{});
+            return true;
         }
-        *out = LoadModelFromMesh(mesh);
+        Model m = LoadModel(path.c_str());
+        if (m.meshCount == 0 || !IsModelValid(m)) {
+            UnloadModel(m);
+            *err = std::string("Could not load ") + GetFileName(path.c_str());
+            return false;
+        }
+        *out = m;
         return true;
     }
 
@@ -252,6 +195,66 @@ namespace Bakugan {
         for (const Vector3& p : mesh.positions) { lo = Vector3Min(lo, p); hi = Vector3Max(hi, p); }
         if (mesh.positions.empty()) lo = hi = { 0, 0, 0 };
         mesh.box = { lo, hi };
+    }
+
+    void Utils::CleanMesh(TriMesh& mesh) {
+        struct Key { float x, y, z; bool operator==(const Key& o) const { return x == o.x && y == o.y && z == o.z; } };
+        struct KeyHash {
+            size_t operator()(const Key& k) const {
+                uint32_t a, b, c;
+                memcpy(&a, &k.x, 4); memcpy(&b, &k.y, 4); memcpy(&c, &k.z, 4);
+                return ((size_t)a * 73856093u) ^ ((size_t)b * 19349663u) ^ ((size_t)c * 83492791u);
+            }
+        };
+        std::unordered_map<Key, unsigned, KeyHash> weld;
+        std::vector<Vector3> positions;
+        std::vector<unsigned> remap(mesh.positions.size());
+        for (size_t i = 0; i < mesh.positions.size(); i++) {
+            const Vector3& p = mesh.positions[i];
+            auto it = weld.emplace(Key{ p.x, p.y, p.z }, (unsigned)positions.size());
+            if (it.second) positions.push_back(p);
+            remap[i] = it.first->second;
+        }
+        struct Tri { unsigned a, b, c; };
+        auto sorted = [](unsigned a, unsigned b, unsigned c) {
+            unsigned lo = std::min(a, std::min(b, c)), hi = std::max(a, std::max(b, c));
+            return std::array<unsigned, 3>{ lo, a + b + c - lo - hi, hi };
+        };
+        struct ArrHash {
+            size_t operator()(const std::array<unsigned, 3>& k) const {
+                return ((size_t)k[0] * 73856093u) ^ ((size_t)k[1] * 19349663u) ^ ((size_t)k[2] * 83492791u);
+            }
+        };
+        std::vector<Tri> tris;
+        std::unordered_map<std::array<unsigned, 3>, std::vector<size_t>, ArrHash> seen;
+        for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
+            unsigned a = remap[mesh.indices[t]], b = remap[mesh.indices[t + 1]], c = remap[mesh.indices[t + 2]];
+            if (a == b || b == c || a == c) continue;
+            Vector3 n = Vector3CrossProduct(Vector3Subtract(positions[b], positions[a]), Vector3Subtract(positions[c], positions[a]));
+            if (Vector3LengthSqr(n) <= 0.0f) continue;
+            seen[sorted(a, b, c)].push_back(tris.size());
+            tris.push_back({ a, b, c });
+        }
+        // the same three corners more than once: keep one per orientation left after opposite pairs cancel
+        std::vector<char> keep(tris.size(), 1);
+        for (auto& kv : seen) {
+            if (kv.second.size() < 2) continue;
+            std::vector<size_t> fwd, rev;
+            const Tri& r = tris[kv.second[0]];
+            for (size_t i : kv.second) {
+                const Tri& t = tris[i];
+                bool same = (t.a == r.a && t.b == r.b) || (t.b == r.a && t.c == r.b) || (t.c == r.a && t.a == r.b);
+                (same ? fwd : rev).push_back(i);
+                keep[i] = 0;
+            }
+            int net = (int)fwd.size() - (int)rev.size();
+            if (net > 0) keep[fwd[0]] = 1;
+            if (net < 0) keep[rev[0]] = 1;
+        }
+        mesh.positions = std::move(positions);
+        mesh.indices.clear();
+        for (size_t i = 0; i < tris.size(); i++)
+            if (keep[i]) mesh.indices.insert(mesh.indices.end(), { tris[i].a, tris[i].b, tris[i].c });
     }
 
     Model Utils::TriMeshToModel(const TriMesh& t, Shader lit) {
@@ -375,18 +378,6 @@ namespace Bakugan {
         return SurfaceNets(field, dim, origin, voxel);
     }
 
-    std::vector<Vector3> Utils::FibonacciSphere(int count) {
-        std::vector<Vector3> dirs(count);
-        const float golden = PI * (3.0f - sqrtf(5.0f));
-        for (int i = 0; i < count; i++) {
-            float y = 1.0f - 2.0f * (i + 0.5f) / count;
-            float r = sqrtf(fmaxf(0.0f, 1.0f - y * y));
-            float a = golden * i;
-            dirs[i] = { r * cosf(a), y, r * sinf(a) };
-        }
-        return dirs;
-    }
-
     Color Utils::PartColor(int index) {
         float hue = fmodf(index * 137.508f + 20.0f, 360.0f);
         return ColorFromHSV(hue, 0.55f, 0.95f);
@@ -405,32 +396,25 @@ namespace Bakugan {
         return Vector3Normalize(Vector3CrossProduct(v, a));
     }
 
-    bool Utils::WriteOBJ(const std::string& path, const std::vector<const TriMesh*>& meshes, const std::vector<Rigid>& xf,
-                         const std::vector<std::string>& names, std::string* err) {
-        FILE* fp = fopen(path.c_str(), "w");
+    bool Utils::WriteSTL(const std::string& path, const TriMesh& mesh, std::string* err) {
+        FILE* fp = fopen(path.c_str(), "wb");
         if (!fp) { *err = "Could not write " + path; return false; }
-        fprintf(fp, "# Bakugan Everything export\n");
-        size_t base = 1;
-        for (size_t m = 0; m < meshes.size(); m++) {
-            const TriMesh& t = *meshes[m];
-            fprintf(fp, "o %s\n", names[m].c_str());
-            for (const Vector3& p : t.positions) {
-                Vector3 w = xf[m].Apply(p);
-                fprintf(fp, "v %.6f %.6f %.6f\n", w.x, w.y, w.z);
-            }
-            for (const Vector3& n : t.normals) {
-                Vector3 w = xf[m].ApplyVector(n);
-                fprintf(fp, "vn %.5f %.5f %.5f\n", w.x, w.y, w.z);
-            }
-            bool normals = t.normals.size() == t.positions.size();
-            for (size_t i = 0; i + 2 < t.indices.size(); i += 3) {
-                size_t a = base + t.indices[i], b = base + t.indices[i + 1], c = base + t.indices[i + 2];
-                if (normals) fprintf(fp, "f %zu//%zu %zu//%zu %zu//%zu\n", a, a, b, b, c, c);
-                else fprintf(fp, "f %zu %zu %zu\n", a, b, c);
-            }
-            base += t.positions.size();
+        char header[80] = {};
+        snprintf(header, sizeof(header), "Bakugan hinge designer export (mm)");
+        fwrite(header, 1, 80, fp);
+        uint32_t count = (uint32_t)(mesh.indices.size() / 3);
+        fwrite(&count, 4, 1, fp);
+        for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
+            Vector3 a = mesh.positions[mesh.indices[t]], b = mesh.positions[mesh.indices[t + 1]], c = mesh.positions[mesh.indices[t + 2]];
+            Vector3 n = Vector3Normalize(Vector3CrossProduct(Vector3Subtract(b, a), Vector3Subtract(c, a)));
+            float rec[12] = { n.x, n.y, n.z, a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z };
+            uint16_t attr = 0;
+            fwrite(rec, sizeof(float), 12, fp);
+            fwrite(&attr, 2, 1, fp);
         }
+        bool ok = !ferror(fp);
         fclose(fp);
-        return true;
+        if (!ok) *err = "Error while writing " + path;
+        return ok;
     }
 }

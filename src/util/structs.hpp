@@ -4,38 +4,43 @@
 #include <raylib.h>
 
 namespace Bakugan {
-    enum class Primitive {
-        None,
-        Cube,
-        Sphere,
-        Cylinder,
-        Torus,
-        Knot,
-        Critter,
-        Dragon
-    };
-
     enum class GizmoOp {
         Translate,
         Rotate,
         Scale
     };
 
-    enum class Mode {
-        Automatic,
-        Manual
+    // What a click in the design view selects.
+    enum class PickMode {
+        Shape,
+        Feature,
+        Body
     };
 
-    enum class EditTarget {
-        Part,
-        Hinge,
-        Sphere
+    // How a shape or a feature group combines with the rest of its group.
+    enum class Op {
+        Union,
+        Cut
     };
 
-    struct Asset {
-        std::string name;
-        std::string path;
-        Primitive primitive = Primitive::None;
+    // Door hinge pin: printed in place inside the knuckles, or a separate pin pushed through after printing.
+    enum class PinStyle {
+        Fused,
+        Separate
+    };
+
+    // How the reference mesh is drawn in the design view.
+    enum class ReferenceMode {
+        Ghost,                       // see-through, behind everything
+        Solid,                       // opaque: shapes show only where they poke out of it
+        SolidXray                    // opaque, with the shapes inside it shown through as ghosts
+    };
+
+    // The pose parts are exported in.
+    enum class ExportPose {
+        Design,
+        Open,
+        Closed
     };
 
     // Indexed triangle mesh in plain arrays (no GPU state).

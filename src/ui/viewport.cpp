@@ -17,7 +17,7 @@ namespace Bakugan {
 
     void Viewport::Frame(BoundingBox b) {
         m_Focus = Vector3Scale(Vector3Add(b.min, b.max), 0.5f);
-        m_Distance = Vector3Distance(b.min, b.max) * 1.45f + 0.4f;
+        m_Distance = Clamp(Vector3Distance(b.min, b.max) * 1.45f + 4.0f, 5.0f, 800.0f);
     }
 
     void Viewport::UpdateCamera() {
@@ -82,7 +82,7 @@ namespace Bakugan {
     void Viewport::HandleInput(bool hovered, bool active) {
         ImGuiIO& io = ImGui::GetIO();
         if (hovered && io.MouseWheel != 0.0f)
-            m_Distance = Clamp(m_Distance * powf(0.88f, io.MouseWheel), 0.2f, 200.0f);
+            m_Distance = Clamp(m_Distance * powf(0.88f, io.MouseWheel), 2.0f, 800.0f);
         if (active) {
             bool orbit = ImGui::IsMouseDown(ImGuiMouseButton_Right) && !io.KeyShift;
             orbit |= ImGui::IsMouseDown(ImGuiMouseButton_Left) && io.KeyAlt;
@@ -170,7 +170,7 @@ namespace Bakugan {
         BeginTextureMode(m_Target);
         ClearBackground(background);
         BeginMode3D(m_Camera);
-        if (grid) DrawGrid(20, 0.25f);
+        if (grid) DrawGrid(30, 10.0f);   // 1 cm squares
         rlDrawRenderBatchActive();
         return true;
     }

@@ -1,46 +1,50 @@
 #pragma once
 #include "util/structs.hpp"
 #include "ui/viewport.hpp"
-#include "data/decompose.hpp"
-#include "data/fold.hpp"
-#include "data/restore.hpp"
+#include "data/build.hpp"
+#include "data/collide.hpp"
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace Bakugan {
-    struct EditState {
-        Design design;
-        int selected = -1;
+    // What the inspector and the gizmo work on: some shapes, one group, or one hinge.
+    struct Selection {
+        std::vector<int> shapes;     // shape ids
+        int group = -1;              // group id
+        int hinge = -1;              // hinge id
+        bool Empty() const { return shapes.empty() && group < 0 && hinge < 0; }
+        bool operator==(const Selection& o) const { return shapes == o.shapes && group == o.group && hinge == o.hinge; }
     };
 
-    struct PartModel {
+    struct EditState {
+        Design design;
+        Selection selection;
+    };
+
+    struct ShapeModel {
         SuperFrustum shape;          // the shape the mesh was built for (pose ignored)
+        TriMesh mesh;                // local frame
         Model model = {};
         bool loaded = false;
     };
 
-    struct RestoredModel {
-        int partId = 0;
+    struct PartModel {
+        int body = -1;               // group id, -1 for a separate pin
+        int pinHinge = -1;
         Model model = {};
-        TriMesh mesh;
+        size_t triangles = 0;
     };
 
-    // One finished optimisation, for comparing the separate and joint pipelines.
-    struct RunRecord {
-        std::string label;
-        int parts = 0;
-        int hinges = 0;
-        FoldMetrics metrics;
-        double seconds = 0.0;
-    };
-
-    enum class Pipeline {
-        Idle,
-        Decompose,
-        Fold,
-        Restore
+    enum class Preset {
+        Box,
+        Cylinder,
+        Cone,
+        Ball,
+        Wedge,
+        Tube,
+        Arc
     };
 
     class App {
@@ -49,7 +53,7 @@ namespace Bakugan {
         ~App();
         void Run();
     private:
-        // app.cpp: frame, history, library, jobs
+        // app.cpp: frame, history, files, jobs, editing
         void Frame();
         EditState Capture() const;
         void Restore(const EditState& st);
@@ -58,152 +62,180 @@ namespace Bakugan {
         void Undo();
         void Redo();
         void HandleKeys();
-        int AddToLibrary(const Asset& a);
-        void LoadAsset(int index);
-        bool OpenModelFile(const std::string& path);
-        void BrowseModel();
+        void SetDesign(const Design& d, const std::string& status);
+        void LoadTemplate(int index);
+        bool OpenFile(const std::string& path);
+        void HandleFileDrops();
+        bool FileDialog(bool save, const char* filters, const std::string& start, std::string* out);
         void BrowseDesign(bool save);
         void BrowseExport();
-        void HandleFileDrops();
-        void AcceptAssetDrop(const Viewport& vp);
-        void SetInputModel(Model m, const std::string& name);
-        bool Busy() const;
-        const Design& Shown() const;
-        void PollJobs();
-        void StartDecompose(bool refineOnly, int onlyIndex, bool coarse = false);
-        void StartFold(bool keepTree);
-        void StartRestore();
-        void RunAll();
-        void BuildTree();
-        void AimSelected();
-        void SnapPivotToContact(int part);
-        void UpdateAnalysis();
-        void ClearRestored();
-        bool RestoredCurrent() const;
-        void ExportParts();
+        void BrowseReference();
+        void LoadReference(const std::string& path);
         void SaveDesign();
         void LoadDesign();
-        void Select(int part);
-        int AddPart(const SuperFrustum& shape);
-        void DeleteSelected();
-        void DuplicateSelected();
+        void PollJobs();
+        void UpdateJobs();
+        void StartExport();
+        bool PartsCurrent() const;
+        bool SweepCurrent() const;
+        const SweepStep* CurrentStep() const;
+        void UpdateAnimation();
 
-        // panels.cpp: the inspector
+        void ClearSelection();
+        void SelectShape(int id, bool additive);
+        void SelectGroup(int id);
+        void SelectHinge(int id);
+        void SanitizeSelection();
+        int SelectedShape() const;           // index when exactly one shape is selected
+        int SelectedGroup() const;           // index
+        int SelectedHinge() const;           // index
+        std::vector<int> SelectedShapeIndices() const;   // the selected shapes, or every shape of the selected group
+        int ContextGroup() const;            // group id new shapes go into (-1: a new body)
+        void AddPreset(Preset p);
+        void NewBody();
+        void GroupSelection();
+        void UngroupSelection();
+        void DeleteSelection();
+        void DuplicateSelection();
+        void ToggleCut();
+        int AddHingeBetween(int parent, int child);
+        void PlaceHinge(int hinge);
+        void FrameView(Viewport& vp);
+
+        // panels.cpp: the sidebar
         void DrawSidebar(float width, float height);
-        void DrawLibrary();
+        void DrawDesignHeader();
         void DrawEditBar();
-        void DrawAutomatic();
-        void DrawManual();
-        void DrawPartList();
-        void DrawPartInspector();
+        void DrawModelTab();
+        void DrawAddButtons();
+        void DrawTree();
+        void DrawShapeInspector();
+        void DrawGroupInspector();
+        void DrawReferencePanel();
+        void DrawHingesTab();
+        void DrawHingeList();
         void DrawHingeInspector();
-        void DrawSphereInspector();
-        void DrawMetrics();
-        void DrawRuns();
-        void DrawReleaseInspector();
-        void DrawFoldSettings(bool manual);
-        void DrawRestorePanel();
+        void DrawCollisionPanel();
+        void DrawPrintTab();
         void DrawFilesPanel();
-        bool DrawJob(const JobControl* control, bool busy, const char* id);
+        bool DrawJob(const JobControl* control, bool busy, const char* id, bool stoppable);
+        std::string ItemName(int shapeId, int hingeId) const;
 
         // scene.cpp: the two viewports
-        void DrawViewportWindow(Viewport& vp, ImVec2 pos, ImVec2 size, bool figure);
-        void FigureToolbar();
-        void BallToolbar();
-        bool FigureOverlay(ImVec2 pos, float w, float h);
-        bool BallOverlay(ImVec2 pos, float w, float h);
-        void RenderFigure();
-        void RenderBall();
-        void DrawInput();
-        void DrawSuperfrustums(const Design& d, const std::vector<Rigid>& xf, float alpha, int highlight);
-        void DrawRestored(const Design& d, const std::vector<Rigid>& xf, float alpha);
-        void DrawHinges(const Design& d, const std::vector<Rigid>& xf, float t);
-        Model& PartMesh(const Part& p);
-        void PurgePartMeshes(const Design& d);
-        int Pick(Viewport& vp, const Design& d, const std::vector<Rigid>& xf);
-        void UpdateFoldAnimation();
+        void DrawViewportWindow(Viewport& vp, ImVec2 pos, ImVec2 size, bool design);
+        void DesignToolbar();
+        void OutputToolbar();
+        void DrawTimeline(float width);
+        bool DesignOverlay(ImVec2 pos, float w, float h);
+        bool OutputOverlay(ImVec2 pos, float w, float h);
+        bool GroupGizmo(const float* view, const float* proj);
+        void RenderDesign();
+        void RenderOutput();
+        void DrawReference(bool solidPass);
+        void DrawShapeGhosts();
+        Matrix ReferenceMatrix() const;
+        BoundingBox ReferenceBounds() const;
+        void DrawShapes(const std::vector<Rigid>& xf, bool output, float alpha);
+        void DrawHingeHardware(const std::vector<Rigid>& xf, bool output);
+        void DrawCollisions();
+        void DrawCollisionMarks();
+        ShapeModel& ShapeMesh(const Shape& s);
+        void PurgeShapeMeshes();
+        void ClearParts();
+        int PickShape(Viewport& vp, const std::vector<Rigid>& xf, bool cuts);
     private:
         Shader m_Shader = {};
         int m_ViewPositionLocation = -1;
-        std::vector<Asset> m_Library;
-        Model m_Input = {};
-        bool m_HasInput = false;
-        std::string m_InputName;
-        Matrix m_InputTransform = {};
-        BoundingBox m_InputBounds = { { -1, 0, -1 }, { 1, 2, 1 } };
-        std::shared_ptr<const TriMesh> m_Mesh;
-        std::shared_ptr<const ShapeAnalysis> m_Shape;
 
         Design m_Design;
-        int m_Selected = -1;
-        Mode m_Mode = Mode::Automatic;
-        EditTarget m_Target = EditTarget::Part;
+        Selection m_Sel;
         GizmoOp m_GizmoOp = GizmoOp::Translate;
-        bool m_LocalGizmo = true;
+        PickMode m_PickMode = PickMode::Shape;
+        bool m_LocalGizmo = false;
+        bool m_Snap = false;
+        float m_SnapMove = 1.0f;
+        float m_SnapAngle = 15.0f;
 
-        Viewport m_Figure{ "Figure  (open pose)" };
-        Viewport m_Ball{ "Ball  (fold preview)" };
+        Viewport m_DesignView{ "Design  (as modelled)" };
+        Viewport m_OutputView{ "Output  (parts in motion)" };
 
         std::vector<EditState> m_UndoStack;
         std::vector<EditState> m_RedoStack;
         EditState m_Committed;
 
-        Job<DecomposeResult> m_DecomposeJob;
-        Job<FoldResult> m_FoldJob;
-        Job<RestoreResult> m_RestoreJob;
-        DecomposeParams m_DecomposeParams;
-        FoldParams m_FoldParams;
-        RestoreParams m_RestoreParams;
-        Pipeline m_Pipeline = Pipeline::Idle;
-        bool m_RunAll = false;
-        double m_RunStart = 0.0;
-        std::vector<RunRecord> m_Runs;
-        float m_FitIoU = -1.0f;
-        bool m_ShowReleases = true;
-        bool m_ShowContacts = false;
-        std::vector<Vector3> m_Contacts;
-        float m_ContactsAt = -1.0f;
-        Design m_ContactsFor;
-        std::vector<float> m_LastHistory;
-        std::shared_ptr<const Design> m_Preview;
-        FoldParams m_ModelParams;
+        // group / multi-shape gizmo: transform applied to a snapshot taken when the drag started
+        bool m_GroupDrag = false;
+        float m_GroupMatrix[16] = {};
+        Matrix m_GroupStart = {};
+        Design m_DragStart;
+        std::vector<int> m_DragShapes;
+        std::vector<int> m_DragHinges;
 
-        std::vector<RestoredModel> m_Restored;
-        Design m_RestoredFor;
-        std::unordered_map<int, PartModel> m_PartModels;
+        // parts, collisions, export
+        Job<BuildResult> m_BuildJob;
+        Job<SweepResult> m_SweepJob;
+        Job<ExportResult> m_ExportJob;
+        std::shared_ptr<const std::vector<BuiltPart>> m_Parts;
+        Design m_BuildingFor;
+        float m_BuildingVoxel = 0.0f;
+        Design m_SweepingFor;
+        SweepParams m_SweepingParams;
+        std::vector<PartModel> m_PartModels;
+        Design m_PartsFor;
+        float m_PartsVoxel = 0.0f;
+        bool m_HasParts = false;
+        int m_PreviewResolution = 220;
+        SweepResult m_Sweep;
+        bool m_HasSweep = false;
+        SweepParams m_SweepParams;
+        ExportParams m_ExportParams;
+        std::vector<std::string> m_ExportedFiles;
 
-        FoldModel m_FoldModel;
-        FoldState m_Analysis;
-        FoldMetrics m_Metrics;
-        FoldVisual m_Visual;
-        bool m_AnalysisValid = false;
-        bool m_ShapesDirty = true;
+        std::unordered_map<int, ShapeModel> m_ShapeModels;
 
-        bool m_ShowInput = true;
-        float m_InputAlpha = 0.22f;
-        bool m_ShowParts = true;
-        float m_PartsAlpha = 0.55f;
+        // reference model
+        Model m_Reference = {};
+        bool m_HasReference = false;
+        std::string m_ReferenceName;
+        bool m_ShowReference = true;
+        float m_ReferenceAlpha = 0.25f;
+        float m_ReferenceScale = 1.0f;
+        Vector3 m_ReferenceOffset = { 0, 0, 0 };
+        Vector3 m_ReferenceRotation = { 0, 0, 0 };   // degrees, about the mesh's own centre
+        BoundingBox m_ReferenceBox = {};              // as loaded (unscaled)
+        ReferenceMode m_ReferenceMode = ReferenceMode::Solid;
+        Color m_ReferenceColor = { 196, 198, 206, 255 };
+        bool m_ReferenceInOutput = false;
+        bool m_ReferenceOpen = false;                 // open the panel once after a load
+
+        // display
+        bool m_ShowCuts = true;
+        float m_ShapesAlpha = 1.0f;
         bool m_ShowHinges = true;
-        bool m_ShowPiecesInFigure = false;
-        bool m_ShowPieces = true;
-        bool m_ShowSphere = true;
-        bool m_ShowShell = false;
-        bool m_ShowLost = false;
         bool m_ShowGrid = true;
+        bool m_ShowBuilt = true;
+        bool m_ShowContacts = true;
+        bool m_GhostOpen = false;
 
-        float m_Fold = 1.0f;
-        float m_FoldVelocity = 0.0f;
-        int m_FoldAnim = 0;             // 0 none, 1 spring open, 2 close
+        // motion: t = 0 open, 1 closed
+        float m_T = 0.0f;
+        int m_Anim = 0;              // +1 closing, -1 opening
         bool m_Loop = false;
         float m_LoopTimer = 0.0f;
+        float m_Duration = 2.5f;     // seconds for the whole motion
+        bool m_Ease = true;
 
-        int m_EulerPart = -1;
+        int m_EulerShape = -1;
         Quaternion m_EulerQuaternion = {};
         Vector3 m_EulerDegrees = {};
+        int m_TemplateIndex = 0;
+        int m_NewHingeParent = -1;
+        int m_NewHingeChild = -1;
+        int m_RenameId = -1;
 
-        std::string m_Status = "Pick a model from the library or drop a file onto a panel to begin.";
-        char m_DesignPath[256] = "bakugan_design.txt";
+        std::string m_Status = "Start from a template, or add shapes in the Model tab.";
+        char m_DesignPath[256] = "hinge_design.txt";
         char m_ExportPath[256] = "bakugan_parts";
-        char m_OpenPath[512] = "";
+        char m_ReferencePath[512] = "";
     };
 }
