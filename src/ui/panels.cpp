@@ -39,6 +39,44 @@ namespace Bakugan {
         ImGui::PopStyleColor();
     }
 
+    // A small eye drawn at the right end of the last item's row; returns true when clicked. `inherited`: shown dim
+    // because an enclosing group is hidden.
+    static bool EyeButton(bool visible, bool inherited) {
+        float h = ImGui::GetTextLineHeight();
+        float w = h * 1.5f;
+        ImVec2 rowMin = ImGui::GetItemRectMin(), rowMax = ImGui::GetItemRectMax();
+        ImGui::SameLine();
+        ImVec2 pos(rowMax.x - w - 2.0f, rowMin.y + (rowMax.y - rowMin.y - h) * 0.5f);
+        ImGui::SetCursorScreenPos(pos);
+        bool clicked = ImGui::InvisibleButton("##eye", ImVec2(w, h));
+        bool hovered = ImGui::IsItemHovered();
+        ImGui::SetItemTooltip(visible ? "Hide (H)" : "Show");
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 c(pos.x + w * 0.5f, pos.y + h * 0.5f);
+        float r = h * 0.55f;
+        int alpha = hovered ? 255 : (visible && !inherited ? 200 : 110);
+        ImU32 col = IM_COL32(220, 225, 235, alpha);
+        if (visible) {
+            dl->AddBezierQuadratic(ImVec2(c.x - r, c.y), ImVec2(c.x, c.y - r * 1.1f), ImVec2(c.x + r, c.y), col, 1.4f);
+            dl->AddBezierQuadratic(ImVec2(c.x - r, c.y), ImVec2(c.x, c.y + r * 1.1f), ImVec2(c.x + r, c.y), col, 1.4f);
+            dl->AddCircleFilled(c, r * 0.32f, col, 12);
+        } else {
+            // a closed lid with lashes
+            dl->AddBezierQuadratic(ImVec2(c.x - r, c.y - r * 0.1f), ImVec2(c.x, c.y + r * 0.9f), ImVec2(c.x + r, c.y - r * 0.1f), col, 1.4f);
+            for (int k = -1; k <= 1; k++) {
+                float x = c.x + k * r * 0.5f, y = c.y + r * (k == 0 ? 0.4f : 0.3f);
+                dl->AddLine(ImVec2(x, y), ImVec2(x + k * r * 0.2f, y + r * 0.35f), col, 1.2f);
+            }
+        }
+        return clicked;
+    }
+
+    // True when the mouse is over the eye column of the last item's row (so a click there doesn't select the row).
+    static bool OverEye() {
+        float w = ImGui::GetTextLineHeight() * 1.5f + 4.0f;
+        return ImGui::GetIO().MousePos.x > ImGui::GetItemRectMax().x - w;
+    }
+
     static const ImVec4 Red = ImVec4(1.0f, 0.42f, 0.4f, 1.0f);
     static const ImVec4 Green = ImVec4(0.4f, 0.85f, 0.5f, 1.0f);
     static const ImVec4 Amber = ImVec4(1.0f, 0.78f, 0.35f, 1.0f);
@@ -248,16 +286,19 @@ namespace Bakugan {
                 const Shape& sh = d.shapes[s];
                 ImGui::PushID(sh.id);
                 bool sel = std::find(m_Sel.shapes.begin(), m_Sel.shapes.end(), sh.id) != m_Sel.shapes.end();
-                ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_SpanAvailWidth;
+                ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_SpanAvailWidth |
+                                           ImGuiTreeNodeFlags_AllowOverlap;
                 if (sel) flags |= ImGuiTreeNodeFlags_Selected;
                 Swatch(sh.op == Op::Cut ? Color{ 235, 90, 90, 255 } : sh.color, sh.op == Op::Cut);
                 ImGui::SameLine();
                 bool isHot = hot.count(sh.id) > 0;
+                bool hidden = ShapeHidden(s);
                 if (isHot) ImGui::PushStyleColor(ImGuiCol_Text, Red);
+                else if (hidden) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
                 ImGui::TreeNodeEx("shape", flags, "%s%s%s", sh.name.c_str(), sh.op == Op::Cut ? "  (cut)" : "", isHot ? "  !!" : "");
-                if (isHot) ImGui::PopStyleColor();
+                if (isHot || hidden) ImGui::PopStyleColor();
                 if (isHot) ImGui::SetItemTooltip("Collides while closing (see the Hinges tab)");
-                if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+                if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen() && !OverEye()) {
                     ImGuiIO& io = ImGui::GetIO();
                     SelectShape(sh.id, io.KeyCtrl || io.KeySuper || io.KeyShift);
                 }
@@ -270,14 +311,17 @@ namespace Bakugan {
                     if (ImGui::MenuItem("Delete")) act = { TreeAction::Delete, sh.id };
                     ImGui::EndPopup();
                 }
+                if (EyeButton(!m_Hidden.count(sh.id), GroupHidden(sh.group))) ToggleHidden(sh.id);
                 ImGui::PopID();
             };
             std::function<void(int)> groupNode = [&](int g) {
                 const Group& grp = d.groups[g];
                 bool body = grp.parent < 0;
                 ImGui::PushID(grp.id);
-                ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanAvailWidth;
+                ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanAvailWidth |
+                                           ImGuiTreeNodeFlags_AllowOverlap;
                 if (m_Sel.group == grp.id) flags |= ImGuiTreeNodeFlags_Selected;
+                bool hidden = GroupHidden(grp.id);
                 Swatch(grp.color, !body);
                 ImGui::SameLine();
                 char label[160];
@@ -288,10 +332,12 @@ namespace Bakugan {
                     snprintf(label, sizeof(label), "%s   [feature%s%s]", grp.name.c_str(), grp.op == Op::Cut ? ", cut" : "",
                              grp.blend > 0.0f ? ", blended" : "");
                 }
-                if (body) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.92f, 0.75f, 1.0f));
+                ImVec4 text = hidden ? ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled) : body ? ImVec4(1.0f, 0.92f, 0.75f, 1.0f)
+                                                                                                : ImGui::GetStyleColorVec4(ImGuiCol_Text);
+                ImGui::PushStyleColor(ImGuiCol_Text, text);
                 bool open = ImGui::TreeNodeEx("group", flags, "%s", label);
-                if (body) ImGui::PopStyleColor();
-                if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) SelectGroup(grp.id);
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen() && !OverEye()) SelectGroup(grp.id);
                 dragSource(1, grp.id, grp.name.c_str());
                 dropTarget(grp.id);
                 if (ImGui::BeginPopupContextItem()) {
@@ -304,6 +350,8 @@ namespace Bakugan {
                     if (ImGui::MenuItem("Delete (with contents)")) act = { TreeAction::Delete, grp.id };
                     ImGui::EndPopup();
                 }
+                int up = grp.parent;
+                if (EyeButton(!m_Hidden.count(grp.id), up >= 0 && GroupHidden(up))) ToggleHidden(grp.id);
                 if (open) {
                     for (int c : d.ChildGroups(grp.id)) groupNode(c);
                     for (int s : d.DirectShapes(grp.id)) shapeNode(s);
@@ -324,7 +372,12 @@ namespace Bakugan {
             }
         }
         ImGui::EndChild();
-        Hint("Drag items onto a group to move them there, or below the list to make a new body.");
+        if (!m_Hidden.empty()) {
+            if (ImGui::SmallButton("Show all (Alt+H)")) m_Hidden.clear();
+            ImGui::SameLine();
+            ImGui::TextDisabled("hidden parts still export");
+        }
+        Hint("Drag items onto a group to move them there, or below the list to make a new body. The eye hides a part in the views.");
 
         // apply
         switch (act.kind) {
@@ -529,7 +582,9 @@ namespace Bakugan {
         ImGui::SameLine();
         if (ImGui::RadioButton("Ghost", mode == (int)ReferenceMode::Ghost)) m_ReferenceMode = ReferenceMode::Ghost;
         ImGui::SetItemTooltip("See-through, drawn over the shapes");
-        if (m_ReferenceMode == ReferenceMode::Ghost) ImGui::SliderFloat("Opacity", &m_ReferenceAlpha, 0.05f, 0.95f, "%.2f");
+        if (m_ReferenceMode == ReferenceMode::Ghost) ImGui::SliderFloat("Mesh opacity", &m_ReferenceAlpha, 0.05f, 0.95f, "%.2f");
+        ImGui::SliderFloat("Shape opacity", &m_ShapesAlpha, 0.05f, 1.0f, m_ShapesAlpha >= 0.995f ? "solid" : "%.2f");
+        ImGui::SetItemTooltip("See-through superfrustums show the mesh behind them (also in the design view's toolbar)");
         ImGui::DragFloat("Scale", &m_ReferenceScale, 0.01f, 0.001f, 1000.0f, "x%.3f");
         ImGui::DragFloat3("Offset", &m_ReferenceOffset.x, 0.1f, 0, 0, "%.1f mm");
         ImGui::DragFloat3("Rotation##ref", &m_ReferenceRotation.x, 0.5f, -360.0f, 360.0f, "%.1f deg");

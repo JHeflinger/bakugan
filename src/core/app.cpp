@@ -132,6 +132,10 @@ namespace Bakugan {
         if (ImGui::IsKeyPressed(ImGuiKey_Q))
             m_PickMode = m_PickMode == PickMode::Shape ? PickMode::Feature : m_PickMode == PickMode::Feature ? PickMode::Body : PickMode::Shape;
         if (ImGui::IsKeyPressed(ImGuiKey_X) && !m_Sel.shapes.empty()) ToggleCut();
+        if (ImGui::IsKeyPressed(ImGuiKey_H)) {
+            if (io.KeyAlt) m_Hidden.clear();
+            else HideSelection();
+        }
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) ClearSelection();
         if (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace)) DeleteSelection();
         if (ImGui::IsKeyPressed(ImGuiKey_D) && io.KeyShift) DuplicateSelection();
@@ -199,6 +203,9 @@ namespace Bakugan {
         if (folder.empty()) folder = GetWorkingDirectory();
         nfdchar_t* path = nullptr;
         nfdresult_t r = save ? NFD_SaveDialog(filters, folder.c_str(), &path) : NFD_OpenDialog(filters, folder.c_str(), &path);
+        // take focus back from the dialog: rlImGui ignores the mouse while the window is unfocused, and not every
+        // window manager hands focus back by itself
+        SetWindowFocused();
         if (r == NFD_OKAY && path) {
             *out = path;
             free(path);
@@ -549,6 +556,42 @@ namespace Bakugan {
             int g = m_Design.GroupIndex(sh.group);
             sh.color = sh.op == Op::Cut ? Color{ 225, 90, 90, 255 } : (g >= 0 ? m_Design.groups[g].color : WHITE);
         }
+    }
+
+    // ---- visibility (view state only: hidden parts still export and still count for collisions) -------------------
+
+    bool App::GroupHidden(int groupId) const {
+        int g = groupId, guard = 0;
+        while (g >= 0 && guard++ <= (int)m_Design.groups.size()) {
+            if (m_Hidden.count(g)) return true;
+            int i = m_Design.GroupIndex(g);
+            g = i >= 0 ? m_Design.groups[i].parent : -1;
+        }
+        return false;
+    }
+
+    bool App::ShapeHidden(int s) const {
+        return m_Hidden.count(m_Design.shapes[s].id) || GroupHidden(m_Design.shapes[s].group);
+    }
+
+    void App::ToggleHidden(int id) {
+        if (m_Hidden.erase(id)) return;
+        m_Hidden.insert(id);
+        // whatever just went out of sight drops out of the selection
+        if (m_Sel.group >= 0 && GroupHidden(m_Sel.group)) m_Sel.group = -1;
+        std::vector<int> keep;
+        for (int s : m_Sel.shapes) {
+            int i = m_Design.ShapeIndex(s);
+            if (i >= 0 && !ShapeHidden(i)) keep.push_back(s);
+        }
+        m_Sel.shapes = keep;
+    }
+
+    void App::HideSelection() {
+        if (m_Sel.group >= 0) m_Hidden.insert(m_Sel.group);
+        for (int id : m_Sel.shapes) m_Hidden.insert(id);
+        if (!m_Sel.Empty()) m_Status = "Hidden (Alt+H shows everything again; hidden parts still export).";
+        ClearSelection();
     }
 
     int App::AddHingeBetween(int parent, int child) {

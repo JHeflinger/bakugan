@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Bakugan {
@@ -98,6 +99,10 @@ namespace Bakugan {
         void DeleteSelection();
         void DuplicateSelection();
         void ToggleCut();
+        bool GroupHidden(int groupId) const;          // it or an enclosing group is hidden
+        bool ShapeHidden(int shapeIndex) const;       // it or a group it is in is hidden
+        void ToggleHidden(int id);
+        void HideSelection();
         int AddHingeBetween(int parent, int child);
         void PlaceHinge(int hinge);
         void FrameView(Viewport& vp);
@@ -192,6 +197,7 @@ namespace Bakugan {
         std::vector<std::string> m_ExportedFiles;
 
         std::unordered_map<int, ShapeModel> m_ShapeModels;
+        std::unordered_set<int> m_Hidden;             // shape and group ids hidden in the views (not part of the design)
 
         // reference model
         Model m_Reference = {};

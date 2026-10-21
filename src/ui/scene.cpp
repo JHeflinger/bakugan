@@ -90,6 +90,7 @@ namespace Bakugan {
         int solid = -1, cut = -1;
         for (int i = 0; i < (int)m_Design.shapes.size(); i++) {
             const Shape& s = m_Design.shapes[i];
+            if (ShapeHidden(i)) continue;
             bool isCut = !m_Design.AddsMaterial(i);
             if (isCut && !cuts) continue;
             int g = m_Design.GroupIndex(s.group);
@@ -160,7 +161,7 @@ namespace Bakugan {
         rlDisableDepthTest();
         rlDisableDepthMask();
         for (int i = 0; i < (int)m_Design.shapes.size(); i++) {
-            if (!m_Design.AddsMaterial(i)) continue;
+            if (!m_Design.AddsMaterial(i) || ShapeHidden(i)) continue;
             const Shape& s = m_Design.shapes[i];
             ShapeModel& sm = ShapeMesh(s);
             sm.model.transform = s.sf.Pose().ToMatrix();
@@ -193,6 +194,7 @@ namespace Bakugan {
         std::vector<Item> items;
         for (int i = 0; i < n; i++) {
             const Shape& s = d.shapes[i];
+            if (ShapeHidden(i)) continue;
             bool cut = !d.AddsMaterial(i);
             if (cut && (output || !m_ShowCuts)) continue;
             int g = d.GroupIndex(s.group);
@@ -257,6 +259,7 @@ namespace Bakugan {
             const Hinge& hg = d.hinges[h];
             int pi = d.GroupIndex(hg.parent), ci = d.GroupIndex(hg.child);
             if (pi < 0 || ci < 0) continue;
+            if (GroupHidden(hg.parent) && GroupHidden(hg.child)) continue;
             Vector3 pivot, axis;
             d.HingeInWorld(h, xf, &pivot, &axis);
             axis = Vector3Normalize(axis);
@@ -370,6 +373,11 @@ namespace Bakugan {
         if (built) {
             rlDrawRenderBatchActive();
             for (PartModel& pm : m_PartModels) {
+                if (pm.body >= 0 && GroupHidden(pm.body)) continue;
+                if (pm.pinHinge >= 0) {
+                    int h = d.HingeIndex(pm.pinHinge);
+                    if (h >= 0 && GroupHidden(d.hinges[h].parent) && GroupHidden(d.hinges[h].child)) continue;
+                }
                 int g = d.GroupIndex(pm.body);
                 Color c = g >= 0 ? d.groups[g].color : Color{ 200, 200, 205, 255 };
                 if (pm.pinHinge >= 0) {
@@ -464,9 +472,9 @@ namespace Bakugan {
         ImGui::SameLine();
         ImGui::Checkbox("Hinges", &m_ShowHinges);
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(60);
-        ImGui::SliderFloat("##sa", &m_ShapesAlpha, 0.1f, 1.0f, "%.2f");
-        ImGui::SetItemTooltip("Shape opacity");
+        ImGui::SetNextItemWidth(110);
+        ImGui::SliderFloat("##sa", &m_ShapesAlpha, 0.05f, 1.0f, m_ShapesAlpha >= 0.995f ? "shapes solid" : "shapes %.2f");
+        ImGui::SetItemTooltip("Superfrustum opacity: lower it to see the reference mesh (or the shapes behind) through them");
         ImGui::SameLine();
         if (!m_HasReference) {
             if (ImGui::Button("Mesh...")) BrowseReference();
