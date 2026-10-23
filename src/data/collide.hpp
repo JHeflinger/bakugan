@@ -1,7 +1,9 @@
 #pragma once
 #include "data/build.hpp"
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace Bakugan {
@@ -37,6 +39,22 @@ namespace Bakugan {
         bool operator!=(const SweepParams& o) const { return !(*this == o); }
     };
 
+    // A surface sample of one body found inside another, in the first body's design frame.
+    struct SweepHit {
+        Vector3 local = { 0, 0, 0 };
+        float depth = 0.0f;
+        bool named = false;              // attributed to the shapes below (only a sample of the hits is)
+        int shapeA = -1, hingeA = -1;
+        int shapeB = -1, hingeB = -1;
+    };
+
+    // Hits of an ordered pair of bodies, per checked moment, kept between sweeps: a pair whose two parts and whose
+    // relative motion are unchanged is not checked again.
+    struct SweepCache {
+        std::mutex mutex;
+        std::unordered_map<std::string, std::shared_ptr<const std::vector<std::vector<SweepHit>>>> pairs;
+    };
+
     struct SweepResult {
         bool ok = false;
         bool cancelled = false;
@@ -45,6 +63,8 @@ namespace Bakugan {
         SweepParams params;
         std::vector<SweepStep> steps;    // t = k / (steps - 1)
         std::vector<Collision> collisions;   // deepest first
+        int pairsChecked = 0;
+        int pairsReused = 0;
         bool Clear() const { return collisions.empty(); }
         int StepAt(float t) const;
     };
@@ -52,5 +72,5 @@ namespace Bakugan {
     // Moves the design from open (t = 0) to closed (t = 1) and checks every body's surface samples against every
     // other body's signed distance field at each step.
     SweepResult SweepCollisions(const Design& d, std::shared_ptr<const std::vector<BuiltPart>> parts, const SweepParams& p,
-                                JobControl& c);
+                                JobControl& c, std::shared_ptr<SweepCache> cache = nullptr);
 }

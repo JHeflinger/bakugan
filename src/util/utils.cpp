@@ -1,3 +1,6 @@
+// TBB first: raylib's macros (PI, EPSILON, ...) must not leak into its headers.
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 #include "utils.hpp"
 #include <raymath.h>
 #include <algorithm>
@@ -370,11 +373,14 @@ namespace Bakugan {
         int dim[3];
         for (int a = 0; a < 3; a++) dim[a] = (int)ceilf((&size.x)[a] / voxel) + 4;
         std::vector<float> field((size_t)dim[0] * dim[1] * dim[2]);
-        for (int k = 0; k < dim[2]; k++)
-            for (int j = 0; j < dim[1]; j++)
-                for (int i = 0; i < dim[0]; i++)
-                    field[((size_t)k * dim[1] + j) * dim[0] + i] =
-                        f({ origin.x + i * voxel, origin.y + j * voxel, origin.z + k * voxel });
+        // slices in parallel: this runs on the UI thread whenever a shape's size or profile changes
+        tbb::parallel_for(tbb::blocked_range<int>(0, dim[2]), [&](const tbb::blocked_range<int>& r) {
+            for (int k = r.begin(); k != r.end(); k++)
+                for (int j = 0; j < dim[1]; j++)
+                    for (int i = 0; i < dim[0]; i++)
+                        field[((size_t)k * dim[1] + j) * dim[0] + i] =
+                            f({ origin.x + i * voxel, origin.y + j * voxel, origin.z + k * voxel });
+        });
         return SurfaceNets(field, dim, origin, voxel);
     }
 

@@ -61,6 +61,17 @@ namespace Bakugan {
         }
     }
 
+    // A sphere around the knuckles, leaves, clearances, bore and head pocket: a point outside it by more than the
+    // current distance can't be changed by this hardware.
+    void HingeHardware::Bound() {
+        float lo2 = lo - clearance, hi2 = fmaxf(hi, headTo) + clearance;
+        float rad = fmaxf(fmaxf(radius + clearance, leafLength + leafThickness), headRadius + clearance);
+        if (pinOnly) rad = fmaxf(pinRadius, headRadius);
+        centre = Vector3Add(pivot, Vector3Scale(axis, (lo2 + hi2) * 0.5f));
+        float half = (hi2 - lo2) * 0.5f;
+        reach = sqrtf(half * half + rad * rad) + 0.01f;
+    }
+
     // ---- compile -----------------------------------------------------------------------------------------------------
 
     int BodyField::Compile(const Design& d, int groupId, Op op, float blend) {
@@ -142,6 +153,7 @@ namespace Bakugan {
             hw.pin = parent && hg.pin == PinStyle::Fused;
             hw.bore = !hw.pin;
             if (hg.pin == PinStyle::Separate) d.PinHead(h, &hw.headFrom, &hw.headTo, &hw.headRadius);
+            hw.Bound();
             f.m_Hardware.push_back(hw);
             BoundingBox hb = HardwareBounds(hw);
             box = hasBox ? Merge(box, hb) : hb;
@@ -170,6 +182,7 @@ namespace Bakugan {
         hw.hi = hw.headTo;
         hw.pin = true;
         hw.pinOnly = true;
+        hw.Bound();
         f.m_Hardware.push_back(hw);
         f.bounds = Grow(HardwareBounds(hw), 0.5f);
         return f;
@@ -203,22 +216,32 @@ namespace Bakugan {
 
     float BodyField::HardwareDistance(float d, Vector3 p) const {
         // leaves join the body, then the other body's knuckles are cleared, then this body's knuckles and pin go in,
-        // and finally the pin bore is drilled
-        for (const HingeHardware& h : m_Hardware) {
-            if (h.pinOnly || h.leafLength <= 0.0f) continue;
+        // and finally the pin bore is drilled. Each hinge is skipped where its bounding sphere shows it can't matter:
+        // material only where it lies closer than d, cuts only where they reach deeper than -d.
+        float lb[16];
+        size_t n = std::min(m_Hardware.size(), (size_t)16);
+        for (size_t i = 0; i < m_Hardware.size(); i++)
+            if (i < n) lb[i] = Vector3Distance(p, m_Hardware[i].centre) - m_Hardware[i].reach;
+        auto far = [&](size_t i) { return i < n ? lb[i] : -FLT_MAX; };
+        for (size_t i = 0; i < m_Hardware.size(); i++) {
+            const HingeHardware& h = m_Hardware[i];
+            if (h.pinOnly || h.leafLength <= 0.0f || far(i) > d) continue;
             float x, y, z;
             ToFrame(h, p, &x, &y, &z);
             for (const Knuckle& k : h.own)
                 d = fminf(d, Box(x, y, z, { 0.0f, -h.leafThickness * 0.5f, k.lo }, { h.leafLength, h.leafThickness * 0.5f, k.hi }));
         }
-        for (const HingeHardware& h : m_Hardware) {
-            if (h.pinOnly) continue;
+        for (size_t i = 0; i < m_Hardware.size(); i++) {
+            const HingeHardware& h = m_Hardware[i];
+            if (h.pinOnly || far(i) >= -d) continue;
             float x, y, z;
             ToFrame(h, p, &x, &y, &z);
             for (const Knuckle& k : h.other)
                 d = fmaxf(d, -Cylinder(x, y, z, h.radius + h.clearance, k.lo - h.clearance, k.hi + h.clearance));
         }
-        for (const HingeHardware& h : m_Hardware) {
+        for (size_t i = 0; i < m_Hardware.size(); i++) {
+            const HingeHardware& h = m_Hardware[i];
+            if (far(i) > d) continue;
             float x, y, z;
             ToFrame(h, p, &x, &y, &z);
             if (!h.pinOnly)
@@ -226,8 +249,9 @@ namespace Bakugan {
             if (h.pin) d = fminf(d, Cylinder(x, y, z, h.pinRadius, h.lo, h.hi));
             if (h.pinOnly && h.headRadius > 0.0f) d = fminf(d, Cylinder(x, y, z, h.headRadius, h.headFrom, h.headTo));
         }
-        for (const HingeHardware& h : m_Hardware) {
-            if (!h.bore) continue;
+        for (size_t i = 0; i < m_Hardware.size(); i++) {
+            const HingeHardware& h = m_Hardware[i];
+            if (!h.bore || far(i) >= -d) continue;
             float x, y, z;
             ToFrame(h, p, &x, &y, &z);
             d = fmaxf(d, -Cylinder(x, y, z, h.pinRadius + h.clearance, h.lo - h.clearance, h.hi + h.clearance));

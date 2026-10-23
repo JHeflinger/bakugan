@@ -1,5 +1,6 @@
 // OpenVDB / TBB first: raylib's macros (PI, EPSILON, ...) must not leak into their headers.
 #include <openvdb/openvdb.h>
+#include <openvdb/tools/Interpolation.h>
 #include <openvdb/tools/SignedFloodFill.h>
 #include <openvdb/tools/VolumeToMesh.h>
 #include <tbb/blocked_range.h>
@@ -13,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <mutex>
+#include <sstream>
 
 namespace Bakugan {
     namespace {
@@ -55,12 +57,33 @@ namespace Bakugan {
         }
     }
 
+    struct LevelSet {
+        openvdb::FloatGrid::Ptr grid;
+        float voxel = 1.0f;
+    };
+
+    struct LevelSetProbe::Impl {
+        openvdb::FloatGrid::ConstAccessor acc;
+        const openvdb::math::Transform& xform;
+        float voxel;
+        Impl(const LevelSet& ls) : acc(ls.grid->getConstAccessor()), xform(ls.grid->transform()), voxel(ls.voxel) {}
+    };
+
+    LevelSetProbe::LevelSetProbe(const LevelSet& ls) : m(new Impl(ls)) {}
+    LevelSetProbe::~LevelSetProbe() { delete m; }
+    float LevelSetProbe::Voxel() const { return m->voxel; }
+
+    float LevelSetProbe::operator()(Vector3 p) {
+        openvdb::Vec3d ijk = m->xform.worldToIndex(openvdb::Vec3d(p.x, p.y, p.z));
+        return openvdb::tools::BoxSampler::sample(m->acc, ijk);
+    }
+
     TriMesh MeshLevelSet(const std::function<float(Vector3)>& f, BoundingBox box, float voxel, float adaptivity,
-                         const JobControl* control, const std::function<void(float)>& progress) {
+                         const JobControl* control, const std::function<void(float)>& progress, std::shared_ptr<const LevelSet>* keep) {
         InitVDB();
         TriMesh out;
         const float band = 3.0f * voxel;
-        const int pad = 3, B = 8, T = 64;
+        const int pad = 3, B = 4, T = 64;   // 4^3 leaf blocks: finer culling of empty space
         // the odd fraction keeps grid points off the round-number planes designs are full of: samples exactly on a
         // face give the mesher ties that come out as pinched (non-manifold) edges
         const Vector3 jitter = { 0.3713f, 0.2847f, 0.4129f };
@@ -116,6 +139,12 @@ namespace Bakugan {
         grid->setTransform(xform);
         grid->setGridClass(openvdb::GRID_LEVEL_SET);
         openvdb::tools::signedFloodFill(grid->tree());
+        if (keep) {
+            auto ls = std::make_shared<LevelSet>();
+            ls->grid = grid;
+            ls->voxel = voxel;
+            *keep = ls;
+        }
 
         std::vector<openvdb::Vec3s> points;
         std::vector<openvdb::Vec3I> tris;
@@ -152,26 +181,65 @@ namespace Bakugan {
         return Clamp(longest / (float)std::max(resolution, 16), 0.12f, 4.0f);
     }
 
+    static void PutHingeHardware(std::ostringstream& s, const Design& d, int h) {
+        const Hinge& hg = d.hinges[h];
+        Vector3 la = d.LeafDirection(h, false), lb = d.LeafDirection(h, true);
+        s << "h" << hg.id << ' ' << hg.parent << ' ' << hg.child << ' ' << hg.pivot.x << ' ' << hg.pivot.y << ' ' << hg.pivot.z << ' '
+          << hg.axis.x << ' ' << hg.axis.y << ' ' << hg.axis.z << ' ' << hg.hardware << ' ' << hg.length << ' ' << hg.radius << ' '
+          << hg.pinRadius << ' ' << hg.clearance << ' ' << hg.knuckles << ' ' << (int)hg.pin << ' ' << hg.leafLength << ' '
+          << hg.leafThickness << ' ' << la.x << ' ' << la.y << ' ' << la.z << ' ' << lb.x << ' ' << lb.y << ' ' << lb.z << ';';
+    }
+
+    std::string PartKey(const Design& d, int bodyId) {
+        std::ostringstream s;
+        s.precision(9);
+        s << "body" << bodyId << ';';
+        for (const Group& g : d.groups)
+            if (d.Inside(g.id, bodyId)) s << "g" << g.id << ' ' << g.parent << ' ' << (int)g.op << ' ' << g.blend << ';';
+        for (const Shape& sh : d.shapes) {
+            if (!d.Inside(sh.group, bodyId)) continue;
+            const SuperFrustum& f = sh.sf;
+            s << "s" << sh.id << ' ' << sh.group << ' ' << (int)sh.op << ' ' << f.position.x << ' ' << f.position.y << ' ' << f.position.z << ' '
+              << f.rotation.x << ' ' << f.rotation.y << ' ' << f.rotation.z << ' ' << f.rotation.w << ' ' << f.size.x << ' ' << f.size.y << ' '
+              << f.size.z << ' ' << f.rounding << ' ' << f.taper << ' ' << f.bulge << ' ' << f.dilation << ' ' << f.onion << ';';
+        }
+        for (int h = 0; h < (int)d.hinges.size(); h++)
+            if (d.hinges[h].parent == bodyId || d.hinges[h].child == bodyId) PutHingeHardware(s, d, h);
+        return s.str();
+    }
+
+    std::string PinKey(const Design& d, int h) {
+        std::ostringstream s;
+        s.precision(9);
+        s << "pin;";
+        PutHingeHardware(s, d, h);
+        return s.str();
+    }
+
     BuildResult BuildParts(const Design& d, float voxel, float adaptivity, int samples, JobControl& c, const std::vector<Rigid>* pose,
-                           float gap) {
+                           float gap, const std::vector<const BuiltPart*>* reuse) {
         BuildResult r;
         r.design = d;
         r.voxel = voxel;
         std::vector<BodyField> fields;
-        std::vector<std::string> names;
+        std::vector<std::string> names, keys;
         std::vector<int> groupIndex;
+        char settings[96];
+        snprintf(settings, sizeof(settings), "|v%.6g a%.4g n%d", voxel, adaptivity, samples);
         for (int g : d.Bodies()) {
             BodyField f = BodyField::Body(d, d.groups[g].id);
             if (f.Empty()) continue;
             fields.push_back(std::move(f));
             names.push_back(d.groups[g].name);
+            keys.push_back(PartKey(d, d.groups[g].id) + settings);
             groupIndex.push_back(g);
         }
         size_t bodies = fields.size();
         // the bodies each one touches (or nearly) in the print pose
         struct Neighbour { size_t j; Rigid rel; BoundingBox box; };
         std::vector<std::vector<Neighbour>> near(bodies);
-        if (pose && gap > 0.0f)
+        bool trimming = pose && gap > 0.0f;
+        if (trimming)
             for (size_t i = 0; i < bodies; i++)
                 for (size_t j = 0; j < bodies; j++) {
                     if (i == j) continue;
@@ -183,16 +251,34 @@ namespace Bakugan {
             if (!d.hinges[h].hardware || d.hinges[h].pin != PinStyle::Separate) continue;
             fields.push_back(BodyField::Pin(d, h));
             names.push_back(d.hinges[h].name + " pin");
+            keys.push_back(PinKey(d, h) + settings);
         }
         if (fields.empty()) { r.ok = true; r.message = "Nothing to build."; return r; }
+        // what can be carried over, and how much is left to mesh (for the progress bar)
+        std::vector<const BuiltPart*> old(fields.size(), nullptr);
+        if (reuse && !trimming)
+            for (size_t i = 0; i < fields.size(); i++)
+                for (const BuiltPart* p : *reuse)
+                    if (p && p->key == keys[i]) { old[i] = p; break; }
+        size_t todo = 0, done = 0;
+        for (const BuiltPart* p : old) todo += p ? 0 : 1;
         for (size_t i = 0; i < fields.size(); i++) {
+            if (old[i]) {
+                BuiltPart part = *old[i];
+                part.name = names[i];
+                r.parts.push_back(std::move(part));
+                continue;
+            }
             const BodyField& f = fields[i];
             c.SetStage("Meshing " + names[i]);
-            float base = (float)i / fields.size(), span = 1.0f / fields.size();
+            float base = (float)done / todo, span = 1.0f / todo;
+            done++;
+            r.rebuilt++;
             BuiltPart part;
             part.body = f.body;
             part.pinHinge = f.pinHinge;
             part.name = names[i];
+            part.key = keys[i];
             const std::vector<Neighbour>* nb = i < bodies && !near[i].empty() ? &near[i] : nullptr;
             float half = gap * 0.5f;
             auto field = [&f, &fields, nb, half](Vector3 p) {
@@ -204,35 +290,45 @@ namespace Bakugan {
                     }
                 return v;
             };
-            part.mesh = MeshLevelSet(field, f.bounds, voxel, adaptivity, &c, [&c, base, span](float x) { c.SetProgress(base + span * x); });
+            part.mesh = MeshLevelSet(field, f.bounds, voxel, adaptivity, &c, [&c, base, span](float x) { c.SetProgress(base + span * 0.9f * x); },
+                                     samples > 0 ? &part.levelSet : nullptr);
+            // when stopped, the parts finished so far still go back: the next build can reuse them
             if (c.Cancelled()) { r.cancelled = true; r.message = "Stopped."; return r; }
             if (samples > 0 && !part.mesh.positions.empty()) {
                 size_t stride = std::max<size_t>(1, part.mesh.positions.size() / (size_t)samples);
+                size_t count = (part.mesh.positions.size() + stride - 1) / stride;
+                part.samples.resize(count);
                 float h = voxel * 0.25f;
-                for (size_t k = 0; k < part.mesh.positions.size(); k += stride) {
-                    Vector3 p = part.mesh.positions[k];
-                    // Newton steps onto the exact surface; kept only if they really land closer (creases and thin
-                    // walls can send the finite difference gradient astray)
-                    Vector3 q = p;
-                    float v0 = fabsf(f.Distance(p));
-                    for (int it = 0; it < 3; it++) {
-                        float v = f.Distance(q);
-                        Vector3 g = f.Gradient(q, h);
-                        float g2 = Vector3DotProduct(g, g);
-                        if (g2 < 0.25f) break;
-                        Vector3 step = Vector3Scale(g, v / g2);
-                        if (Vector3Length(step) > voxel) break;
-                        q = Vector3Subtract(q, step);
+                const TriMesh& mesh = part.mesh;
+                tbb::parallel_for(tbb::blocked_range<size_t>(0, count, 64), [&](const tbb::blocked_range<size_t>& range) {
+                    if (c.Cancelled()) return;
+                    for (size_t k = range.begin(); k != range.end(); k++) {
+                        Vector3 p = mesh.positions[k * stride];
+                        // Newton steps onto the exact surface; kept only if they really land closer (creases and thin
+                        // walls can send the finite difference gradient astray)
+                        Vector3 q = p;
+                        float v0 = fabsf(f.Distance(p));
+                        for (int it = 0; it < 3; it++) {
+                            float v = f.Distance(q);
+                            Vector3 g = f.Gradient(q, h);
+                            float g2 = Vector3DotProduct(g, g);
+                            if (g2 < 0.25f) break;
+                            Vector3 step = Vector3Scale(g, v / g2);
+                            if (Vector3Length(step) > voxel) break;
+                            q = Vector3Subtract(q, step);
+                        }
+                        if (fabsf(f.Distance(q)) < v0 && Vector3Distance(p, q) < voxel * 1.5f) p = q;
+                        part.samples[k] = p;
                     }
-                    if (fabsf(f.Distance(q)) < v0 && Vector3Distance(p, q) < voxel * 1.5f) p = q;
-                    part.samples.push_back(p);
-                }
+                });
+                if (c.Cancelled()) { r.cancelled = true; r.message = "Stopped."; return r; }
             }
             r.parts.push_back(std::move(part));
         }
         c.SetProgress(1.0f);
         r.ok = true;
-        r.message = "Built " + std::to_string(r.parts.size()) + " part" + (r.parts.size() == 1 ? "" : "s") + ".";
+        r.message = "Built " + std::to_string(r.parts.size()) + " part" + (r.parts.size() == 1 ? "" : "s") + " (" +
+                    std::to_string(r.rebuilt) + " remeshed).";
         return r;
     }
 

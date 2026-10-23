@@ -34,6 +34,7 @@ namespace Bakugan {
     struct PartModel {
         int body = -1;               // group id, -1 for a separate pin
         int pinHinge = -1;
+        std::string key;             // BuiltPart::key: an unchanged part keeps its GPU model
         Model model = {};
         size_t triangles = 0;
     };
@@ -181,6 +182,10 @@ namespace Bakugan {
         Job<SweepResult> m_SweepJob;
         Job<ExportResult> m_ExportJob;
         std::shared_ptr<const std::vector<BuiltPart>> m_Parts;
+        std::vector<BuiltPart> m_SpareParts;          // finished by a build that was stopped: reused by the next one
+        std::shared_ptr<SweepCache> m_SweepCache = std::make_shared<SweepCache>();
+        double m_BuildStart = 0.0, m_SweepStart = 0.0;
+        std::string m_BuildStats, m_SweepStats;       // how long the last update took, and how much was reused
         Design m_BuildingFor;
         float m_BuildingVoxel = 0.0f;
         Design m_SweepingFor;

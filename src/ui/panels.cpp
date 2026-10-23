@@ -781,6 +781,7 @@ namespace Bakugan {
         ImGui::DragFloat("Tolerance", &m_SweepParams.tolerance, 0.005f, 0.0f, 2.0f, "%.2f mm");
         ImGui::SetItemTooltip("Overlaps shallower than this count as touching");
         DrawJob(m_SweepJob.Control(), m_SweepJob.Busy(), "sweep", false);
+        if (!m_SweepStats.empty()) ImGui::TextDisabled("%s", m_SweepStats.c_str());
         if (!m_HasSweep) return;
         if (m_Sweep.collisions.empty()) {
             ImGui::TextColored(Green, "Nothing collides between open and closed.");
@@ -837,7 +838,7 @@ namespace Bakugan {
                 }
                 ImGui::EndTable();
             }
-            ImGui::TextDisabled("preview voxel %.2f mm", m_PartsVoxel);
+            ImGui::TextDisabled("preview voxel %.2f mm   %s", m_PartsVoxel, m_BuildStats.c_str());
         }
 
         ImGui::SeparatorText("Export STL");

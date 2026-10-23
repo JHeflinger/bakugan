@@ -25,6 +25,9 @@ namespace Bakugan {
         bool pin = false;            // this body carries the pin (fused, or a separate pin part)
         bool bore = false;           // this body's knuckles are bored for the pin
         bool pinOnly = false;        // a separate pin: nothing but the pin
+        Vector3 centre = { 0, 0, 0 };   // bounding sphere of everything above (for skipping far points)
+        float reach = 0.0f;
+        void Bound();
     };
 
     // Signed distance of one printed part (a body with its hinge hardware, or a separate pin) in the design pose.

@@ -320,23 +320,52 @@ namespace Bakugan {
 
     void App::PollJobs() {
         BuildResult br;
-        if (m_BuildJob.Poll(&br) && br.ok) {
-            ClearParts();
-            for (const BuiltPart& p : br.parts) {
-                PartModel pm;
-                pm.body = p.body;
-                pm.pinHinge = p.pinHinge;
-                pm.model = Utils::TriMeshToModel(p.mesh, m_Shader);
-                pm.triangles = p.mesh.indices.size() / 3;
-                m_PartModels.push_back(pm);
+        if (m_BuildJob.Poll(&br)) {
+            if (br.ok) {
+                // keep the GPU models of parts that didn't change, upload the rest
+                std::vector<PartModel> models;
+                for (const BuiltPart& p : br.parts) {
+                    PartModel pm;
+                    auto it = std::find_if(m_PartModels.begin(), m_PartModels.end(), [&](const PartModel& m) { return !m.key.empty() && m.key == p.key; });
+                    if (it != m_PartModels.end()) {
+                        pm = *it;
+                        it->key.clear();
+                        it->model = Model{};
+                    } else {
+                        pm.model = Utils::TriMeshToModel(p.mesh, m_Shader);
+                        pm.triangles = p.mesh.indices.size() / 3;
+                        pm.key = p.key;
+                    }
+                    pm.body = p.body;
+                    pm.pinHinge = p.pinHinge;
+                    models.push_back(pm);
+                }
+                for (PartModel& old : m_PartModels)
+                    if (old.model.meshCount > 0) UnloadModel(old.model);
+                m_PartModels = std::move(models);
+                m_Parts = std::make_shared<const std::vector<BuiltPart>>(std::move(br.parts));
+                m_PartsFor = br.design;
+                m_PartsVoxel = br.voxel;
+                m_HasParts = true;
+                m_SpareParts.clear();
+                char buf[96];
+                snprintf(buf, sizeof(buf), "last update %.0f ms, %d of %d parts remeshed", (GetTime() - m_BuildStart) * 1000.0,
+                         br.rebuilt, (int)m_Parts->size());
+                m_BuildStats = buf;
+            } else if (br.cancelled) {
+                for (BuiltPart& p : br.parts) {
+                    bool known = std::any_of(m_SpareParts.begin(), m_SpareParts.end(), [&](const BuiltPart& q) { return q.key == p.key; });
+                    if (!known) m_SpareParts.push_back(std::move(p));
+                }
+                if (m_SpareParts.size() > 32) m_SpareParts.erase(m_SpareParts.begin(), m_SpareParts.end() - 32);
             }
-            m_Parts = std::make_shared<const std::vector<BuiltPart>>(std::move(br.parts));
-            m_PartsFor = br.design;
-            m_PartsVoxel = br.voxel;
-            m_HasParts = true;
         }
         SweepResult sr;
         if (m_SweepJob.Poll(&sr) && sr.ok) {
+            char buf[96];
+            snprintf(buf, sizeof(buf), "last check %.0f ms, %d of %d body pairs rechecked", (GetTime() - m_SweepStart) * 1000.0,
+                     sr.pairsChecked, sr.pairsChecked + sr.pairsReused);
+            m_SweepStats = buf;
             m_Sweep = std::move(sr);
             m_HasSweep = true;
         }
@@ -348,29 +377,51 @@ namespace Bakugan {
     }
 
     // Keeps the parts and the collision sweep in step with the design, once the user lets go of whatever they drag.
+    // Only what changed is redone: parts whose geometry is the same are reused, and so are the collision checks of
+    // pairs of bodies whose parts and relative motion are the same. A job that went stale is stopped without waiting
+    // for it (the UI never blocks on a worker); the next one starts once it has wound down.
     void App::UpdateJobs() {
         if (Interacting()) return;
         float voxel = PreviewVoxel(m_Design, m_PreviewResolution);
         bool partsStale = !m_HasParts || !SameGeometry(m_PartsFor, m_Design) || m_PartsVoxel != voxel;
         if (partsStale) {
-            bool running = m_BuildJob.Busy();
-            if (running && SameGeometry(m_BuildingFor, m_Design) && m_BuildingVoxel == voxel) return;
+            if (m_BuildJob.Busy()) {
+                if (!SameGeometry(m_BuildingFor, m_Design) || m_BuildingVoxel != voxel) m_BuildJob.Cancel();
+                return;
+            }
+            if (m_SweepJob.Busy()) m_SweepJob.Cancel();   // its parts are about to change
             Design d = m_Design;
             m_BuildingFor = d;
             m_BuildingVoxel = voxel;
-            m_BuildJob.Start([d, voxel](JobControl& c) { return BuildParts(d, voxel, 0.0f, 5000, c); });
+            // the worker reads the current parts through shared pointers: nothing is copied on the UI thread
+            std::shared_ptr<const std::vector<BuiltPart>> current = m_Parts;
+            auto spare = std::make_shared<const std::vector<BuiltPart>>(std::move(m_SpareParts));
+            m_SpareParts.clear();
+            m_BuildStart = GetTime();
+            m_BuildJob.Start([d, voxel, current, spare](JobControl& c) {
+                std::vector<const BuiltPart*> reuse;
+                for (const BuiltPart& p : *spare) reuse.push_back(&p);
+                if (current)
+                    for (const BuiltPart& p : *current) reuse.push_back(&p);
+                return BuildParts(d, voxel, 0.0f, 5000, c, nullptr, 0.0f, &reuse);
+            });
             return;
         }
         m_SweepParams.ease = m_Ease;
         bool sweepStale = !m_HasSweep || !(m_Sweep.design == m_Design) || m_Sweep.params != m_SweepParams;
         if (!sweepStale) return;
-        if (m_SweepJob.Busy() && m_SweepingFor == m_Design && m_SweepingParams == m_SweepParams) return;
+        if (m_SweepJob.Busy()) {
+            if (!(m_SweepingFor == m_Design) || m_SweepingParams != m_SweepParams) m_SweepJob.Cancel();
+            return;
+        }
         Design d = m_Design;
         SweepParams p = m_SweepParams;
         std::shared_ptr<const std::vector<BuiltPart>> parts = m_Parts;
+        std::shared_ptr<SweepCache> cache = m_SweepCache;
         m_SweepingFor = d;
         m_SweepingParams = p;
-        m_SweepJob.Start([d, parts, p](JobControl& c) { return SweepCollisions(d, parts, p, c); });
+        m_SweepStart = GetTime();
+        m_SweepJob.Start([d, parts, p, cache](JobControl& c) { return SweepCollisions(d, parts, p, c, cache); });
     }
 
     void App::StartExport() {
