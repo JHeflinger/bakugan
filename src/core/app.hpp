@@ -1,6 +1,7 @@
 #pragma once
 #include "util/structs.hpp"
 #include "ui/viewport.hpp"
+#include "ui/raymarch.hpp"
 #include "data/build.hpp"
 #include "data/collide.hpp"
 #include <memory>
@@ -142,6 +143,10 @@ namespace Bakugan {
         Matrix ReferenceMatrix() const;
         BoundingBox ReferenceBounds() const;
         void DrawShapes(const std::vector<Rigid>& xf, bool output, float alpha);
+        void DrawShapesExact(const std::vector<Rigid>& xf, bool output, float alpha);
+        bool Exact() const { return m_Exact && m_Sdf.Ok(); }
+        SdfView ViewOf(const Viewport& vp) const;
+        void SyncExact();
         void DrawHingeHardware(const std::vector<Rigid>& xf, bool output);
         void DrawCollisions();
         void DrawCollisionMarks();
@@ -151,6 +156,10 @@ namespace Bakugan {
         int PickShape(Viewport& vp, const std::vector<Rigid>& xf, bool cuts);
     private:
         Shader m_Shader = {};
+        SdfRenderer m_Sdf;
+        bool m_Exact = true;                          // raymarch the fields instead of drawing meshes
+        bool m_ExactSynced = false;
+        Design m_ExactFor;
         int m_ViewPositionLocation = -1;
 
         Design m_Design;

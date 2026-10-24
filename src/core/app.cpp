@@ -34,6 +34,7 @@ namespace Bakugan {
         ImGui::GetIO().IniFilename = nullptr;
         m_Shader = LoadShaderFromMemory(Utils::GetVertexShader(), Utils::GetFragmentShader());
         m_ViewPositionLocation = GetShaderLocation(m_Shader, "viewPos");
+        if (!m_Sdf.Init()) m_Exact = false;   // no float precision / GLSL 3.3 trouble: draw meshes instead
         LoadTemplate(0);
         m_UndoStack.clear();
         m_Committed = Capture();
@@ -47,6 +48,7 @@ namespace Bakugan {
         for (auto& [id, sm] : m_ShapeModels)
             if (sm.loaded) UnloadModel(sm.model);
         if (m_HasReference) UnloadModel(m_Reference);
+        m_Sdf.Unload();
         m_DesignView.Unload();
         m_OutputView.Unload();
         UnloadShader(m_Shader);
@@ -776,6 +778,41 @@ namespace Bakugan {
         vp.Frame(b);
     }
 
+    // ---- exact rendering ---------------------------------------------------------------------------------------------
+
+    // Keeps one raymarching program per body (and separate pin) in step with the design. Values change every frame of
+    // a drag and only cost an upload; a shader is recompiled only when a body's structure changes.
+    void App::SyncExact() {
+        if (!Exact()) return;
+        if (m_ExactSynced && SameGeometry(m_ExactFor, m_Design)) return;
+        std::vector<std::string> slots;
+        for (int g : m_Design.Bodies()) {
+            BodyField f = BodyField::Body(m_Design, m_Design.groups[g].id);
+            if (f.Empty()) continue;
+            std::string slot = "b" + std::to_string(m_Design.groups[g].id);
+            if (!m_Sdf.SetBody(slot, f)) m_Status = "A body's raymarching shader failed to compile; showing meshes for it.";
+            slots.push_back(slot);
+        }
+        for (int h = 0; h < (int)m_Design.hinges.size(); h++) {
+            if (!m_Design.hinges[h].hardware || m_Design.hinges[h].pin != PinStyle::Separate) continue;
+            std::string slot = "p" + std::to_string(m_Design.hinges[h].id);
+            m_Sdf.SetBody(slot, BodyField::Pin(m_Design, h));
+            slots.push_back(slot);
+        }
+        m_Sdf.Retain(slots);
+        m_ExactFor = m_Design;
+        m_ExactSynced = true;
+    }
+
+    SdfView App::ViewOf(const Viewport& vp) const {
+        SdfView v;
+        v.camera = vp.GetCamera();
+        v.ortho = vp.Ortho();
+        float h = fmaxf(vp.ScreenRectangle().height, 1.0f);
+        v.pixel = v.ortho ? v.camera.fovy / h : 2.0f * tanf(v.camera.fovy * 0.5f * DEG2RAD) / h;
+        return v;
+    }
+
     // ---- frame -----------------------------------------------------------------------------------------------------
 
     void App::UpdateAnimation() {
@@ -815,6 +852,7 @@ namespace Bakugan {
         TrackHistory();
         UpdateJobs();
 
+        SyncExact();
         RenderDesign();
         RenderOutput();
 

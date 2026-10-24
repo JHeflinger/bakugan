@@ -84,6 +84,32 @@ namespace Bakugan {
     }
 
     // Material wins; a cut is picked only where its ghost is in front of the material (or with no material hit).
+    // Sphere traces one superfrustum along a ray (in its design frame): distance to the first hit, or -1.
+    static float TraceShape(const SuperFrustum& f, Vector3 ro, Vector3 rd) {
+        BoundingBox b = f.WorldBounds();
+        float tn = 0.0f, tf = FLT_MAX;
+        for (int a = 0; a < 3; a++) {
+            float o = (&ro.x)[a], d = (&rd.x)[a], lo = (&b.min.x)[a] - 0.01f, hi = (&b.max.x)[a] + 0.01f;
+            if (fabsf(d) < 1e-9f) {
+                if (o < lo || o > hi) return -1.0f;
+                continue;
+            }
+            float t0 = (lo - o) / d, t1 = (hi - o) / d;
+            if (t0 > t1) std::swap(t0, t1);
+            tn = fmaxf(tn, t0);
+            tf = fminf(tf, t1);
+        }
+        if (tn > tf) return -1.0f;
+        float t = tn;
+        for (int i = 0; i < 256 && t <= tf; i++) {
+            float d = f.Distance(Vector3Add(ro, Vector3Scale(rd, t)));
+            if (d < 1e-3f) return t;
+            t += fmaxf(d * 0.9f, 1e-3f);
+        }
+        return -1.0f;
+    }
+
+    // Picks against the exact shapes (what the raymarcher draws), not their outline meshes.
     int App::PickShape(Viewport& vp, const std::vector<Rigid>& xf, bool cuts) {
         Ray ray = vp.MouseRay();
         float bestSolid = FLT_MAX, bestCut = FLT_MAX;
@@ -94,9 +120,10 @@ namespace Bakugan {
             bool isCut = !m_Design.AddsMaterial(i);
             if (isCut && !cuts) continue;
             int g = m_Design.GroupIndex(s.group);
-            ShapeModel& sm = ShapeMesh(s);
-            Matrix t = s.sf.Pose().Then(g >= 0 ? xf[g] : Rigid{}).ToMatrix();
-            RayCollision c = GetRayCollisionMesh(ray, sm.model.meshes[0], t);
+            Rigid inv = (g >= 0 ? xf[g] : Rigid{}).Inverse();
+            RayCollision c = {};
+            c.distance = TraceShape(s.sf, inv.Apply(ray.position), Vector3Normalize(inv.ApplyVector(ray.direction)));
+            c.hit = c.distance >= 0.0f;
             if (!c.hit) continue;
             if (isCut && c.distance < bestCut) { bestCut = c.distance; cut = i; }
             if (!isCut && c.distance < bestSolid) { bestSolid = c.distance; solid = i; }
@@ -160,9 +187,15 @@ namespace Bakugan {
         rlDrawRenderBatchActive();
         rlDisableDepthTest();
         rlDisableDepthMask();
+        SdfView view = ViewOf(m_DesignView);
         for (int i = 0; i < (int)m_Design.shapes.size(); i++) {
             if (!m_Design.AddsMaterial(i) || ShapeHidden(i)) continue;
             const Shape& s = m_Design.shapes[i];
+            if (Exact()) {
+                bool isSel = sel.count(i) > 0;
+                m_Sdf.DrawShape(s.sf, Rigid{}, ColorAlpha(isSel ? ColorBrightness(s.color, 0.3f) : s.color, isSel ? 0.35f : 0.18f), 0.0f, view);
+                continue;
+            }
             ShapeModel& sm = ShapeMesh(s);
             sm.model.transform = s.sf.Pose().ToMatrix();
             bool isSel = sel.count(i) > 0;
@@ -173,7 +206,66 @@ namespace Bakugan {
         rlEnableDepthTest();
     }
 
+    // The shapes raymarched one by one: exact surfaces, nothing to remesh when they change. Same passes as the mesh
+    // path below, with the selection shown as a bright rim instead of a wireframe.
+    void App::DrawShapesExact(const std::vector<Rigid>& xf, bool output, float alpha) {
+        const Design& d = m_Design;
+        int n = (int)d.shapes.size();
+        if (n == 0) return;
+        SdfView view = ViewOf(output ? m_OutputView : m_DesignView);
+        std::vector<int> selected = SelectedShapeIndices();
+        std::unordered_set<int> sel(selected.begin(), selected.end());
+        std::unordered_set<int> hot;
+        if (m_HasSweep && m_ShowContacts) {
+            if (output) {
+                if (const SweepStep* st = CurrentStep())
+                    for (int id : st->shapes) hot.insert(id);
+            } else {
+                for (const Collision& c : m_Sweep.collisions) { hot.insert(c.shapeA); hot.insert(c.shapeB); }
+            }
+        }
+        struct Item { int i; float dist; Rigid xf; bool cut; };
+        std::vector<Item> items;
+        for (int i = 0; i < n; i++) {
+            const Shape& s = d.shapes[i];
+            if (ShapeHidden(i)) continue;
+            bool cut = !d.AddsMaterial(i);
+            if (cut && (output || !m_ShowCuts)) continue;
+            int g = d.GroupIndex(s.group);
+            Rigid body = g >= 0 ? xf[g] : Rigid{};
+            items.push_back({ i, Vector3DistanceSqr(body.Apply(s.sf.position), view.camera.position), body, cut });
+        }
+        std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.dist > b.dist; });
+        float pulse = Pulse();
+        bool translucent = alpha < 0.97f;
+        rlDrawRenderBatchActive();
+        if (translucent) rlDisableDepthMask();
+        for (const Item& it : items) {
+            if (it.cut) continue;
+            const Shape& s = d.shapes[it.i];
+            Color c = s.color;
+            float a = alpha, glow = 0.0f;
+            if (sel.count(it.i)) { glow = 0.45f; a = fminf(1.0f, alpha + 0.2f); }
+            if (hot.count(s.id)) c = Mix(c, Danger, output ? 0.85f * pulse : 0.55f);
+            m_Sdf.DrawShape(s.sf, it.xf, ColorAlpha(c, a), glow, view);
+        }
+        if (translucent) rlEnableDepthMask();
+        // cuts: red ghosts where they reach out of the material, selected ones x-rayed through it
+        rlDisableDepthMask();
+        for (const Item& it : items) {
+            if (!it.cut) continue;
+            const Shape& s = d.shapes[it.i];
+            bool isSel = sel.count(it.i) > 0;
+            if (isSel) rlDisableDepthTest();
+            m_Sdf.DrawShape(s.sf, it.xf, ColorAlpha(Color{ 235, 80, 80, 255 }, isSel ? 0.3f : 0.2f), isSel ? 0.4f : 0.0f, view);
+            if (isSel) rlEnableDepthTest();
+        }
+        rlEnableDepthMask();
+        rlDrawRenderBatchActive();
+    }
+
     void App::DrawShapes(const std::vector<Rigid>& xf, bool output, float alpha) {
+        if (Exact()) { DrawShapesExact(xf, output, alpha); return; }
         const Design& d = m_Design;
         int n = (int)d.shapes.size();
         if (n == 0) return;
@@ -252,7 +344,7 @@ namespace Bakugan {
 
     void App::DrawHingeHardware(const std::vector<Rigid>& xf, bool output) {
         const Design& d = m_Design;
-        bool built = output && m_ShowBuilt && m_HasParts && !m_PartModels.empty() && PartsCurrent();
+        bool built = output && m_ShowBuilt && (Exact() || (m_HasParts && !m_PartModels.empty() && PartsCurrent()));
         const SweepStep* st = output ? CurrentStep() : nullptr;
         rlDrawRenderBatchActive();
         for (int h = 0; h < (int)d.hinges.size(); h++) {
@@ -368,6 +460,29 @@ namespace Bakugan {
         int selBody = -1;
         if (SelectedGroup() >= 0) selBody = d.BodyOf(m_Sel.group);
         else if (SelectedShape() >= 0) selBody = d.ShapeBody(SelectedShape());
+        // exact: every body raymarched with its hinge hardware, always current (nothing to wait for)
+        if (Exact() && m_ShowBuilt) {
+            SdfView view = ViewOf(m_OutputView);
+            for (int g : d.Bodies()) {
+                int id = d.groups[g].id;
+                if (GroupHidden(id)) continue;
+                Color c = d.groups[g].color;
+                float glow = id == selBody ? 0.3f : 0.0f;
+                if (st && std::find(st->bodies.begin(), st->bodies.end(), id) != st->bodies.end()) c = Mix(c, Danger, 0.35f + 0.35f * pulse);
+                m_Sdf.DrawBody("b" + std::to_string(id), xf[g], c, glow, view);
+            }
+            for (const Hinge& h : d.hinges) {
+                if (!h.hardware || h.pin != PinStyle::Separate) continue;
+                if (GroupHidden(h.parent) && GroupHidden(h.child)) continue;
+                int g = d.GroupIndex(h.parent);
+                if (g >= 0) m_Sdf.DrawBody("p" + std::to_string(h.id), xf[g], Color{ 205, 205, 210, 255 }, 0.0f, view);
+            }
+            if (m_ShowHinges) DrawHingeHardware(xf, true);
+            DrawCollisions();
+            if (m_ReferenceInOutput) DrawReference(false);
+            m_OutputView.End3D();
+            return;
+        }
         // the built parts once they match the design; the raw shapes while an edit is being rebuilt
         bool built = m_ShowBuilt && m_HasParts && !m_PartModels.empty() && PartsCurrent();
         if (built) {
@@ -494,6 +609,14 @@ namespace Bakugan {
         if (ImGui::Button("View...")) ImGui::OpenPopup("design_view");
         if (ImGui::BeginPopup("design_view")) {
             ImGui::Checkbox("Grid (1 cm)", &m_ShowGrid);
+            ImGui::BeginDisabled(!m_Sdf.Ok());
+            ImGui::Checkbox("Exact rendering", &m_Exact);
+            ImGui::EndDisabled();
+            ImGui::SetItemTooltip(m_Sdf.Ok() ? "Raymarch the signed distance fields on the GPU: exact, instant surfaces.\n"
+                                               "Off: draw meshes (built in the background), for slow GPUs."
+                                             : "Not available: the raymarching shader didn't compile on this GPU.");
+            ImGui::SameLine();
+            ImGui::TextDisabled("%d fps", GetFPS());
             bool ortho = m_DesignView.Ortho();
             if (ImGui::Checkbox("Orthographic (5)", &ortho)) m_DesignView.SetOrtho(ortho);
             ImGui::Checkbox("Collision highlights", &m_ShowContacts);
@@ -567,11 +690,19 @@ namespace Bakugan {
         ImGui::SetItemTooltip("Each hinge eases in and out of its move");
         ImGui::SameLine();
         ImGui::Checkbox("Built", &m_ShowBuilt);
-        ImGui::SetItemTooltip("Show the built parts (with the hinge hardware, cuts and clearances) instead of the raw shapes");
+        ImGui::SetItemTooltip("Show the finished parts (with the hinge hardware, cuts and clearances) instead of the raw shapes");
         ImGui::SameLine();
         if (ImGui::Button("View...")) ImGui::OpenPopup("output_view");
         if (ImGui::BeginPopup("output_view")) {
             ImGui::Checkbox("Grid (1 cm)", &m_ShowGrid);
+            ImGui::BeginDisabled(!m_Sdf.Ok());
+            ImGui::Checkbox("Exact rendering", &m_Exact);
+            ImGui::EndDisabled();
+            ImGui::SetItemTooltip(m_Sdf.Ok() ? "Raymarch the signed distance fields on the GPU: exact, instant surfaces.\n"
+                                               "Off: draw meshes (built in the background), for slow GPUs."
+                                             : "Not available: the raymarching shader didn't compile on this GPU.");
+            ImGui::SameLine();
+            ImGui::TextDisabled("%d fps", GetFPS());
             ImGui::Checkbox("Hinge axes", &m_ShowHinges);
             ImGui::Checkbox("Collision highlights", &m_ShowContacts);
             bool ortho = m_OutputView.Ortho();
@@ -761,7 +892,8 @@ namespace Bakugan {
         }
         bool building = m_BuildJob.Busy() || m_SweepJob.Busy();
         if (building || !PartsCurrent()) {
-            const char* msg = m_BuildJob.Busy() ? "building parts..." : m_SweepJob.Busy() ? "checking motion..." : "waiting to rebuild...";
+            const char* msg = Exact() ? "updating the collision check..."
+                            : m_BuildJob.Busy() ? "building parts..." : m_SweepJob.Busy() ? "checking motion..." : "waiting to rebuild...";
             dl->AddText(ImVec2(pos.x + 8, pos.y + 6), IM_COL32(255, 220, 140, 200), msg);
         }
 

@@ -48,6 +48,11 @@ namespace Bakugan {
 
         static BodyField Body(const Design& d, int bodyId);
         static BodyField Pin(const Design& d, int hingeIndex);
+
+        // The same field as GLSL: the body of `float map(vec3 p)` reading its numbers from `uniform vec4 U[]`, which are
+        // appended to `params`. The code depends only on the structure (which shapes, groups, ops, knuckles), so
+        // editing values only changes the parameters. See ui/raymarch.cpp for the functions it calls.
+        std::string Glsl(std::vector<Vector4>* params) const;
     private:
         struct Node {
             int prim = -1;           // index into m_Prims, or -1 for a group
@@ -60,6 +65,8 @@ namespace Bakugan {
         int Compile(const Design& d, int groupId, Op op, float blend);
         float Eval(int node, Vector3 p) const;
         float HardwareDistance(float d, Vector3 p) const;
+        void GlslNode(int node, const std::string& acc, const std::string& blend, std::string& code, std::vector<Vector4>& U, int& vars) const;
+        void GlslHardware(std::string& code, std::vector<Vector4>& U) const;
         static void HardwareParts(const HingeHardware& h, Vector3 p, std::vector<float>* out);
     private:
         std::vector<SuperFrustum> m_Prims;

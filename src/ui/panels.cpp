@@ -819,8 +819,10 @@ namespace Bakugan {
 
     void App::DrawPrintTab() {
         ImGui::SeparatorText("Parts");
-        ImGui::SliderInt("Preview detail", &m_PreviewResolution, 80, 400, "%d voxels");
-        ImGui::SetItemTooltip("Resolution of the parts in the output view (voxels along the design's longest side)");
+        ImGui::SliderInt(Exact() ? "Check detail" : "Preview detail", &m_PreviewResolution, 80, 400, "%d voxels");
+        ImGui::SetItemTooltip(Exact() ? "Resolution of the background meshes the collision check samples (voxels along the design's\n"
+                                        "longest side). The views are raymarched exactly and don't depend on it."
+                                      : "Resolution of the parts in the output view (voxels along the design's longest side)");
         DrawJob(m_BuildJob.Control(), m_BuildJob.Busy(), "build", false);
         if (m_HasParts && m_Parts) {
             if (!PartsCurrent()) ImGui::TextColored(Amber, "Out of date: rebuilding after your edit.");

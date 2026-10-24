@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <string>
 
 namespace Bakugan {
     namespace {
@@ -337,5 +338,137 @@ namespace Bakugan {
             if (!(x == y)) return false;
         }
         return true;
+    }
+
+    // ---- GLSL ----------------------------------------------------------------------------------------------------------
+
+    static int Push(std::vector<Vector4>& U, Vector4 v) {
+        U.push_back(v);
+        return (int)U.size() - 1;
+    }
+
+    static std::string Ref(int i) { return "U[" + std::to_string(i) + "]"; }
+
+    // One child of a group, folded into the group's accumulator `acc`. A child whose bounding sphere is further away
+    // than |acc| (+ the group's blend) can't change it, so its lower bound stands in for it (exactly like Eval).
+    void BodyField::GlslNode(int n, const std::string& acc, const std::string& blend, std::string& code, std::vector<Vector4>& U,
+                             int& vars) const {
+        const Node& nd = m_Nodes[n];
+        bool cut = nd.op == Op::Cut;
+        auto combine = [&](const std::string& x) {
+            return cut ? acc + " = max(" + acc + ", -" + x + ");" : acc + " = opU(" + acc + ", " + x + ", " + blend + ");";
+        };
+        if (nd.prim >= 0) {
+            const SuperFrustum& f = m_Prims[nd.prim];
+            int i = Push(U, { f.position.x, f.position.y, f.position.z, nd.radius });
+            Push(U, { f.rotation.x, f.rotation.y, f.rotation.z, f.rotation.w });
+            Push(U, { f.size.x, f.size.y, f.size.z, f.rounding });
+            Push(U, { f.taper, f.bulge, f.dilation, f.onion });
+            code += "{ float lb = length(p - " + Ref(i) + ".xyz) - " + Ref(i) + ".w; float x = lb > abs(" + acc + ") + " + blend +
+                    " ? lb : sf(p, " + std::to_string(i) + "); " + combine("x") + " }\n";
+            return;
+        }
+        std::string g = "g" + std::to_string(vars++);
+        int c = Push(U, { nd.centre.x, nd.centre.y, nd.centre.z, nd.radius });
+        int k = Push(U, { nd.blend, 0, 0, 0 });
+        code += "{ float " + g + " = 1e9; float lb = length(p - " + Ref(c) + ".xyz) - " + Ref(c) + ".w;\n";
+        code += "if (" + Ref(c) + ".w > 0.0 && lb > abs(" + acc + ") + " + blend + ") " + g + " = lb; else {\n";
+        for (int ch : nd.children)
+            if (m_Nodes[ch].op == Op::Union) GlslNode(ch, g, Ref(k) + ".x", code, U, vars);
+        for (int ch : nd.children)
+            if (m_Nodes[ch].op == Op::Cut) GlslNode(ch, g, Ref(k) + ".x", code, U, vars);
+        code += "}\n" + combine(g) + " }\n";
+    }
+
+    void BodyField::GlslHardware(std::string& code, std::vector<Vector4>& U) const {
+        // per hinge: [0] bounding sphere, [1] pivot + radius, [2] leaf + pin radius, [3] side + clearance,
+        // [4] axis + leaf length, [5] leaf thickness, lo, hi, head from, [6] head to, head radius, then one vec4 per knuckle
+        struct Slots { int base; std::vector<int> own, other; };
+        std::vector<Slots> slots;
+        for (const HingeHardware& h : m_Hardware) {
+            Slots s;
+            s.base = Push(U, { h.centre.x, h.centre.y, h.centre.z, h.reach });
+            Push(U, { h.pivot.x, h.pivot.y, h.pivot.z, h.radius });
+            Push(U, { h.leaf.x, h.leaf.y, h.leaf.z, h.pinRadius });
+            Push(U, { h.side.x, h.side.y, h.side.z, h.clearance });
+            Push(U, { h.axis.x, h.axis.y, h.axis.z, h.leafLength });
+            Push(U, { h.leafThickness, h.lo, h.hi, h.headFrom });
+            Push(U, { h.headTo, h.headRadius, 0, 0 });
+            for (const Knuckle& k : h.own) s.own.push_back(Push(U, { k.lo, k.hi, 0, 0 }));
+            for (const Knuckle& k : h.other) s.other.push_back(Push(U, { k.lo, k.hi, 0, 0 }));
+            slots.push_back(s);
+        }
+        auto far = [&](const Slots& s) { return "(length(p - " + Ref(s.base) + ".xyz) - " + Ref(s.base) + ".w)"; };
+        auto frame = [&](const Slots& s) { return "vec3 f = hwFrame(p, " + std::to_string(s.base) + ");"; };
+        // leaves
+        for (size_t i = 0; i < m_Hardware.size(); i++) {
+            const HingeHardware& h = m_Hardware[i];
+            const Slots& s = slots[i];
+            if (h.pinOnly || h.leafLength <= 0.0f || h.own.empty()) continue;
+            std::string b = std::to_string(s.base);
+            code += "if (!(" + far(s) + " > d)) { " + frame(s) + "\n";
+            for (int k : s.own)
+                code += "  d = min(d, sdBox(f, vec3(0.0, -U[" + b + "+5].x * 0.5, " + Ref(k) + ".x), vec3(U[" + b + "+4].w, U[" + b + "+5].x * 0.5, " +
+                        Ref(k) + ".y)));\n";
+            code += "}\n";
+        }
+        // clearance around the other body's knuckles
+        for (size_t i = 0; i < m_Hardware.size(); i++) {
+            const HingeHardware& h = m_Hardware[i];
+            const Slots& s = slots[i];
+            if (h.pinOnly || h.other.empty()) continue;
+            std::string b = std::to_string(s.base);
+            code += "if (!(" + far(s) + " >= -d)) { " + frame(s) + "\n";
+            for (int k : s.other)
+                code += "  d = max(d, -sdCyl(f, U[" + b + "+1].w + U[" + b + "+3].w, " + Ref(k) + ".x - U[" + b + "+3].w, " + Ref(k) + ".y + U[" + b +
+                        "+3].w));\n";
+            code += "}\n";
+        }
+        // own knuckles, pin, separate pin head
+        for (size_t i = 0; i < m_Hardware.size(); i++) {
+            const HingeHardware& h = m_Hardware[i];
+            const Slots& s = slots[i];
+            bool knuckles = !h.pinOnly && !h.own.empty(), head = h.pinOnly && h.headRadius > 0.0f;
+            if (!knuckles && !h.pin && !head) continue;
+            std::string b = std::to_string(s.base);
+            code += "if (!(" + far(s) + " > d)) { " + frame(s) + "\n";
+            if (knuckles)
+                for (int k : s.own) code += "  d = min(d, sdCyl(f, U[" + b + "+1].w, " + Ref(k) + ".x, " + Ref(k) + ".y));\n";
+            if (h.pin) code += "  d = min(d, sdCyl(f, U[" + b + "+2].w, U[" + b + "+5].y, U[" + b + "+5].z));\n";
+            if (head) code += "  d = min(d, sdCyl(f, U[" + b + "+6].y, U[" + b + "+5].w, U[" + b + "+6].x));\n";
+            code += "}\n";
+        }
+        // bore and head pocket
+        for (size_t i = 0; i < m_Hardware.size(); i++) {
+            const HingeHardware& h = m_Hardware[i];
+            const Slots& s = slots[i];
+            if (!h.bore) continue;
+            std::string b = std::to_string(s.base);
+            code += "if (!(" + far(s) + " >= -d)) { " + frame(s) + "\n";
+            code += "  d = max(d, -sdCyl(f, U[" + b + "+2].w + U[" + b + "+3].w, U[" + b + "+5].y - U[" + b + "+3].w, U[" + b + "+5].z + U[" + b +
+                    "+3].w));\n";
+            if (h.headRadius > 0.0f)
+                code += "  d = max(d, -sdCyl(f, U[" + b + "+6].y + U[" + b + "+3].w, U[" + b + "+5].w - U[" + b + "+3].w, U[" + b + "+6].x + U[" + b +
+                        "+3].w));\n";
+            code += "}\n";
+        }
+    }
+
+    std::string BodyField::Glsl(std::vector<Vector4>* params) const {
+        std::vector<Vector4>& U = *params;
+        std::string code = "float d = 1e9;\n";
+        int vars = 0;
+        if (m_Root >= 0) {
+            // the root group is the body itself: its children fold straight into d
+            const Node& root = m_Nodes[m_Root];
+            int k = Push(U, { root.blend, 0, 0, 0 });
+            for (int ch : root.children)
+                if (m_Nodes[ch].op == Op::Union) GlslNode(ch, "d", Ref(k) + ".x", code, U, vars);
+            for (int ch : root.children)
+                if (m_Nodes[ch].op == Op::Cut) GlslNode(ch, "d", Ref(k) + ".x", code, U, vars);
+        }
+        if (!m_Hardware.empty()) GlslHardware(code, U);
+        code += "return min(d, 1e6);\n";
+        return code;
     }
 }
