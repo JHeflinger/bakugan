@@ -1,35 +1,35 @@
 Bakugan hinge designer - print sheet
-units: mm (x1)   pose: open   up axis: +Z   voxel 0.050 mm   bodies kept 0.40 mm apart
+units: mm (x2)   pose: closed   up axis: +Z   voxel 0.050 mm   bodies kept 0.40 mm apart
 
 part                             size x     size y     size z  triangles
-Base                              32.00      31.75      21.90      51794
-Head                               8.68      32.07      18.07      37186
-Left Wing                         22.65      24.58      15.47      27668
-Feet                              29.66      22.12       8.82      28828
-Neck                               5.50       5.13      13.69       5314
-Left Wing Joint                   12.05       8.51       2.92       6612
-Left Subwing                       8.73      19.34      14.78      10228
-Front Horns                        9.56      13.91      10.36       8584
-Back Horn                          3.02      10.74      14.23       3462
-Right Wing Joint                  12.09       8.46       2.92       7488
-Right Wing                        22.45      24.74      15.46      27532
-Right Subwing                      8.70      19.47      14.74      10786
-Extend Neck pin                    8.66       1.13       1.14        256
-Open Left Arm pin                  1.14       1.14       9.76        280
-Open Feet pin                     16.37       2.29       2.29       1450
-Open Head pin                      7.26       1.14       1.13        208
-Open Left Wing pin                 1.35       1.35       3.40        358
-Open Left Subwing pin              2.92       2.68       1.14        152
-Open Front Horns pin               5.66       1.14       1.16        176
-Open Back Horn pin                 7.66       1.14       1.16        216
-Open Right Arm pin                 1.14       1.14       9.76        280
-Open Right Wing pin                1.17       1.16       3.36        152
-Open Right Subwing pin             2.96       2.65       1.14        152
+Base                              64.00      63.58      43.81     174918
+Head                              17.34      63.94      38.06     135734
+Left Wing                         20.47      61.58      30.96      71412
+Feet                              59.33      44.20      17.61      67508
+Neck                              14.10      27.69       9.85      30532
+Left Wing Joint                    9.98      26.51       5.89      25032
+Left Subwing                      22.77      40.63      12.11      35328
+Front Horns                       19.20      32.01      13.91      42504
+Back Horn                          6.04      27.94      22.24      20154
+Right Wing Joint                   9.98      26.51       5.89      27676
+Right Wing                        20.50      61.56      30.92      65058
+Right Subwing                     22.78      40.60      12.11      33838
+Extend Neck pin                   18.60       2.40       2.40       3868
+Open Left Arm pin                  2.40       2.40      19.60       3956
+Open Feet pin                     53.00       4.60       4.60      12478
+Open Head pin                     19.60       2.40       2.40       3956
+Open Left Wing pin                 2.72       2.72      15.60       4530
+Open Left Subwing pin             14.20       2.40       2.40       3222
+Open Front Horns pin              17.40       2.40       2.40       3686
+Open Back Horn pin                15.40       2.40       2.40       3404
+Open Right Arm pin                 2.40       2.40      19.60       3956
+Open Right Wing pin                2.40       2.40      15.60       3376
+Open Right Subwing pin            14.20       2.40       2.40       3160
 
 hinge            parent           child                open   closed   kn  radius    pin    gap style
 Extend Neck      Base             Neck                91.1d     0.0d    3    1.00   0.20   0.40 separate pin
 Open Left Arm    Base             Left Wing Joint    -67.8d    -0.0d    3    1.00   0.20   0.40 separate pin
-Open Feet        Base             Feet              -180.3d     0.0d    3    1.55   0.20   0.40 separate pin
+Open Feet        Base             Feet              -180.3d     0.0d    2    1.55   0.20   0.40 separate pin
 Open Head        Neck             Head              -100.0d     0.0d    2    1.00   0.20   0.40 separate pin
 Open Left Wing   Left Wing Joint  Left Wing          109.2d     0.0d    2    1.08   0.28   0.40 separate pin
 Open Left Subwing Left Wing        Left Subwing        32.8d     0.0d    2    1.00   0.20   0.40 separate pin
