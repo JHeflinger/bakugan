@@ -281,8 +281,9 @@ namespace Bakugan {
 
     void App::SaveDesign() {
         std::string text = m_Design.Serialize();
-        if (SaveFileText(m_DesignPath, (char*)text.c_str())) m_Status = std::string("Saved the design to ") + m_DesignPath;
-        else m_Status = std::string("Could not write ") + m_DesignPath;
+        std::string err;
+        if (Utils::WriteTextFile(m_DesignPath, text, &err)) m_Status = std::string("Saved the design to ") + m_DesignPath;
+        else m_Status = err;
     }
 
     void App::LoadDesign() {

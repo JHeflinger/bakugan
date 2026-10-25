@@ -7,6 +7,7 @@
 #include <cfloat>
 #include <cmath>
 #include <array>
+#include <cstdarg>
 #include <cstdint>
 #include <cstring>
 #include <unordered_map>
@@ -400,6 +401,29 @@ namespace Bakugan {
     Vector3 Utils::AnyPerpendicular(Vector3 v) {
         Vector3 a = fabsf(v.x) < 0.8f ? Vector3{ 1, 0, 0 } : Vector3{ 0, 1, 0 };
         return Vector3Normalize(Vector3CrossProduct(v, a));
+    }
+
+    bool Utils::WriteTextFile(const std::string& path, const std::string& text, std::string* err) {
+        FILE* fp = fopen(path.c_str(), "wb");
+        if (!fp) { *err = "Could not create " + path; return false; }
+        size_t written = text.empty() ? 0 : fwrite(text.data(), 1, text.size(), fp);
+        bool ok = written == text.size();
+        ok &= fclose(fp) == 0;
+        if (!ok) *err = "Could not write " + path;
+        return ok;
+    }
+
+    std::string Utils::Format(const char* fmt, ...) {
+        va_list args;
+        va_start(args, fmt);
+        va_list copy;
+        va_copy(copy, args);
+        int n = vsnprintf(nullptr, 0, fmt, copy);
+        va_end(copy);
+        std::string out(n > 0 ? (size_t)n : 0, '\0');
+        if (n > 0) vsnprintf(&out[0], (size_t)n + 1, fmt, args);
+        va_end(args);
+        return out;
     }
 
     bool Utils::WriteSTL(const std::string& path, const TriMesh& mesh, std::string* err) {

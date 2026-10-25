@@ -394,41 +394,41 @@ namespace Bakugan {
 
         // a short assembly sheet next to the parts
         std::string notes = p.prefix + "_notes.txt";
-        FILE* fp = fopen(notes.c_str(), "w");
-        if (fp) {
-            fprintf(fp, "Bakugan hinge designer - print sheet\n");
-            fprintf(fp, "units: mm (x%.3g)   pose: %s   up axis: %s   voxel %.3f mm", p.scale, PoseName(p.pose), p.zUp ? "+Z" : "+Y", p.voxel);
-            if (p.keepApart) fprintf(fp, "   bodies kept %.2f mm apart", p.gap);
-            fprintf(fp, "\n\n");
-            fprintf(fp, "%-28s %10s %10s %10s %10s\n", "part", "size x", "size y", "size z", "triangles");
+        {
+            std::string t;
+            t += Utils::Format("Bakugan hinge designer - print sheet\n");
+            t += Utils::Format("units: mm (x%.3g)   pose: %s   up axis: %s   voxel %.3f mm", p.scale, PoseName(p.pose), p.zUp ? "+Z" : "+Y", p.voxel);
+            if (p.keepApart) t += Utils::Format("   bodies kept %.2f mm apart", p.gap);
+            t += Utils::Format("\n\n");
+            t += Utils::Format("%-28s %10s %10s %10s %10s\n", "part", "size x", "size y", "size z", "triangles");
             for (size_t i = 0; i < placed.size(); i++) {
                 Vector3 s = Vector3Subtract(placed[i].box.max, placed[i].box.min);
-                fprintf(fp, "%-28s %10.2f %10.2f %10.2f %10zu\n", b.parts[i].name.c_str(), s.x, s.y, s.z, placed[i].indices.size() / 3);
+                t += Utils::Format("%-28s %10.2f %10.2f %10.2f %10zu\n", b.parts[i].name.c_str(), s.x, s.y, s.z, placed[i].indices.size() / 3);
             }
             bool fused = false;
             if (!d.hinges.empty()) {
-                fprintf(fp, "\n%-16s %-16s %-16s %8s %8s %4s %7s %6s %6s %s\n", "hinge", "parent", "child", "open", "closed", "kn",
+                t += Utils::Format("\n%-16s %-16s %-16s %8s %8s %4s %7s %6s %6s %s\n", "hinge", "parent", "child", "open", "closed", "kn",
                         "radius", "pin", "gap", "style");
                 for (const Hinge& h : d.hinges) {
                     int pi = d.GroupIndex(h.parent), ci = d.GroupIndex(h.child);
-                    fprintf(fp, "%-16s %-16s %-16s %7.1fd %7.1fd %4d %7.2f %6.2f %6.2f %s\n", h.name.c_str(),
+                    t += Utils::Format("%-16s %-16s %-16s %7.1fd %7.1fd %4d %7.2f %6.2f %6.2f %s\n", h.name.c_str(),
                             pi >= 0 ? d.groups[pi].name.c_str() : "?", ci >= 0 ? d.groups[ci].name.c_str() : "?", h.start * RAD2DEG,
                             h.end * RAD2DEG, h.knuckles, h.radius, h.pinRadius, h.clearance,
                             !h.hardware ? "axis only (no hardware)" : h.pin == PinStyle::Fused ? "print in place" : "separate pin");
                     fused |= h.hardware && h.pin == PinStyle::Fused;
                 }
             }
-            fprintf(fp, "\nNotes\n");
+            t += Utils::Format("\nNotes\n");
             if (fused)
-                fprintf(fp, "- Print-in-place hinges: the pin is part of the parent body and runs through the child's knuckles,\n"
+                t += Utils::Format("- Print-in-place hinges: the pin is part of the parent body and runs through the child's knuckles,\n"
                             "  so the joined bodies must be printed together, as exported (use the _assembly.stl). Break the\n"
                             "  hinge free gently after printing.\n");
-            fprintf(fp, "- Separate-pin hinges: print the bodies and the pin parts on their own, line up the knuckles and push the\n"
+            t += Utils::Format("- Separate-pin hinges: print the bodies and the pin parts on their own, line up the knuckles and push the\n"
                         "  pin in from the end without a head (print pins standing up, head down, for a round shaft).\n"
                         "- The gap is the designed clearance between moving surfaces. Below about 0.3 mm most FDM printers\n"
                         "  fuse the parts; raise it in the hinge settings if the hinge prints solid.\n");
-            fclose(fp);
-            r.files.push_back(notes);
+            std::string err;
+            if (Utils::WriteTextFile(notes, t, &err)) r.files.push_back(notes);
         }
         r.ok = true;
         r.message = "Exported " + std::to_string(placed.size()) + " part" + (placed.size() == 1 ? "" : "s") + " (" +

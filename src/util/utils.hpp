@@ -46,6 +46,14 @@ namespace Bakugan {
 
         Vector3 AnyPerpendicular(Vector3 v);
 
+        // Writes text as is. Formatting stays in memory (Format) and only fopen / fwrite / fclose touch the FILE: on
+        // Windows those always come from the same C runtime, while fprintf can come from another one when runtimes are
+        // mixed (MinGW msvcrt vs UCRT), which leaves an empty file.
+        bool WriteTextFile(const std::string& path, const std::string& text, std::string* err);
+
+        // printf into a std::string.
+        std::string Format(const char* fmt, ...);
+
         // Binary STL, one facet per triangle.
         bool WriteSTL(const std::string& path, const TriMesh& mesh, std::string* err);
     }
