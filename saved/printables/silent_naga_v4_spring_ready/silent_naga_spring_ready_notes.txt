@@ -1,0 +1,56 @@
+Bakugan hinge designer - print sheet
+units: mm (x2)   pose: closed   up axis: +Z   voxel 0.050 mm   bodies kept 0.40 mm apart
+
+part                             size x     size y     size z  triangles
+Base                              64.00      63.58      42.98     195644
+Head                              17.16      63.94      38.06     139142
+Left Wing                         20.88      61.60      30.96      76244
+Feet                              59.33      44.20      17.61      70272
+Neck                              11.05      29.14      10.80      42770
+Left Wing Joint                    9.98      27.14       6.16      32340
+Left Subwing                      22.77      40.63      12.11      35744
+Front Horns                       19.20      32.01      13.91      43246
+Back Horn                          5.04      27.94      22.24      22088
+Right Wing Joint                   9.98      27.15       6.16      31948
+Right Wing                        20.92      61.56      30.92      70992
+Right Subwing                     22.78      40.60      12.11      34122
+Extend Neck pin                   13.60       3.20       3.20       3452
+Open Left Arm pin                  1.93       1.93       8.38       2010
+Open Feet pin                     34.80       3.20       3.20       6420
+Open Head pin                     13.20       2.79       2.79       3338
+Open Left Wing pin                 2.07       2.07       8.04       2100
+Open Left Subwing pin             14.20       3.20       3.20       3574
+Open Front Horns pin              17.40       3.20       3.20       4030
+Open Back Horn pin                18.60       3.20       3.20       4230
+Open Right Arm pin                 1.93       1.93       8.38       2010
+Open Right Wing pin                2.07       2.07       8.04       2100
+Open Right Subwing pin            14.20       3.20       3.20       3472
+
+hinge            parent           child                open   closed   kn  radius    pin    gap style
+Extend Neck      Base             Neck                91.1d     0.0d    4    2.70   0.20   0.40 separate pin
+Open Left Arm    Base             Left Wing Joint    -67.8d    -0.0d    4    2.16   0.20   0.09 separate pin
+Open Feet        Base             Feet              -180.3d     0.0d    3    1.00   0.20   0.40 separate pin
+Open Head        Neck             Head              -100.0d     0.0d    4    2.45   0.20   0.30 separate pin
+Open Left Wing   Left Wing Joint  Left Wing          109.2d     0.0d    4    2.08   0.20   0.12 separate pin
+Open Left Subwing Left Wing        Left Subwing        32.8d     0.0d    2    1.00   0.20   0.40 separate pin
+Open Front Horns Head             Front Horns         26.9d     0.0d    3    1.00   0.20   0.40 separate pin
+Open Back Horn   Head             Back Horn          -79.3d     0.0d    3    1.00   0.20   0.40 separate pin
+Open Right Arm   Base             Right Wing Joint    68.2d     0.0d    4    2.16   0.20   0.09 separate pin
+Open Right Wing  Right Wing Joint Right Wing        -108.9d     0.0d    4    2.08   0.20   0.12 separate pin
+Open Right Subwing Right Wing       Right Subwing      -32.5d     0.0d    2    1.00   0.20   0.40 separate pin
+
+Torsion spring room (removed knuckles, numbered along the hinge axis)
+  Extend Neck      knuckle 1 removed: room 1.85 mm long, coil outer dia. up to 5.40 mm, inner dia. at least 0.80 mm
+  Open Left Arm    knuckle 2 removed: room 0.89 mm long, coil outer dia. up to 4.32 mm, inner dia. at least 0.49 mm
+  Open Head        knuckle 4 removed: room 1.70 mm long, coil outer dia. up to 4.90 mm, inner dia. at least 0.70 mm
+  Open Left Wing   knuckle 2 removed: room 0.88 mm long, coil outer dia. up to 4.16 mm, inner dia. at least 0.52 mm
+  Open Right Arm   knuckle 2 removed: room 0.89 mm long, coil outer dia. up to 4.32 mm, inner dia. at least 0.49 mm
+  Open Right Wing  knuckle 2 removed: room 0.88 mm long, coil outer dia. up to 4.16 mm, inner dia. at least 0.52 mm
+  Slide the spring into the gap and push the pin through it. The spring legs need their own anchors
+  in each body.
+
+Notes
+- Separate-pin hinges: print the bodies and the pin parts on their own, line up the knuckles and push the
+  pin in from the end without a head (print pins standing up, head down, for a round shaft).
+- The gap is the designed clearance between moving surfaces. Below about 0.3 mm most FDM printers
+  fuse the parts; raise it in the hinge settings if the hinge prints solid.

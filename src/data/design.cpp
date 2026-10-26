@@ -22,10 +22,12 @@ namespace Bakugan {
 
     bool Hinge::operator==(const Hinge& o) const {
         return id == o.id && name == o.name && parent == o.parent && child == o.child && SameVec(pivot, o.pivot) &&
-               SameVec(axis, o.axis) && start == o.start && end == o.end && t0 == o.t0 && t1 == o.t1 && hardware == o.hardware &&
+               SameVec(axis, o.axis) && start == o.start && end == o.end && t0 == o.t0 && t1 == o.t1 && ownOpening == o.ownOpening &&
+               o0 == o.o0 && o1 == o.o1 && hardware == o.hardware &&
                length == o.length && radius == o.radius && pinRadius == o.pinRadius && clearance == o.clearance &&
                knuckles == o.knuckles && pin == o.pin && leafLength == o.leafLength && leafThickness == o.leafThickness &&
-               autoLeaves == o.autoLeaves && leafAngle[0] == o.leafAngle[0] && leafAngle[1] == o.leafAngle[1];
+               autoLeaves == o.autoLeaves && leafAngle[0] == o.leafAngle[0] && leafAngle[1] == o.leafAngle[1] &&
+               removed == o.removed && swapKnuckles == o.swapKnuckles && headDiameter == o.headDiameter;
     }
 
     bool Design::operator==(const Design& o) const {
@@ -143,21 +145,32 @@ namespace Bakugan {
 
     // ---- kinematics --------------------------------------------------------------------------------------------------
 
-    float Design::HingeFraction(int h, float t, bool ease) const {
-        const Hinge& hg = hinges[h];
-        float span = hg.t1 - hg.t0;
-        float f = span > 1e-4f ? (t - hg.t0) / span : (t >= hg.t1 ? 1.0f : 0.0f);
+    static float Window(float t, float a, float b, bool ease) {
+        float span = b - a;
+        float f = span > 1e-4f ? (t - a) / span : (t >= b ? 1.0f : 0.0f);
         f = Clamp(f, 0.0f, 1.0f);
         if (ease) f = f * f * (3.0f - 2.0f * f);
         return f;
     }
 
-    float Design::HingeAngle(int h, float t, bool ease) const {
+    float Design::HingeFraction(int h, float t, bool ease, Motion m) const {
         const Hinge& hg = hinges[h];
-        return hg.start + (hg.end - hg.start) * HingeFraction(h, t, ease);
+        if (m == Motion::Opening && hg.ownOpening) return 1.0f - Window(1.0f - t, hg.o0, hg.o1, ease);
+        return Window(t, hg.t0, hg.t1, ease);
     }
 
-    std::vector<Rigid> Design::Transforms(float t, bool ease) const {
+    float Design::HingeAngle(int h, float t, bool ease, Motion m) const {
+        const Hinge& hg = hinges[h];
+        return hg.start + (hg.end - hg.start) * HingeFraction(h, t, ease, m);
+    }
+
+    bool Design::HasOwnOpening() const {
+        for (const Hinge& h : hinges)
+            if (h.ownOpening) return true;
+        return false;
+    }
+
+    std::vector<Rigid> Design::Transforms(float t, bool ease, Motion m) const {
         int n = (int)groups.size();
         std::vector<Rigid> body(n);
         std::vector<char> state(n, 0);
@@ -172,7 +185,7 @@ namespace Bakugan {
                 int p = GroupIndex(hg.parent);
                 Rigid parent = p >= 0 ? solve(p) : Rigid{};
                 Vector3 axis = Vector3Length(hg.axis) > 1e-6f ? hg.axis : Vector3{ 1, 0, 0 };
-                r = Rigid::AboutAxis(hg.pivot, axis, HingeAngle(h, t, ease)).Then(parent);
+                r = Rigid::AboutAxis(hg.pivot, axis, HingeAngle(h, t, ease, m)).Then(parent);
             }
             state[g] = 2;
             body[g] = r;
@@ -230,7 +243,40 @@ namespace Bakugan {
         for (int k = 0; k < n; k++) {
             out[k].lo = -total * 0.5f + k * (seg + gap);
             out[k].hi = out[k].lo + seg;
-            out[k].child = (k % 2) == 1;
+            out[k].child = ((k % 2) == 1) != hg.swapKnuckles;
+            out[k].removed = k < 32 && (hg.removed >> k) & 1u;
+        }
+        return out;
+    }
+
+    bool Design::KnuckleRemovable(int h, int k) const {
+        std::vector<Knuckle> ks = Knuckles(h);
+        if (k < 0 || k >= (int)ks.size()) return false;
+        int left = 0;
+        for (int i = 0; i < (int)ks.size(); i++)
+            if (i != k && !ks[i].removed && ks[i].child == ks[k].child) left++;
+        return left > 0;
+    }
+
+    std::vector<SpringSpace> Design::SpringSpaces(int h) const {
+        const Hinge& hg = hinges[h];
+        std::vector<Knuckle> ks = Knuckles(h);
+        std::vector<SpringSpace> out;
+        for (int k = 0; k < (int)ks.size(); k++) {
+            if (!ks[k].removed) continue;
+            if (!out.empty() && out.back().last == k - 1) {
+                out.back().last = k;
+                out.back().hi = ks[k].hi + hg.clearance;
+                continue;
+            }
+            SpringSpace s;
+            s.first = s.last = k;
+            s.lo = ks[k].lo - hg.clearance;
+            s.hi = ks[k].hi + hg.clearance;
+            // both bodies are cleared to the knuckle radius + clearance; keep the clearance around the coil
+            s.outer = 2.0f * hg.radius;
+            s.inner = 2.0f * hg.pinRadius + hg.clearance;
+            out.push_back(s);
         }
         return out;
     }
@@ -240,7 +286,18 @@ namespace Bakugan {
         std::vector<Knuckle> ks = Knuckles(h);
         *from = ks.back().hi + hg.clearance;
         *to = *from + fmaxf(1.0f, hg.pinRadius);
-        *radius = fmaxf(hg.radius - hg.clearance, hg.pinRadius + 0.4f);
+        float dia = hg.headDiameter > 0.0f ? hg.headDiameter : AutoPinHeadDiameter(h);
+        *radius = fmaxf(dia, MinPinHeadDiameter(h)) * 0.5f;
+    }
+
+    float Design::AutoPinHeadDiameter(int h) const {
+        const Hinge& hg = hinges[h];
+        return 2.0f * fmaxf(hg.radius - hg.clearance, hg.pinRadius + 0.4f);
+    }
+
+    float Design::MinPinHeadDiameter(int h) const {
+        const Hinge& hg = hinges[h];
+        return 2.0f * (hg.pinRadius + hg.clearance + 0.2f);
     }
 
     bool Design::AddsMaterial(int s) const {
@@ -512,12 +569,22 @@ namespace Bakugan {
             if (fabsf(h.end - h.start) > 2 * PI) h.end = h.start + (h.end > h.start ? 2 * PI : -2 * PI);
             h.t0 = Clamp(h.t0, 0.0f, 1.0f);
             h.t1 = Clamp(h.t1, h.t0, 1.0f);
+            h.o0 = Clamp(h.o0, 0.0f, 1.0f);
+            h.o1 = Clamp(h.o1, h.o0, 1.0f);
             h.knuckles = std::clamp(h.knuckles, 2, 15);
             h.length = fmaxf(h.length, 1.0f);
             h.clearance = Clamp(h.clearance, 0.05f, 3.0f);
             h.pinRadius = fmaxf(h.pinRadius, 0.2f);
             h.radius = fmaxf(h.radius, h.pinRadius + h.clearance + 0.4f);
             h.leafLength = fmaxf(h.leafLength, 0.0f);
+            h.headDiameter = Clamp(h.headDiameter, 0.0f, 500.0f);
+            // forget knuckles past the count, and never leave a body without one
+            h.removed &= h.knuckles >= 32 ? ~0u : (1u << h.knuckles) - 1u;
+            for (int side = 0; side < 2; side++) {
+                uint32_t mine = 0;
+                for (int k = side; k < h.knuckles; k += 2) mine |= 1u << k;
+                if ((h.removed & mine) == mine) h.removed &= ~mine;
+            }
             h.leafThickness = fmaxf(h.leafThickness, 0.2f);
             hinges.push_back(h);
         }
@@ -561,6 +628,14 @@ namespace Bakugan {
               << h.t1 << " " << (h.hardware ? 1 : 0) << " " << h.length << " " << h.radius << " " << h.pinRadius << " "
               << h.clearance << " " << h.knuckles << " " << (int)h.pin << " " << h.leafLength << " " << h.leafThickness << " "
               << (h.autoLeaves ? 1 : 0) << " " << h.leafAngle[0] << " " << h.leafAngle[1] << " " << h.name << "\n";
+        for (const Hinge& h : hinges)
+            if (h.ownOpening) s << "opening " << h.id << " " << h.o0 << " " << h.o1 << "\n";
+        for (const Hinge& h : hinges)
+            if (h.removed) s << "removed " << h.id << " " << h.removed << "\n";
+        for (const Hinge& h : hinges)
+            if (h.swapKnuckles) s << "swapknuckles " << h.id << "\n";
+        for (const Hinge& h : hinges)
+            if (h.headDiameter > 0.0f) s << "pinhead " << h.id << " " << h.headDiameter << "\n";
         return s.str();
     }
 
@@ -569,6 +644,11 @@ namespace Bakugan {
         std::string line;
         Design d;
         bool header = false;
+        struct Opening { int hinge; float o0, o1; };
+        std::vector<Opening> openings;
+        std::vector<std::pair<int, uint32_t>> removals;
+        std::vector<int> swaps;
+        std::vector<std::pair<int, float>> heads;
         while (std::getline(in, line)) {
             std::istringstream ls(line);
             std::string tag;
@@ -614,8 +694,42 @@ namespace Bakugan {
                 h.name = RestOfLine(ls);
                 if (h.name.empty()) h.name = "Hinge";
                 d.hinges.push_back(h);
+            } else if (tag == "opening") {
+                Opening o;
+                ls >> o.hinge >> o.o0 >> o.o1;
+                if (ls.fail()) { *err = "Malformed opening line: " + line.substr(0, 60); return false; }
+                openings.push_back(o);
+            } else if (tag == "removed") {
+                int id = 0;
+                uint32_t mask = 0;
+                ls >> id >> mask;
+                if (ls.fail()) { *err = "Malformed removed line: " + line.substr(0, 60); return false; }
+                removals.push_back({ id, mask });
+            } else if (tag == "swapknuckles") {
+                int id = 0;
+                ls >> id;
+                if (ls.fail()) { *err = "Malformed swapknuckles line: " + line.substr(0, 60); return false; }
+                swaps.push_back(id);
+            } else if (tag == "pinhead") {
+                int id = 0;
+                float dia = 0.0f;
+                ls >> id >> dia;
+                if (ls.fail()) { *err = "Malformed pinhead line: " + line.substr(0, 60); return false; }
+                heads.push_back({ id, dia });
             }
         }
+        for (const Opening& o : openings)
+            for (Hinge& h : d.hinges)
+                if (h.id == o.hinge) { h.ownOpening = true; h.o0 = o.o0; h.o1 = o.o1; }
+        for (const auto& r : removals)
+            for (Hinge& h : d.hinges)
+                if (h.id == r.first) h.removed = r.second;
+        for (int id : swaps)
+            for (Hinge& h : d.hinges)
+                if (h.id == id) h.swapKnuckles = true;
+        for (const auto& hd : heads)
+            for (Hinge& h : d.hinges)
+                if (h.id == hd.first) h.headDiameter = hd.second;
         if (!header) { *err = "Not a bakugan hinge design file"; return false; }
         d.Repair();
         *this = d;

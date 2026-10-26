@@ -364,6 +364,7 @@ namespace Bakugan {
             if (hg.hardware && !built) {
                 Color pc = d.groups[pi].color, cc = d.groups[ci].color;
                 for (const Knuckle& k : d.Knuckles(h)) {
+                    if (k.removed) continue;
                     Vector3 a = Vector3Add(pivot, Vector3Scale(axis, k.lo)), b = Vector3Add(pivot, Vector3Scale(axis, k.hi));
                     Color c = k.child ? cc : pc;
                     if (sel) c = ColorBrightness(c, 0.3f);
@@ -372,6 +373,26 @@ namespace Bakugan {
                     DrawCylinderWiresEx(a, b, hg.radius, hg.radius, 10, ColorAlpha(BLACK, 0.25f));
                 }
             }
+            // a torsion spring drawn in the room left by removed knuckles (a marker only: never built or exported)
+            if (hg.hardware)
+                for (const SpringSpace& s : d.SpringSpaces(h)) {
+                    float wire = fmaxf((s.outer - s.inner) * 0.18f, 0.12f);
+                    float r = (s.outer + s.inner) * 0.25f;
+                    float lo = s.lo + hg.clearance + wire, hi = s.hi - hg.clearance - wire;
+                    if (hi <= lo) continue;
+                    int turns = std::max(2, (int)((hi - lo) / (2.6f * wire)));
+                    int segs = turns * 14;
+                    Vector3 u = Utils::AnyPerpendicular(axis), v = Vector3CrossProduct(axis, u);
+                    Color sc = sel ? Color{ 255, 220, 120, 255 } : Color{ 225, 175, 70, 255 };
+                    Vector3 prev = {};
+                    for (int i = 0; i <= segs; i++) {
+                        float f = i / (float)segs, a = f * turns * 2.0f * PI;
+                        Vector3 q = Vector3Add(pivot, Vector3Add(Vector3Scale(axis, lo + (hi - lo) * f),
+                                                                 Vector3Add(Vector3Scale(u, r * cosf(a)), Vector3Scale(v, r * sinf(a)))));
+                        if (i > 0) DrawCylinderEx(prev, q, wire, wire, 5, sc);
+                        prev = q;
+                    }
+                }
             // the axis
             float half = hg.length * 0.5f + hg.radius * 1.5f;
             Color axisCol = sel ? WHITE : Color{ 255, 205, 60, 255 };
@@ -453,7 +474,7 @@ namespace Bakugan {
         if (!m_OutputView.Begin3D(Color{ 32, 36, 44, 255 }, m_ShowGrid)) return;
         SetShaderValue(m_Shader, m_ViewPositionLocation, &m_OutputView.GetCamera().position, SHADER_UNIFORM_VEC3);
         const Design& d = m_Design;
-        std::vector<Rigid> xf = d.Transforms(m_T, m_Ease);
+        std::vector<Rigid> xf = d.Transforms(m_T, m_Ease, m_Motion);
         const SweepStep* st = CurrentStep();
         float pulse = Pulse();
         if (m_ReferenceInOutput) DrawReference(true);
@@ -541,7 +562,7 @@ namespace Bakugan {
         if (vp.Clicked()) {
             ImGuiIO& io = ImGui::GetIO();
             bool additive = io.KeyCtrl || io.KeySuper || io.KeyShift;
-            std::vector<Rigid> xf = design ? std::vector<Rigid>(m_Design.groups.size()) : m_Design.Transforms(m_T, m_Ease);
+            std::vector<Rigid> xf = design ? std::vector<Rigid>(m_Design.groups.size()) : m_Design.Transforms(m_T, m_Ease, m_Motion);
             int hit = PickShape(vp, xf, design && m_ShowCuts);
             if (hit < 0) {
                 if (!additive) ClearSelection();
@@ -636,11 +657,12 @@ namespace Bakugan {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         dl->AddRectFilled(p, ImVec2(p.x + width, p.y + h), IM_COL32(28, 30, 36, 255), 4.0f);
         // collisions along the motion
-        if (m_HasSweep && m_ShowContacts && !m_Sweep.steps.empty()) {
-            int n = (int)m_Sweep.steps.size();
+        const std::vector<SweepStep>* steps = m_HasSweep ? &m_Sweep.Steps(m_Motion) : nullptr;
+        if (steps && m_ShowContacts && !steps->empty()) {
+            int n = (int)steps->size();
             float cell = width / (float)n;
             for (int k = 0; k < n; k++) {
-                if (m_Sweep.steps[k].depth <= 0.0f) continue;
+                if ((*steps)[k].depth <= 0.0f) continue;
                 float x0 = p.x + k * cell, x1 = x0 + cell + 1.0f;
                 dl->AddRectFilled(ImVec2(x0, p.y + 2), ImVec2(x1, p.y + h - 2), SweepCurrent() ? IM_COL32(230, 50, 50, 220) : IM_COL32(170, 90, 90, 160));
             }
@@ -649,7 +671,10 @@ namespace Bakugan {
         int hs = SelectedHinge();
         if (hs >= 0) {
             const Hinge& hg = m_Design.hinges[hs];
-            dl->AddRectFilled(ImVec2(p.x + hg.t0 * width, p.y + h - 5), ImVec2(p.x + hg.t1 * width, p.y + h - 1), IM_COL32(255, 205, 60, 230));
+            bool own = m_Motion == Motion::Opening && hg.ownOpening;
+            float a = own ? 1.0f - hg.o1 : hg.t0, b = own ? 1.0f - hg.o0 : hg.t1;
+            dl->AddRectFilled(ImVec2(p.x + a * width, p.y + h - 5), ImVec2(p.x + b * width, p.y + h - 1),
+                              own ? IM_COL32(110, 200, 255, 230) : IM_COL32(255, 205, 60, 230));
         }
         float x = p.x + m_T * width;
         dl->AddLine(ImVec2(x, p.y), ImVec2(x, p.y + h), IM_COL32_WHITE, 2.0f);
@@ -657,6 +682,12 @@ namespace Bakugan {
         dl->AddText(ImVec2(p.x + 6, p.y + 4), IM_COL32(150, 230, 160, 200), "open");
         ImVec2 ts = ImGui::CalcTextSize("closed");
         dl->AddText(ImVec2(p.x + width - ts.x - 6, p.y + 4), IM_COL32(255, 180, 90, 200), "closed");
+        if (m_Design.HasOwnOpening()) {
+            const char* dir = m_Motion == Motion::Opening ? "<<  opening schedule" : "closing schedule  >>";
+            ImVec2 ds = ImGui::CalcTextSize(dir);
+            dl->AddText(ImVec2(p.x + (width - ds.x) * 0.5f, p.y + 4), m_Motion == Motion::Opening ? IM_COL32(110, 200, 255, 200)
+                                                                                                    : IM_COL32(255, 205, 60, 200), dir);
+        }
         if (active) {
             m_T = Clamp((ImGui::GetIO().MousePos.x - p.x) / width, 0.0f, 1.0f);
             m_Anim = 0;
@@ -664,19 +695,29 @@ namespace Bakugan {
         if (ImGui::IsItemHovered()) {
             float t = Clamp((ImGui::GetIO().MousePos.x - p.x) / width, 0.0f, 1.0f);
             int k = m_HasSweep ? m_Sweep.StepAt(t) : -1;
-            if (k >= 0 && m_Sweep.steps[k].depth > 0.0f)
-                ImGui::SetTooltip("%.0f%% closed: collision, %.2f mm deep", t * 100.0f, m_Sweep.steps[k].depth);
+            const char* motion = MotionWord(m_Motion);
+            if (k >= 0 && (*steps)[k].depth > 0.0f)
+                ImGui::SetTooltip("%.0f%% closed (%s): collision, %.2f mm deep", t * 100.0f, motion, (*steps)[k].depth);
             else
-                ImGui::SetTooltip("%.0f%% closed. Drag to scrub. Red = parts collide there.", t * 100.0f);
+                ImGui::SetTooltip("%.0f%% closed (%s). Drag to scrub. Red = parts collide there.", t * 100.0f, motion);
         }
     }
 
     void App::OutputToolbar() {
-        if (ImGui::Button(m_Anim < 0 ? "Opening..." : "Open")) { m_Anim = -1; if (m_T <= 0.0f) m_T = 1.0f; }
+        if (ImGui::Button(m_Anim < 0 ? "Opening..." : "Open")) Play(-1);
         ImGui::SetItemTooltip("Play the opening motion (closed -> open)");
         ImGui::SameLine();
-        if (ImGui::Button(m_Anim > 0 ? "Closing..." : "Close")) { m_Anim = 1; if (m_T >= 1.0f) m_T = 0.0f; }
+        if (ImGui::Button(m_Anim > 0 ? "Closing..." : "Close")) Play(1);
         ImGui::SetItemTooltip("Space. Play the closing motion (open -> closed)");
+        if (m_Design.HasOwnOpening()) {
+            ImGui::SameLine();
+            int motion = (int)m_Motion;
+            ImGui::SetNextItemWidth(90);
+            const char* names[] = { "Closing", "Opening" };
+            if (ImGui::Combo("##schedule", &motion, names, 2)) { m_Motion = (Motion)motion; m_Anim = 0; }
+            ImGui::SetItemTooltip("Which schedule the timeline follows when you scrub. Some hinges open on their own timing;\n"
+                                  "playing Open or Close from an end picks the matching one.");
+        }
         ImGui::SameLine();
         if (ImGui::Button("Stop")) m_Anim = 0;
         ImGui::SameLine();
@@ -798,8 +839,9 @@ namespace Bakugan {
                 if (close) continue;
                 placed.push_back(c.local);
                 char buf[64];
-                if (c.firstT == c.lastT) snprintf(buf, sizeof(buf), "hits at %.0f%%", c.firstT * 100.0f);
-                else snprintf(buf, sizeof(buf), "hits %.0f-%.0f%%", c.firstT * 100.0f, c.lastT * 100.0f);
+                const char* when = c.motion == Motion::Opening ? " opening" : "";
+                if (c.firstT == c.lastT) snprintf(buf, sizeof(buf), "hits at %.0f%%%s", c.firstT * 100.0f, when);
+                else snprintf(buf, sizeof(buf), "hits %.0f-%.0f%%%s", c.firstT * 100.0f, c.lastT * 100.0f, when);
                 label(c.local, buf, IM_COL32(255, 110, 110, 230));
             }
         }
@@ -884,7 +926,8 @@ namespace Bakugan {
         const SweepStep* st = CurrentStep();
         if (st && st->depth > 0.0f) {
             char buf[96];
-            snprintf(buf, sizeof(buf), "COLLISION  %.2f mm  at %.0f%% closed", st->depth, st->t * 100.0f);
+            snprintf(buf, sizeof(buf), "COLLISION  %.2f mm  at %.0f%% closed%s", st->depth, st->t * 100.0f,
+                     st->motion == Motion::Opening ? " (opening)" : "");
             ImVec2 ts = ImGui::CalcTextSize(buf);
             ImVec2 a(pos.x + (w - ts.x) * 0.5f - 10, pos.y + 8), b(pos.x + (w + ts.x) * 0.5f + 10, pos.y + 14 + ts.y);
             dl->AddRectFilled(a, b, IM_COL32(200, 30, 30, (int)(150 + 90 * Pulse())), 4.0f);
@@ -902,7 +945,7 @@ namespace Bakugan {
         if (sh < 0) return false;
         bool atOpen = m_T <= 0.001f, atClosed = m_T >= 0.999f;
         Design& d = m_Design;
-        std::vector<Rigid> t = d.Transforms(m_T, m_Ease);
+        std::vector<Rigid> t = d.Transforms(m_T, m_Ease, m_Motion);
         Vector3 pivot, axis;
         d.HingeInWorld(sh, t, &pivot, &axis);
         axis = Vector3Normalize(axis);

@@ -160,15 +160,21 @@ namespace Bakugan {
         ImGui::PopStyleColor();
         // the motion check, always in sight
         if (!m_HasSweep) {
-            ImGui::TextDisabled("Checking the closing motion...");
+            ImGui::TextDisabled("Checking the motion...");
         } else if (m_Sweep.collisions.empty()) {
-            ImGui::TextColored(Green, "Closing motion is clear.");
+            ImGui::TextColored(Green, m_Sweep.Opens() ? "Closing and opening are clear." : "Closing motion is clear.");
         } else {
             const Collision& worst = m_Sweep.collisions[0];
-            ImGui::TextColored(Red, "!! %d collision%s while closing", (int)m_Sweep.collisions.size(), m_Sweep.collisions.size() == 1 ? "" : "s");
-            ImGui::SetItemTooltip("Deepest: %.2f mm at %.0f%% closed. Details in the Hinges tab.", worst.depth, worst.worstT * 100.0f);
+            int closing = m_Sweep.Count(Motion::Closing), opening = m_Sweep.Count(Motion::Opening);
+            if (closing > 0 && opening > 0)
+                ImGui::TextColored(Red, "!! %d collision%s closing, %d opening", closing, closing == 1 ? "" : "s", opening);
+            else
+                ImGui::TextColored(Red, "!! %d collision%s while %s", closing + opening, closing + opening == 1 ? "" : "s",
+                                   opening > 0 ? "opening" : "closing");
+            ImGui::SetItemTooltip("Deepest: %.2f mm at %.0f%% closed (%s). Details in the Hinges tab.", worst.depth,
+                                  worst.worstT * 100.0f, MotionWord(worst.motion));
             ImGui::SameLine();
-            if (ImGui::SmallButton("Show")) { m_T = worst.worstT; m_Anim = 0; }
+            if (ImGui::SmallButton("Show")) ShowMoment(worst.worstT, worst.motion);
             ImGui::SetItemTooltip("Jump the output view to the worst moment (details in the Hinges tab)");
         }
         if (m_HasSweep && !SweepCurrent()) {
@@ -297,7 +303,7 @@ namespace Bakugan {
                 else if (hidden) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
                 ImGui::TreeNodeEx("shape", flags, "%s%s%s", sh.name.c_str(), sh.op == Op::Cut ? "  (cut)" : "", isHot ? "  !!" : "");
                 if (isHot || hidden) ImGui::PopStyleColor();
-                if (isHot) ImGui::SetItemTooltip("Collides while closing (see the Hinges tab)");
+                if (isHot) ImGui::SetItemTooltip("Collides in the motion (see the Hinges tab)");
                 if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen() && !OverEye()) {
                     ImGuiIO& io = ImGui::GetIO();
                     SelectShape(sh.id, io.KeyCtrl || io.KeySuper || io.KeyShift);
@@ -725,9 +731,9 @@ namespace Bakugan {
         ImGui::SameLine();
         if (ImGui::SmallButton("Swap")) std::swap(h.start, h.end);
         ImGui::SameLine();
-        if (ImGui::SmallButton("Show open")) { m_T = 0.0f; m_Anim = 0; }
+        if (ImGui::SmallButton("Show open")) ShowMoment(0.0f, m_Motion);
         ImGui::SameLine();
-        if (ImGui::SmallButton("Show closed")) { m_T = 1.0f; m_Anim = 0; }
+        if (ImGui::SmallButton("Show closed")) ShowMoment(1.0f, m_Motion);
         float t0 = h.t0 * 100.0f, t1 = h.t1 * 100.0f;
         if (ImGui::DragFloatRange2("Moves during", &t0, &t1, 0.5f, 0.0f, 100.0f, "from %.0f%%", "to %.0f%%")) {
             h.t0 = Clamp(t0 / 100.0f, 0.0f, 1.0f);
@@ -735,6 +741,26 @@ namespace Bakugan {
         }
         ImGui::SetItemTooltip("Share of the whole closing motion while this hinge turns (sequence hinges one after another).\n"
                               "Shown in yellow under the timeline.");
+        if (ImGui::Checkbox("Own opening timing", &h.ownOpening) && h.ownOpening) {
+            // start from closing played backwards, so turning it on changes nothing until the range is moved
+            h.o0 = 1.0f - h.t1;
+            h.o1 = 1.0f - h.t0;
+        }
+        ImGui::SetItemTooltip("Off: opening is the closing motion played backwards. On: this hinge opens on its own timing, so it\n"
+                              "can wait until the parts around it are out of the way.");
+        if (h.ownOpening) {
+            float o0 = h.o0 * 100.0f, o1 = h.o1 * 100.0f;
+            if (ImGui::DragFloatRange2("Opens during", &o0, &o1, 0.5f, 0.0f, 100.0f, "from %.0f%%", "to %.0f%%")) {
+                h.o0 = Clamp(o0 / 100.0f, 0.0f, 1.0f);
+                h.o1 = Clamp(o1 / 100.0f, h.o0, 1.0f);
+            }
+            ImGui::SetItemTooltip("Share of the whole opening motion (0%% = fully closed, 100%% = fully open) while this hinge\n"
+                                  "turns. 'From' is the delay: the hinge stays closed until then. Shown in blue under the\n"
+                                  "timeline while the opening schedule is on.");
+            ImGui::TextDisabled("Waits %.0f%% of the opening (%.1f s)", h.o0 * 100.0f, h.o0 * m_Duration);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Preview opening")) { ShowMoment(1.0f, Motion::Opening); Play(-1); }
+        }
 
         ImGui::SeparatorText("Door hinge");
         ImGui::Checkbox("Build hinge hardware", &h.hardware);
@@ -743,7 +769,19 @@ namespace Bakugan {
         ImGui::BeginDisabled(!h.hardware);
         ImGui::DragFloat("Length", &h.length, 0.1f, 2.0f, 500.0f, "%.1f mm");
         ImGui::SliderInt("Knuckles", &h.knuckles, 2, 9);
-        ImGui::SetItemTooltip("Alternating: the parent (stays) takes the first, third, ...");
+        ImGui::SetItemTooltip(h.swapKnuckles ? "Alternating: the child (turns) takes the first, third, ..."
+                                             : "Alternating: the parent (stays) takes the first, third, ...");
+        DrawKnuckleToggles(hi);
+        if (ImGui::Checkbox("Swap knuckles", &h.swapKnuckles)) {
+            // removed knuckles stay where they are along the pin, but a body can't lose its last one
+            for (int side = 0; side < 2; side++) {
+                uint32_t mine = 0;
+                for (int k = side; k < h.knuckles && k < 32; k += 2) mine |= 1u << k;
+                if ((h.removed & mine) == mine) h.removed &= ~mine;
+            }
+        }
+        ImGui::SetItemTooltip("Swap which knuckles belong to the parent and which to the child (with an odd count this also\n"
+                              "changes which body gets the extra one, and the outer ends).");
         ImGui::DragFloat("Knuckle radius", &h.radius, 0.05f, 0.5f, 50.0f, "%.2f mm");
         ImGui::DragFloat("Pin radius", &h.pinRadius, 0.02f, 0.2f, 40.0f, "%.2f mm");
         ImGui::DragFloat("Clearance", &h.clearance, 0.005f, 0.05f, 3.0f, "%.2f mm");
@@ -754,6 +792,25 @@ namespace Bakugan {
         if (ImGui::Combo("Pin", &pin, pins, 2)) h.pin = (PinStyle)pin;
         ImGui::SetItemTooltip("Print in place: the pin belongs to the parent and runs through the child's knuckles, so the two\n"
                               "bodies print together. Separate: every knuckle is bored and the pin is exported as its own part.");
+        if (h.pin == PinStyle::Separate) {
+            float autoDia = d.AutoPinHeadDiameter(hi), minDia = d.MinPinHeadDiameter(hi);
+            bool custom = h.headDiameter > 0.0f;
+            float dia = custom ? fmaxf(h.headDiameter, minDia) : autoDia;
+            char fmt[48];
+            snprintf(fmt, sizeof(fmt), custom ? "%%.2f mm" : "auto (%%.2f mm)");
+            if (custom) ImGui::SetNextItemWidth(ImGui::CalcItemWidth() - ImGui::CalcTextSize("Auto").x - ImGui::GetStyle().ItemSpacing.x - 8.0f);
+            if (ImGui::DragFloat("Pin head dia.", &dia, 0.02f, minDia, 200.0f, fmt, ImGuiSliderFlags_AlwaysClamp))
+                h.headDiameter = fmaxf(dia, minDia);
+            ImGui::SetItemTooltip("Diameter of the separate pin's head (its pocket in the body grows or shrinks with it). It can't go\n"
+                                  "below %.2f mm, just wider than the pin's bore, or the pin would slide through.", minDia);
+            if (custom) {
+                ImGui::SameLine();
+                ImGui::PushID("autohead");
+                if (ImGui::SmallButton("Auto")) h.headDiameter = 0.0f;
+                ImGui::PopID();
+                ImGui::SetItemTooltip("Back to the automatic size: the knuckle diameter less the clearance");
+            }
+        }
         ImGui::DragFloat("Leaf length", &h.leafLength, 0.1f, 0.0f, 200.0f, h.leafLength > 0.0f ? "%.1f mm" : "none");
         ImGui::SetItemTooltip("Plates that tie each set of knuckles into its body");
         ImGui::DragFloat("Leaf thickness", &h.leafThickness, 0.05f, 0.2f, 50.0f, "%.2f mm");
@@ -768,11 +825,55 @@ namespace Bakugan {
         ImGui::EndDisabled();
         if (h.hardware && h.pin == PinStyle::Fused)
             Warn("Print in place: the two bodies must print together, so export with 'Combined assembly'.");
+        if (h.hardware && h.pin == PinStyle::Fused && h.removed)
+            Warn("A fused pin is printed through the spring gap, so a spring can't be fitted afterwards: use a separate pin.");
         ImGui::PopID();
     }
 
+    // One button per knuckle along the axis, in its body's colour: click to leave it out (an open gap on the pin, room for
+    // a torsion spring) or put it back.
+    void App::DrawKnuckleToggles(int hi) {
+        Design& d = m_Design;
+        Hinge& h = d.hinges[hi];
+        std::vector<Knuckle> ks = d.Knuckles(hi);
+        int pi = d.GroupIndex(h.parent), ci = d.GroupIndex(h.child);
+        float avail = ImGui::GetContentRegionAvail().x;
+        float w = fminf(46.0f, (avail - ImGui::GetStyle().ItemSpacing.x * (ks.size() - 1)) / (float)ks.size());
+        for (int k = 0; k < (int)ks.size(); k++) {
+            if (k > 0) ImGui::SameLine();
+            ImGui::PushID(k);
+            Color c = ks[k].child ? (ci >= 0 ? d.groups[ci].color : GRAY) : (pi >= 0 ? d.groups[pi].color : GRAY);
+            bool removed = ks[k].removed;
+            ImVec4 col = removed ? ImVec4(0.16f, 0.17f, 0.2f, 1.0f) : ImVec4(c.r / 255.0f * 0.75f, c.g / 255.0f * 0.75f, c.b / 255.0f * 0.75f, 1.0f);
+            ImGui::PushStyleColor(ImGuiCol_Button, col);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(col.x + 0.12f, col.y + 0.12f, col.z + 0.12f, 1.0f));
+            if (removed) ImGui::PushStyleColor(ImGuiCol_Text, Amber);
+            bool can = removed || d.KnuckleRemovable(hi, k);
+            ImGui::BeginDisabled(!can);
+            char label[16];
+            snprintf(label, sizeof(label), removed ? "~%d~" : "%d", k + 1);
+            if (ImGui::Button(label, ImVec2(w, 0))) h.removed ^= 1u << k;
+            ImGui::EndDisabled();
+            if (removed) ImGui::PopStyleColor();
+            ImGui::PopStyleColor(2);
+            const char* owner = ks[k].child ? "child" : "parent";
+            if (removed)
+                ImGui::SetItemTooltip("Knuckle %d (%s) is removed: an open gap on the pin, cleared in both bodies, room for a torsion\n"
+                                      "spring. Click to put it back.", k + 1, owner);
+            else if (can)
+                ImGui::SetItemTooltip("Knuckle %d (%s). Click to remove it and leave room for a torsion spring.", k + 1, owner);
+            else
+                ImGui::SetItemTooltip("Knuckle %d is the %s's last one on the pin, so it has to stay.", k + 1, owner);
+            ImGui::PopID();
+        }
+        for (const SpringSpace& s : d.SpringSpaces(hi))
+            ImGui::TextColored(Amber, "Spring room %.1f mm long, coil dia. %.1f - %.1f mm", s.hi - s.lo, s.inner, s.outer);
+        if (h.removed) ImGui::SetItemTooltip("Length of the gap along the pin, and the coil diameters that fit: the inside over the pin,\n"
+                                             "the outside within the cleared bore (the knuckle diameter).");
+    }
+
     void App::DrawCollisionPanel() {
-        ImGui::SeparatorText("Collisions while closing");
+        ImGui::SeparatorText(m_Design.HasOwnOpening() ? "Collisions while closing or opening" : "Collisions while closing");
         ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.4f);
         ImGui::SliderInt("Checks", &m_SweepParams.steps, 16, 240);
         ImGui::SetItemTooltip("Moments checked between open and closed");
@@ -784,7 +885,7 @@ namespace Bakugan {
         if (!m_SweepStats.empty()) ImGui::TextDisabled("%s", m_SweepStats.c_str());
         if (!m_HasSweep) return;
         if (m_Sweep.collisions.empty()) {
-            ImGui::TextColored(Green, "Nothing collides between open and closed.");
+            ImGui::TextColored(Green, m_Sweep.Opens() ? "Nothing collides closing or opening." : "Nothing collides between open and closed.");
             return;
         }
         const Design& d = m_Design;
@@ -798,8 +899,7 @@ namespace Bakugan {
                      bodyName(c.bodyB).c_str(), ItemName(c.shapeB, c.hingeB).c_str());
             ImGui::PushStyleColor(ImGuiCol_Text, Red);
             if (ImGui::Selectable(line)) {
-                m_T = c.worstT;
-                m_Anim = 0;
+                ShowMoment(c.worstT, c.motion);
                 m_Sel = Selection{};
                 if (d.ShapeIndex(c.shapeA) >= 0) m_Sel.shapes.push_back(c.shapeA);
                 if (d.ShapeIndex(c.shapeB) >= 0) m_Sel.shapes.push_back(c.shapeB);
@@ -807,10 +907,12 @@ namespace Bakugan {
             }
             ImGui::PopStyleColor();
             ImGui::SetItemTooltip("Click: jump to the worst moment and select both");
+            const char* when = MotionWord(c.motion);
             if (c.firstT == c.lastT)
-                ImGui::TextDisabled("    at %.0f%% closed, %.2f mm deep", c.firstT * 100.0f, c.depth);
+                ImGui::TextDisabled("    %s, at %.0f%% closed, %.2f mm deep", when, c.firstT * 100.0f, c.depth);
             else
-                ImGui::TextDisabled("    from %.0f%% to %.0f%% closed, up to %.2f mm deep", c.firstT * 100.0f, c.lastT * 100.0f, c.depth);
+                ImGui::TextDisabled("    %s, from %.0f%% to %.0f%% closed, up to %.2f mm deep", when, c.firstT * 100.0f, c.lastT * 100.0f,
+                                    c.depth);
             ImGui::PopID();
         }
     }

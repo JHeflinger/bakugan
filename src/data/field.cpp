@@ -150,7 +150,8 @@ namespace Bakugan {
             std::vector<Knuckle> ks = d.Knuckles(h);
             hw.lo = ks.front().lo;
             hw.hi = ks.back().hi;
-            for (const Knuckle& k : ks) (k.child == child ? hw.own : hw.other).push_back(k);
+            // a removed knuckle is cleared in both bodies, leaving an open gap around the pin
+            for (const Knuckle& k : ks) (k.child == child && !k.removed ? hw.own : hw.other).push_back(k);
             hw.pin = parent && hg.pin == PinStyle::Fused;
             hw.bore = !hw.pin;
             if (hg.pin == PinStyle::Separate) d.PinHead(h, &hw.headFrom, &hw.headTo, &hw.headRadius);
@@ -334,6 +335,9 @@ namespace Bakugan {
             x.end = y.end;
             x.t0 = y.t0;
             x.t1 = y.t1;
+            x.ownOpening = y.ownOpening;
+            x.o0 = y.o0;
+            x.o1 = y.o1;
             x.name = y.name;
             if (!(x == y)) return false;
         }

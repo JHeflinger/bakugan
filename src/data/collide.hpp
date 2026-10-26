@@ -7,9 +7,10 @@
 #include <vector>
 
 namespace Bakugan {
-    // One thing that runs into another while the design closes: a shape (or hinge hardware) of one body digging
-    // into a shape (or hardware) of another.
+    // One thing that runs into another while the design closes (or opens): a shape (or hinge hardware) of one body
+    // digging into a shape (or hardware) of another. Times are timeline positions (0 open, 1 closed) of `motion`.
     struct Collision {
+        Motion motion = Motion::Closing;
         int bodyA = -1, bodyB = -1;      // group ids
         int shapeA = -1, shapeB = -1;    // shape ids (-1 when it is hinge hardware)
         int hingeA = -1, hingeB = -1;    // hinge ids of the hardware
@@ -23,6 +24,7 @@ namespace Bakugan {
 
     // What collides at one checked moment of the motion.
     struct SweepStep {
+        Motion motion = Motion::Closing;
         float t = 0.0f;
         float depth = 0.0f;              // 0 = clear
         std::vector<Vector3> points;     // world positions (a capped sample)
@@ -61,16 +63,21 @@ namespace Bakugan {
         std::string message;
         Design design;
         SweepParams params;
-        std::vector<SweepStep> steps;    // t = k / (steps - 1)
-        std::vector<Collision> collisions;   // deepest first
+        std::vector<SweepStep> steps;    // closing, t = k / (steps - 1)
+        std::vector<SweepStep> openSteps;    // opening, the same moments; empty when opening is closing backwards
+        std::vector<Collision> collisions;   // both motions, deepest first
         int pairsChecked = 0;
         int pairsReused = 0;
         bool Clear() const { return collisions.empty(); }
+        bool Opens() const { return !openSteps.empty(); }
+        const std::vector<SweepStep>& Steps(Motion m) const { return m == Motion::Opening && Opens() ? openSteps : steps; }
         int StepAt(float t) const;
+        int Count(Motion m) const;           // collisions in that motion
     };
 
     // Moves the design from open (t = 0) to closed (t = 1) and checks every body's surface samples against every
-    // other body's signed distance field at each step.
+    // other body's signed distance field at each step; then the opening motion too when some hinge has its own
+    // opening timing.
     SweepResult SweepCollisions(const Design& d, std::shared_ptr<const std::vector<BuiltPart>> parts, const SweepParams& p,
                                 JobControl& c, std::shared_ptr<SweepCache> cache = nullptr);
 }

@@ -44,6 +44,12 @@ namespace Bakugan {
         return std::clamp(k, 0, (int)steps.size() - 1);
     }
 
+    int SweepResult::Count(Motion m) const {
+        int n = 0;
+        for (const Collision& c : collisions) n += c.motion == m;
+        return n;
+    }
+
     // Hits of this many samples per pair and moment are worked out to the shapes involved (the deepest always): enough
     // to name every shape that collides, without paying for the attribution of thousands of hits.
     static const size_t NamedPerStep = 48;
@@ -54,7 +60,8 @@ namespace Bakugan {
         SweepResult r;
         r.design = d;
         r.params = p;
-        c.SetStage("Checking the closing motion");
+        bool opens = d.HasOwnOpening();
+        c.SetStage(opens ? "Checking the closing and opening motions" : "Checking the closing motion");
         // one field per body that has surface samples
         std::vector<BodyField> fields;
         std::vector<const BuiltPart*> built;
@@ -68,9 +75,13 @@ namespace Bakugan {
             groupIndex.push_back(g);
         }
         int n = (int)fields.size();
+        // checked moments: the closing motion, then the opening one when it differs
         int steps = std::max(p.steps, 2);
-        std::vector<std::vector<Rigid>> xf(steps);
-        for (int k = 0; k < steps; k++) xf[k] = d.Transforms(k / (float)(steps - 1), p.ease);
+        int moments = opens ? 2 * steps : steps;
+        auto motionOf = [&](int k) { return k >= steps ? Motion::Opening : Motion::Closing; };
+        auto timeOf = [&](int k) { return (k % steps) / (float)(steps - 1); };
+        std::vector<std::vector<Rigid>> xf(moments);
+        for (int k = 0; k < moments; k++) xf[k] = d.Transforms(timeOf(k), p.ease, motionOf(k));
 
         // every ordered pair, keyed by both parts and their relative motion
         struct Pair { int a, b; std::string key; std::vector<Rigid> rel; std::shared_ptr<const PairHits> hits; };
@@ -81,10 +92,10 @@ namespace Bakugan {
             for (int b = 0; b < n; b++) {
                 if (a == b) continue;
                 Pair pr{ a, b, std::string(head) + built[a]->key + "|" + built[b]->key + "|", {}, nullptr };
-                pr.rel.resize(steps);
+                pr.rel.resize(moments);
                 std::string motion;
-                motion.reserve(steps * 7 * 4);
-                for (int k = 0; k < steps; k++) {
+                motion.reserve(moments * 7 * 4);
+                for (int k = 0; k < moments; k++) {
                     pr.rel[k] = xf[k][groupIndex[a]].Then(xf[k][groupIndex[b]].Inverse());   // a's frame -> b's frame
                     const float v[7] = { pr.rel[k].rotation.x, pr.rel[k].rotation.y, pr.rel[k].rotation.z, pr.rel[k].rotation.w,
                                          pr.rel[k].position.x, pr.rel[k].position.y, pr.rel[k].position.z };
@@ -108,14 +119,14 @@ namespace Bakugan {
             if (!pairs[i].hits) todo.push_back(i);
         r.pairsChecked = (int)todo.size();
         r.pairsReused = (int)pairs.size() - r.pairsChecked;
-        std::vector<PairHits> fresh(todo.size(), PairHits(steps));
-        size_t tasks = todo.size() * steps;
+        std::vector<PairHits> fresh(todo.size(), PairHits(moments));
+        size_t tasks = todo.size() * moments;
         std::atomic<size_t> done{ 0 };
         tbb::parallel_for(tbb::blocked_range<size_t>(0, tasks, 1), [&](const tbb::blocked_range<size_t>& range) {
             for (size_t task = range.begin(); task != range.end(); task++) {
                 if (c.Cancelled()) return;
-                size_t t = task / steps;
-                int k = (int)(task % steps);
+                size_t t = task / moments;
+                int k = (int)(task % moments);
                 const Pair& pr = pairs[todo[t]];
                 const BodyField& fa = fields[pr.a];
                 const BodyField& fb = fields[pr.b];
@@ -170,12 +181,15 @@ namespace Bakugan {
         }
 
         // per step summaries and per pair of colliding primitives
-        using Key = std::tuple<int, int, int, int, int, int>;
+        using Key = std::tuple<int, int, int, int, int, int, int>;
         std::map<Key, Collision> merged;
         r.steps.resize(steps);
-        for (int k = 0; k < steps; k++) {
-            SweepStep& st = r.steps[k];
-            st.t = k / (float)(steps - 1);
+        if (opens) r.openSteps.resize(steps);
+        for (int k = 0; k < moments; k++) {
+            SweepStep& st = k >= steps ? r.openSteps[k - steps] : r.steps[k];
+            st.motion = motionOf(k);
+            st.t = timeOf(k);
+            int m = (int)st.motion;
             size_t total = 0;
             for (const Pair& pr : pairs) total += (*pr.hits)[k].size();
             size_t stride = std::max<size_t>(1, total / 300), counter = 0;
@@ -197,14 +211,15 @@ namespace Bakugan {
                     AddUnique(st.hinges, h.hingeB);
                     // order the pair so a hits b and b hits a merge
                     bool swap = ba > bb;
-                    Key key = swap ? Key{ bb, ba, h.shapeB, h.shapeA, h.hingeB, h.hingeA } : Key{ ba, bb, h.shapeA, h.shapeB, h.hingeA, h.hingeB };
+                    Key key = swap ? Key{ m, bb, ba, h.shapeB, h.shapeA, h.hingeB, h.hingeA } : Key{ m, ba, bb, h.shapeA, h.shapeB, h.hingeA, h.hingeB };
                     Collision& col = merged[key];
-                    col.bodyA = std::get<0>(key);
-                    col.bodyB = std::get<1>(key);
-                    col.shapeA = std::get<2>(key);
-                    col.shapeB = std::get<3>(key);
-                    col.hingeA = std::get<4>(key);
-                    col.hingeB = std::get<5>(key);
+                    col.motion = st.motion;
+                    col.bodyA = std::get<1>(key);
+                    col.bodyB = std::get<2>(key);
+                    col.shapeA = std::get<3>(key);
+                    col.shapeB = std::get<4>(key);
+                    col.hingeA = std::get<5>(key);
+                    col.hingeB = std::get<6>(key);
                     col.firstT = fminf(col.firstT, st.t);
                     col.lastT = fmaxf(col.lastT, st.t);
                     if (h.depth > col.depth) { col.depth = h.depth; col.worstT = st.t; col.point = xa.Apply(h.local); col.local = h.local; }
@@ -216,8 +231,9 @@ namespace Bakugan {
         std::sort(r.collisions.begin(), r.collisions.end(), [](const Collision& a, const Collision& b) { return a.depth > b.depth; });
         r.ok = true;
         if (n < 2) r.message = "Fewer than two bodies: nothing can collide.";
-        else if (r.collisions.empty()) r.message = "The closing motion is clear.";
-        else r.message = std::to_string(r.collisions.size()) + " collision" + (r.collisions.size() == 1 ? "" : "s") + " while closing.";
+        else if (r.collisions.empty()) r.message = opens ? "The closing and opening motions are clear." : "The closing motion is clear.";
+        else r.message = std::to_string(r.collisions.size()) + " collision" + (r.collisions.size() == 1 ? "" : "s") +
+                         (opens ? " while closing or opening." : " while closing.");
         return r;
     }
 }

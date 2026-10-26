@@ -187,7 +187,8 @@ namespace Bakugan {
         s << "h" << hg.id << ' ' << hg.parent << ' ' << hg.child << ' ' << hg.pivot.x << ' ' << hg.pivot.y << ' ' << hg.pivot.z << ' '
           << hg.axis.x << ' ' << hg.axis.y << ' ' << hg.axis.z << ' ' << hg.hardware << ' ' << hg.length << ' ' << hg.radius << ' '
           << hg.pinRadius << ' ' << hg.clearance << ' ' << hg.knuckles << ' ' << (int)hg.pin << ' ' << hg.leafLength << ' '
-          << hg.leafThickness << ' ' << la.x << ' ' << la.y << ' ' << la.z << ' ' << lb.x << ' ' << lb.y << ' ' << lb.z << ';';
+          << hg.leafThickness << ' ' << la.x << ' ' << la.y << ' ' << la.z << ' ' << lb.x << ' ' << lb.y << ' ' << lb.z << ' '
+          << hg.removed << ' ' << hg.swapKnuckles << ' ' << hg.headDiameter << ';';
     }
 
     std::string PartKey(const Design& d, int bodyId) {
@@ -418,6 +419,20 @@ namespace Bakugan {
                     fused |= h.hardware && h.pin == PinStyle::Fused;
                 }
             }
+            std::string springs;
+            for (int h = 0; h < (int)d.hinges.size(); h++) {
+                if (!d.hinges[h].hardware) continue;
+                for (const SpringSpace& s : d.SpringSpaces(h)) {
+                    std::string which = s.first == s.last ? "knuckle " + std::to_string(s.first + 1)
+                                                         : "knuckles " + std::to_string(s.first + 1) + "-" + std::to_string(s.last + 1);
+                    springs += Utils::Format("  %-16s %s removed: room %.2f mm long, coil outer dia. up to %.2f mm, inner dia. at least %.2f mm\n",
+                                             d.hinges[h].name.c_str(), which.c_str(), s.hi - s.lo, s.outer, s.inner);
+                }
+            }
+            if (!springs.empty())
+                t += "\nTorsion spring room (removed knuckles, numbered along the hinge axis)\n" + springs +
+                     "  Slide the spring into the gap and push the pin through it. The spring legs need their own anchors\n"
+                     "  in each body.\n";
             t += Utils::Format("\nNotes\n");
             if (fused)
                 t += Utils::Format("- Print-in-place hinges: the pin is part of the parent body and runs through the child's knuckles,\n"

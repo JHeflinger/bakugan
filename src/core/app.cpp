@@ -125,7 +125,7 @@ namespace Bakugan {
             if (m_OutputView.Hovered()) FrameView(m_OutputView);
         }
         if (ImGui::IsKeyPressed(ImGuiKey_Space)) {
-            m_Anim = m_T > 0.5f ? -1 : 1;
+            Play(m_T > 0.5f ? -1 : 1);
             m_LoopTimer = 0.0f;
         }
         if (ImGui::IsKeyPressed(ImGuiKey_W)) m_GizmoOp = GizmoOp::Translate;
@@ -152,6 +152,7 @@ namespace Bakugan {
         m_Sel = Selection{};
         m_T = 0.0f;
         m_Anim = 0;
+        m_Motion = Motion::Closing;
         m_HasSweep = false;
         FrameView(m_DesignView);
         FrameView(m_OutputView);
@@ -318,7 +319,7 @@ namespace Bakugan {
     const SweepStep* App::CurrentStep() const {
         if (!m_HasSweep || !m_ShowContacts) return nullptr;
         int k = m_Sweep.StepAt(m_T);
-        return k >= 0 ? &m_Sweep.steps[k] : nullptr;
+        return k >= 0 ? &m_Sweep.Steps(m_Motion)[k] : nullptr;
     }
 
     void App::PollJobs() {
@@ -763,8 +764,9 @@ namespace Bakugan {
         }
         if (&vp == &m_OutputView && !m_Design.shapes.empty()) {
             // everything the parts sweep through between open and closed
-            for (float t : { 0.0f, 0.5f, 1.0f }) {
-                std::vector<Rigid> xf = m_Design.Transforms(t, m_Ease);
+            for (float t : { 0.0f, 0.25f, 0.5f, 0.75f, 1.0f })
+            for (Motion m : { Motion::Closing, Motion::Opening }) {
+                std::vector<Rigid> xf = m_Design.Transforms(t, m_Ease, m);
                 for (int g : m_Design.Bodies()) {
                     BoundingBox bb = m_Design.BodyBounds(m_Design.groups[g].id);
                     for (int i = 0; i < 8; i++) {
@@ -816,6 +818,22 @@ namespace Bakugan {
 
     // ---- frame -----------------------------------------------------------------------------------------------------
 
+    // A play that starts from an end follows that direction's schedule. Turning round part way keeps the schedule it
+    // is on, so the parts don't jump.
+    void App::Play(int direction) {
+        if (direction < 0 && m_T <= 0.0f) m_T = 1.0f;
+        if (direction > 0 && m_T >= 1.0f) m_T = 0.0f;
+        bool atEnd = direction < 0 ? m_T >= 0.999f : m_T <= 0.001f;
+        if (atEnd) m_Motion = direction < 0 ? Motion::Opening : Motion::Closing;
+        m_Anim = direction;
+    }
+
+    void App::ShowMoment(float t, Motion m) {
+        m_T = t;
+        m_Motion = m;
+        m_Anim = 0;
+    }
+
     void App::UpdateAnimation() {
         float dt = fminf(GetFrameTime(), 0.1f);
         if (m_Anim != 0) {
@@ -828,7 +846,7 @@ namespace Bakugan {
             m_LoopTimer += dt;
             if (m_LoopTimer > 0.6f) {
                 m_LoopTimer = 0.0f;
-                m_Anim = m_T > 0.5f ? -1 : 1;
+                Play(m_T > 0.5f ? -1 : 1);
             }
         }
     }

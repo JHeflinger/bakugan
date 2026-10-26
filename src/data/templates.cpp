@@ -118,8 +118,47 @@ namespace Bakugan {
         }
     }
 
+    namespace {
+        // Two flaps folding over a base from opposite sides, modelled closed: the inner one closes first and the outer
+        // one over it. Opening has to wait for the outer flap to clear before the inner one lifts, so the inner hinge
+        // has its own opening timing with a delay.
+        Design OverlappingFlaps() {
+            Design d;
+            const float thick = 3.0f, gap = 0.6f;
+            const float innerY = 4 + gap + thick * 0.5f;              // panel centres
+            const float outerY = innerY + thick + gap;
+            int base = Body(d, "Base");
+            d.AddShape(Up({ 0, 2, 0 }, 44, 36, 4, 0.1f), base, "Plate");
+            d.AddShape(Up({ 21, (4 + gap + thick) * 0.5f, 0 }, 6, 36, 4 + gap + thick, 0.1f), base, "Riser");
+            int inner = Body(d, "Inner flap");
+            d.AddShape(Up({ -4, innerY, 0 }, 36, 32, thick, 0.1f), inner, "Inner panel");
+            int outer = Body(d, "Outer flap");
+            d.AddShape(Up({ 3, outerY, 0 }, 38, 32, thick, 0.1f), outer, "Outer panel");
+            AddHinge(d, base, inner, { -22, innerY, 0 }, { 0, 0, 1 }, 150, 0).name = "Inner hinge";
+            AddHinge(d, base, outer, { 22, outerY, 0 }, { 0, 0, 1 }, -150, 0).name = "Outer hinge";
+            for (Hinge& h : d.hinges) {
+                h.length = 30.0f;
+                h.knuckles = 5;
+                h.radius = 2.6f;
+                h.pinRadius = 1.0f;
+                h.clearance = 0.4f;
+                h.leafLength = 0.0f;
+            }
+            Hinge& a = d.hinges[0];
+            Hinge& b = d.hinges[1];
+            // closing: the inner flap first, then the outer one over it
+            a.t0 = 0.0f;  a.t1 = 0.45f;
+            b.t0 = 0.45f; b.t1 = 1.0f;
+            // opening: the outer flap lifts first; the inner one waits until it is out of the way
+            b.ownOpening = true; b.o0 = 0.0f;  b.o1 = 0.6f;
+            a.ownOpening = true; a.o0 = 0.35f; a.o1 = 1.0f;
+            return d;
+        }
+    }
+
     std::vector<std::string> TemplateNames() {
-        return { "Hinged box", "Clamshell", "Folding ruler (sequenced)", "Collision demo (lip too deep)", "Empty" };
+        return { "Hinged box", "Clamshell", "Folding ruler (sequenced)", "Collision demo (lip too deep)",
+                 "Overlapping flaps (delayed opening)", "Empty" };
     }
 
     Design MakeTemplate(int index) {
@@ -129,6 +168,7 @@ namespace Bakugan {
             case 1: d = Clamshell(); break;
             case 2: d = FoldingRuler(); break;
             case 3: d = HingedBox(true); break;
+            case 4: d = OverlappingFlaps(); break;
             default: break;
         }
         d.Repair();

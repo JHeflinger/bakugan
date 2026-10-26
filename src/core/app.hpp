@@ -83,6 +83,9 @@ namespace Bakugan {
         bool SweepCurrent() const;
         const SweepStep* CurrentStep() const;
         void UpdateAnimation();
+        void Play(int direction);                    // +1 close, -1 open
+        void ShowMoment(float t, Motion m);          // stop and jump the output to a moment
+        static const char* MotionWord(Motion m) { return m == Motion::Opening ? "opening" : "closing"; }
 
         void ClearSelection();
         void SelectShape(int id, bool additive);
@@ -122,6 +125,7 @@ namespace Bakugan {
         void DrawHingesTab();
         void DrawHingeList();
         void DrawHingeInspector();
+        void DrawKnuckleToggles(int hinge);
         void DrawCollisionPanel();
         void DrawPrintTab();
         void DrawFilesPanel();
@@ -240,6 +244,7 @@ namespace Bakugan {
         // motion: t = 0 open, 1 closed
         float m_T = 0.0f;
         int m_Anim = 0;              // +1 closing, -1 opening
+        Motion m_Motion = Motion::Closing;   // the schedule the output follows (picked when a play starts at an end)
         bool m_Loop = false;
         float m_LoopTimer = 0.0f;
         float m_Duration = 2.5f;     // seconds for the whole motion

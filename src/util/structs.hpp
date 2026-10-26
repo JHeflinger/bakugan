@@ -37,6 +37,13 @@ namespace Bakugan {
     };
 
     // The pose parts are exported in.
+    // Which schedule the hinges follow. The timeline runs from open (0) to closed (1) either way; opening plays it
+    // from closed back to open, with each hinge's own opening timing when it has one.
+    enum class Motion {
+        Closing,
+        Opening
+    };
+
     enum class ExportPose {
         Design,
         Open,
