@@ -4,8 +4,9 @@
 #include "ui/raymarch.hpp"
 #include "data/build.hpp"
 #include "data/collide.hpp"
-#include "data/autodesign.hpp"
-#include "data/suite.hpp"
+#include "autodesign/autodesign.hpp"
+#include "autodesign/suite.hpp"
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -76,17 +77,12 @@ namespace Bakugan {
         void BrowseExport();
         void BrowseReference();
         void LoadReference(const std::string& path);
+        void RemoveReference();
         void SaveDesign();
         void LoadDesign();
         void PollJobs();
         void UpdateJobs();
         void StartExport();
-        void StartAuto(bool scoreOnly);              // generate a design from the reference mesh (or just score this one)
-        void PollAuto();
-        void StartSuite();                           // the generator on every .obj in a folder, into one video
-        void PollSuite();
-        void Notify();                               // plays notification.mp3, if there is one
-        void BrowseSuiteFolder();
         bool PartsCurrent() const;
         bool SweepCurrent() const;
         const SweepStep* CurrentStep() const;
@@ -137,8 +133,27 @@ namespace Bakugan {
         void DrawCollisionPanel();
         void DrawPrintTab();
         void DrawFilesPanel();
+
+        // generate.cpp: the Generate tab's jobs
+        void StartAuto(bool scoreOnly);              // generate a design from the reference mesh (or just score this one)
+        void PollAuto();
+        void ClearAutoScore();                       // the shown score no longer applies (another mesh)
+        void StartSuite();                           // the generator on every .obj in a folder, into one video
+        void PollSuite();
+        void BrowseSuiteFolder();
+        void Notify();                               // plays notification.mp3, if there is one
+
+        // generatetab.cpp: the Generate tab, section by section
         void DrawGenerateTab();
-        bool DrawJob(const JobControl* control, bool busy, const char* id, bool stoppable);
+        void GenerateInput();
+        void GenerateGoal();
+        void GenerateStart();
+        void GenerateSpace();
+        void GenerateSearch();
+        void GenerateRun();
+        void GenerateScore();
+        void GenerateSuite();
+        void DrawJob(const JobControl* control, bool busy, const char* id, const std::function<void()>& stop = {});
         std::string ItemName(int shapeId, int hingeId) const;
 
         // scene.cpp: the two viewports
@@ -247,6 +262,9 @@ namespace Bakugan {
         char m_SuiteFolder[1024] = "";
         std::string m_SuiteVideo;                     // the last video written
         double m_SuiteStart = 0.0;
+        std::string m_SuiteCountedFolder;             // the folder's .obj files, counted now and then
+        double m_SuiteCountedAt = -10.0;
+        int m_SuiteMeshCount = 0;
 
         // the sound for a finished generator run or test suite
         bool m_Audio = false;

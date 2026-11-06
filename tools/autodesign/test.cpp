@@ -1,4 +1,4 @@
-#include "data/autodesign.hpp"
+#include "autodesign/autodesign.hpp"
 #include "data/field.hpp"
 #include <raymath.h>
 #include <chrono>
@@ -65,6 +65,7 @@ int main(int argc, char** argv) {
     if (getenv("VIEWS")) p.views = atoi(getenv("VIEWS"));
     if (getenv("VRES")) p.viewResolution = atoi(getenv("VRES"));
     if (getenv("COLW")) p.collisionWeight = atof(getenv("COLW"));
+    if (getenv("SIMP")) p.simplicity = atof(getenv("SIMP"));
     if (getenv("MOTION")) p.motionChecks = atoi(getenv("MOTION"));
     if (getenv("TIMING")) p.allowTiming = atoi(getenv("TIMING")) != 0;
     if (argc > 10) { p.allowCuts = argv[10][0] == '1'; p.allowFeatures = argv[10][1] == '1'; p.maxShapes = atoi(argv[10] + 2); }

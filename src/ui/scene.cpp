@@ -11,11 +11,6 @@
 #include <unordered_set>
 
 namespace Bakugan {
-    static void ToFloat16(const Matrix& m, float* out) {
-        float16 f = MatrixToFloatV(m);
-        memcpy(out, f.v, sizeof(f.v));
-    }
-
     static Matrix FromFloat16(const float* f) {
         return { f[0], f[4], f[8],  f[12],
                  f[1], f[5], f[9],  f[13],

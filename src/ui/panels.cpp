@@ -1,7 +1,7 @@
 #include "core/app.hpp"
 #include "util/utils.hpp"
+#include "ui/widgets.hpp"
 #include <imgui_internal.h>
-#include <rlImGui.h>
 #include <algorithm>
 #include <raymath.h>
 #include <cfloat>
@@ -12,12 +12,7 @@
 #include <unordered_set>
 
 namespace Bakugan {
-    static bool ColorEdit(const char* id, Color* c) {
-        float f[3] = { c->r / 255.0f, c->g / 255.0f, c->b / 255.0f };
-        if (!ImGui::ColorEdit3(id, f, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel)) return false;
-        *c = { (unsigned char)(f[0] * 255), (unsigned char)(f[1] * 255), (unsigned char)(f[2] * 255), 255 };
-        return true;
-    }
+    using namespace Widgets;
 
     static void Swatch(Color c, bool hollow = false) {
         ImVec2 p = ImGui::GetCursorScreenPos();
@@ -26,18 +21,6 @@ namespace Bakugan {
         if (hollow) ImGui::GetWindowDrawList()->AddRect(ImVec2(p.x + 1, p.y + 2), ImVec2(p.x + s - 1, p.y + s - 2), col, 3.0f, 0, 1.5f);
         else ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(p.x, p.y + 1), ImVec2(p.x + s, p.y + s - 1), col, 3.0f);
         ImGui::Dummy(ImVec2(s, s));
-    }
-
-    static void Hint(const char* text) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-        ImGui::TextWrapped("%s", text);
-        ImGui::PopStyleColor();
-    }
-
-    static void Warn(const char* text) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.78f, 0.35f, 1.0f));
-        ImGui::TextWrapped("%s", text);
-        ImGui::PopStyleColor();
     }
 
     // A small eye drawn at the right end of the last item's row; returns true when clicked. `inherited`: shown dim
@@ -78,10 +61,6 @@ namespace Bakugan {
         return ImGui::GetIO().MousePos.x > ImGui::GetItemRectMax().x - w;
     }
 
-    static const ImVec4 Red = ImVec4(1.0f, 0.42f, 0.4f, 1.0f);
-    static const ImVec4 Green = ImVec4(0.4f, 0.85f, 0.5f, 1.0f);
-    static const ImVec4 Amber = ImVec4(1.0f, 0.78f, 0.35f, 1.0f);
-
     // Things the tree asks for, applied after it is drawn (the tree reads the design while it draws).
     struct TreeAction {
         enum Kind { None, MoveShape, MoveGroup, NewBodyFrom, NewBodyFromGroup, ToggleShapeCut, ToggleGroupCut, MakeBody, AddFeature,
@@ -90,17 +69,17 @@ namespace Bakugan {
         int target = -1;
     };
 
-    bool App::DrawJob(const JobControl* c, bool busy, const char* id, bool stoppable) {
-        if (!busy || !c) return false;
+    // A running job's progress bar, with a Stop button when it can be stopped.
+    void App::DrawJob(const JobControl* c, bool busy, const char* id, const std::function<void()>& stop) {
+        if (!busy || !c) return;
         ImGui::PushID(id);
         std::string stage = c->Stage();
-        ImGui::ProgressBar(c->Progress(), ImVec2(stoppable ? ImGui::GetContentRegionAvail().x - 60 : -FLT_MIN, 0), stage.c_str());
-        if (stoppable) {
+        ImGui::ProgressBar(c->Progress(), ImVec2(stop ? WidthBeside("Stop") : -FLT_MIN, 0), stage.c_str());
+        if (stop) {
             ImGui::SameLine();
-            if (ImGui::Button("Stop", ImVec2(-FLT_MIN, 0))) m_ExportJob.Cancel();
+            if (ImGui::Button("Stop", ImVec2(-FLT_MIN, 0))) stop();
         }
         ImGui::PopID();
-        return true;
     }
 
     std::string App::ItemName(int shapeId, int hingeId) const {
@@ -605,10 +584,7 @@ namespace Bakugan {
         if (ImGui::Button("Drop to ground", ImVec2(half, 0))) m_ReferenceOffset.y -= ReferenceBounds().min.y;
         ImGui::SetItemTooltip("Move it so its lowest point sits on the grid");
         ImGui::SameLine();
-        if (ImGui::Button("Remove", ImVec2(-FLT_MIN, 0))) {
-            UnloadModel(m_Reference);
-            m_HasReference = false;
-        }
+        if (ImGui::Button("Remove", ImVec2(-FLT_MIN, 0))) RemoveReference();
     }
 
     // ---- hinges ----------------------------------------------------------------------------------------------------
@@ -886,7 +862,7 @@ namespace Bakugan {
         ImGui::SetNextItemWidth(-ImGui::CalcTextSize("Tolerance").x - 8);
         ImGui::DragFloat("Tolerance", &m_SweepParams.tolerance, 0.005f, 0.0f, 2.0f, "%.2f mm");
         ImGui::SetItemTooltip("Overlaps shallower than this count as touching");
-        DrawJob(m_SweepJob.Control(), m_SweepJob.Busy(), "sweep", false);
+        DrawJob(m_SweepJob.Control(), m_SweepJob.Busy(), "sweep");
         if (!m_SweepStats.empty()) ImGui::TextDisabled("%s", m_SweepStats.c_str());
         if (!m_HasSweep) return;
         if (m_Sweep.collisions.empty()) {
@@ -930,7 +906,7 @@ namespace Bakugan {
         ImGui::SetItemTooltip(Exact() ? "Resolution of the background meshes the collision check samples (voxels along the design's\n"
                                         "longest side). The views are raymarched exactly and don't depend on it."
                                       : "Resolution of the parts in the output view (voxels along the design's longest side)");
-        DrawJob(m_BuildJob.Control(), m_BuildJob.Busy(), "build", false);
+        DrawJob(m_BuildJob.Control(), m_BuildJob.Busy(), "build");
         if (m_HasParts && m_Parts) {
             if (!PartsCurrent()) ImGui::TextColored(Amber, "Out of date: rebuilding after your edit.");
             if (ImGui::BeginTable("parts", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
@@ -1003,345 +979,12 @@ namespace Bakugan {
         ImGui::BeginDisabled(m_ExportJob.Busy() || (!p.separate && !p.combined));
         if (ImGui::Button("Export STL", ImVec2(-FLT_MIN, 30))) StartExport();
         ImGui::EndDisabled();
-        DrawJob(m_ExportJob.Control(), m_ExportJob.Busy(), "export", true);
+        DrawJob(m_ExportJob.Control(), m_ExportJob.Busy(), "export", [&] { m_ExportJob.Cancel(); });
         if (!m_ExportedFiles.empty()) {
             ImGui::TextColored(Green, "Wrote:");
             for (const std::string& f : m_ExportedFiles) ImGui::BulletText("%s", f.c_str());
         }
         DrawFilesPanel();
-    }
-
-    // ---- generate ----------------------------------------------------------------------------------------------------
-
-    void App::DrawGenerateTab() {
-        AutoParams& p = m_AutoParams;
-        bool busy = m_AutoJob.Busy();
-        Hint("Builds a design from the reference mesh: superfrustum bodies fitted to it in the open pose, hinged so they "
-             "close into a sphere. Shapes, cuts, groups and hinges are all tuned together against one score.");
-
-        ImGui::SeparatorText("Input mesh");
-        if (!m_HasReference) {
-            Warn("Load the mesh to turn into a Bakugan as the reference mesh. It is fitted where it is placed in the design view.");
-            if (ImGui::Button("Import mesh...", ImVec2(-FLT_MIN, 0))) BrowseReference();
-        } else {
-            BoundingBox b = ReferenceBounds();
-            Vector3 e = Vector3Subtract(b.max, b.min);
-            ImGui::TextUnformatted(m_ReferenceName.c_str());
-            ImGui::SameLine();
-            ImGui::TextDisabled("%.0f x %.0f x %.0f mm", e.x, e.y, e.z);
-            ImGui::SetItemTooltip("Scale, move and turn it in the Model tab's Reference mesh panel; the design is fitted to it there");
-        }
-
-        ImGui::BeginDisabled(busy);
-        ImGui::SeparatorText("Goal");
-        float w = ImGui::GetContentRegionAvail().x;
-        ImGui::TextDisabled("match the mesh");
-        ImGui::SameLine(w - ImGui::CalcTextSize("close into a sphere").x);
-        ImGui::TextDisabled("close into a sphere");
-        char fmt[64];
-        int sphere = (int)lroundf(p.sphereBias * 100.0f);
-        snprintf(fmt, sizeof(fmt), "fit %d%%%%  |  sphere %d%%%%", 100 - sphere, sphere);
-        ImGui::SetNextItemWidth(-FLT_MIN);
-        ImGui::SliderFloat("##bias", &p.sphereBias, 0.0f, 1.0f, fmt);
-        ImGui::SetItemTooltip("How much each half of the score counts: how well the open design matches the mesh,\n"
-                              "against how round the closed design is");
-        ImGui::TextUnformatted("Score by");
-        ImGui::SameLine();
-        if (ImGui::RadioButton("Silhouettes", p.loss == AutoLoss::Silhouettes)) p.loss = AutoLoss::Silhouettes;
-        ImGui::SetItemTooltip("Compare outlines from several directions: the open design's against the mesh's, the closed\n"
-                              "design's against a disc of the sphere's size. Outlines can't see depth or hidden hollows:\n"
-                              "more views pin the shape down better.");
-        ImGui::SameLine();
-        if (ImGui::RadioButton("Volume", p.loss == AutoLoss::Volume)) p.loss = AutoLoss::Volume;
-        ImGui::SetItemTooltip("Compare filled volumes and surfaces in 3D");
-        if (p.loss == AutoLoss::Silhouettes) {
-            ImGui::SliderInt("Views", &p.views, 1, 16);
-            ImGui::SetItemTooltip("Directions the outlines are compared from, spread over a half sphere (from the other\n"
-                                  "half they would only be mirror images)");
-            ImGui::SliderInt("View pixels", &p.viewResolution, 32, 192);
-            ImGui::SetItemTooltip("Pixels across each view: finer is more exact and slower");
-            ImGui::SliderFloat("Min coverage", &p.minViewCoverage, 0.0f, 1.0f, "%.2f");
-            ImGui::SetItemTooltip("Share of every view's target outline the design must cover. Each view short of it costs\n"
-                                  "steeply (10 per whole share missing), so no single view can be given up.");
-        }
-        ImGui::DragFloat("Sphere size", &p.sphereDiameter, 0.5f, 0.0f, 500.0f, p.sphereDiameter > 0.0f ? "%.1f mm across" : "auto");
-        ImGui::SetItemTooltip("Diameter the closed design should have. Auto: a sphere of the closed design's own volume.");
-
-        ImGui::SeparatorText("Start from");
-        if (ImGui::RadioButton("The mesh", !p.fromCurrent)) p.fromCurrent = false;
-        ImGui::SetItemTooltip("Split the mesh into pieces (k-means), one box-like superfrustum and one body each, hinged in a tree");
-        ImGui::SameLine();
-        ImGui::BeginDisabled(m_Design.shapes.empty());
-        if (ImGui::RadioButton("The current design", p.fromCurrent)) p.fromCurrent = true;
-        ImGui::SetItemTooltip("Refine what is in the editor (its hinges keep their hardware settings)");
-        ImGui::EndDisabled();
-        if (!p.fromCurrent) {
-            ImGui::SliderInt("Pieces", &p.seedBodies, 1, std::max(1, p.maxBodies));
-            ImGui::SetItemTooltip("Bodies to begin with. The search adds, splits, merges and removes bodies from there.");
-        }
-
-        ImGui::SeparatorText("Design space");
-        ImGui::SliderInt("Min bodies", &p.minBodies, 1, 12);
-        ImGui::SetItemTooltip("Hinged parts (top level groups) the design must keep. Merging everything into one body\n"
-                              "dodges every collision, so without a floor the search tends to stop folding.");
-        ImGui::SliderInt("Max bodies", &p.maxBodies, 1, 12);
-        ImGui::SetItemTooltip("Hinged parts (top level groups)");
-        if (p.maxBodies < p.minBodies) p.maxBodies = p.minBodies;
-        ImGui::SliderInt("Max shapes", &p.maxShapes, 1, 48);
-        ImGui::SetItemTooltip("Superfrustums in all, cuts included");
-        ImGui::Checkbox("Cuts", &p.allowCuts);
-        ImGui::SetItemTooltip("Shapes and features may remove material");
-        ImGui::SameLine();
-        ImGui::Checkbox("Blended features", &p.allowFeatures);
-        ImGui::SetItemTooltip("Shapes may be grouped into features inside a body, smoothly merged with a blend");
-        ImGui::Checkbox("Hinge hardware", &p.hingeHardware);
-        ImGui::SetItemTooltip("Give the result's hinges knuckles and leaves. Off, they are bare pivots: nothing is added\n"
-                              "to the bodies. The score never includes hardware either way.");
-        ImGui::SliderFloat("Collisions", &p.collisionWeight, 0.0f, 5.0f, p.collisionWeight > 0.0f ? "%.2f" : "ignored");
-        ImGui::SetItemTooltip("What bodies overlapping each other costs, in the open and in the closed pose (and on the way\n"
-                              "between with motion checks). It starts low and reaches this by 60%% of the run, so folds can\n"
-                              "form first.");
-        ImGui::BeginDisabled(p.collisionWeight <= 0.0f);
-        ImGui::SliderInt("Motion checks", &p.motionChecks, 0, 32, p.motionChecks > 0 ? "%d moments" : "ends only");
-        ImGui::SetItemTooltip("Moments between open and closed also checked for bodies overlapping, evenly spaced and eased\n"
-                              "like the animation (the opening motion's too, for hinges with their own opening timing).\n"
-                              "Together they weigh as much as one end pose. More catch quicker swings, and cost more.");
-        ImGui::BeginDisabled(p.motionChecks <= 0);
-        ImGui::Checkbox("Hinge timing", &p.allowTiming);
-        ImGui::EndDisabled();
-        ImGui::SetItemTooltip("Let the search change when each hinge turns: slide and stretch its share of the closing\n"
-                              "motion, move it before or after another hinge's, give it its own opening timing. Only the\n"
-                              "motion checks can see timing, so it needs them.");
-        ImGui::EndDisabled();
-        ImGui::SliderFloat("Simplicity", &p.simplicity, 0.0f, 1.0f, "%.2f");
-        ImGui::SetItemTooltip("What each shape and group costs in the score: higher keeps the design leaner");
-
-        ImGui::SeparatorText("Search");
-        ImGui::SliderInt("Scorings", &p.iterations, 500, 60000, "%d", ImGuiSliderFlags_Logarithmic);
-        ImGui::SetItemTooltip("How many designs the search may score (each in both poses): its budget");
-        ImGui::SliderInt("Rewrites per round", &p.rewritesPerRound, 1, 64);
-        ImGui::SetItemTooltip("Stochastic Rewrite Descent: grammar rewrites drawn and tried in each round. Every one that\n"
-                              "improves the score is applied, all together (skipping any that conflict).");
-        ImGui::SliderInt("Steps per round", &p.stepsPerRound, 0, 100);
-        ImGui::SetItemTooltip("Descent steps on the shapes', hinges' and blends' values between rewrite rounds");
-        int q = std::clamp(p.quality, 0, 2);
-        ImGui::TextUnformatted("Samples");
-        ImGui::SameLine();
-        if (ImGui::RadioButton("Fast", q == 0)) p.quality = 0;
-        ImGui::SameLine();
-        if (ImGui::RadioButton("Normal", q == 1)) p.quality = 1;
-        ImGui::SameLine();
-        if (ImGui::RadioButton("Fine", q == 2)) p.quality = 2;
-        ImGui::SetItemTooltip("Points the score is measured at: finer is steadier and slower");
-        int seed = (int)p.seed;
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
-        if (ImGui::InputInt("Seed", &seed)) p.seed = (unsigned)std::max(seed, 0);
-        ImGui::SetItemTooltip("Same seed and settings, same result");
-        ImGui::SameLine();
-        if (ImGui::Button("Shuffle")) p.seed = (unsigned)GetRandomValue(1, 999999);
-        ImGui::EndDisabled();
-
-        ImGui::Checkbox("Show progress live", &m_AutoPreview);
-        ImGui::SetItemTooltip("Put the best design so far in the editor while the search runs");
-        ImGui::SameLine();
-        ImGui::Checkbox("Show sphere", &m_ShowAutoSphere);
-        ImGui::SetItemTooltip("The sphere the closed design is scored against, in the output view");
-
-        if (busy) {
-            const JobControl* c = m_AutoJob.Control();
-            int it = 0, n = 0, accepted = 0, rounds = 0;
-            if (m_AutoLive) {
-                std::lock_guard<std::mutex> l(m_AutoLive->mutex);
-                it = m_AutoLive->iteration;
-                n = m_AutoLive->iterations;
-                accepted = m_AutoLive->accepted;
-                rounds = m_AutoLive->rounds;
-            }
-            char label[96];
-            std::string stage = c ? c->Stage() : std::string();
-            if (stage == "Searching") snprintf(label, sizeof(label), "%d / %d  (%.0f s)", it, n, GetTime() - m_AutoStart);
-            else snprintf(label, sizeof(label), "%s", stage.c_str());
-            ImGui::ProgressBar(c ? c->Progress() : 0.0f, ImVec2(ImGui::GetContentRegionAvail().x - 60, 0), label);
-            ImGui::SameLine();
-            if (ImGui::Button("Stop", ImVec2(-FLT_MIN, 0))) m_AutoJob.Cancel();
-            ImGui::SetItemTooltip("Stop and keep the best design found so far");
-            if (it > 0) ImGui::TextDisabled("%d rewrites applied in %d rounds", accepted, rounds);
-        } else {
-            ImGui::BeginDisabled(!m_HasReference || m_SuiteJob.Busy());
-            float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-            if (ImGui::Button("Generate", ImVec2(half, 30))) StartAuto(false);
-            ImGui::SetItemTooltip(p.fromCurrent ? "Refine the current design (Ctrl+Z brings it back)"
-                                                : "Replace the design with a generated one (Ctrl+Z brings it back)");
-            ImGui::SameLine();
-            ImGui::BeginDisabled(m_Design.shapes.empty());
-            if (ImGui::Button("Score this design", ImVec2(-FLT_MIN, 30))) StartAuto(true);
-            ImGui::SetItemTooltip("Measure the current design with the same score, without changing it");
-            ImGui::EndDisabled();
-            ImGui::EndDisabled();
-        }
-
-        if (m_HasAutoScore) {
-            ImGui::SeparatorText("Score");
-            const AutoScore& s = m_AutoScore;
-            if (!busy && !(m_AutoScoreFor == m_Design)) ImGui::TextColored(Amber, "The design changed since: score it again to update.");
-            auto pct = [](float v) { ImGui::Text("%.0f%%", v * 100.0f); };
-            if (s.silhouettes && ImGui::BeginTable("views", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
-                ImGui::TableSetupColumn("outlines");
-                ImGui::TableSetupColumn("covered");
-                ImGui::TableSetupColumn("extra");
-                ImGui::TableHeadersRow();
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn(); ImGui::TextUnformatted("Open vs mesh");
-                ImGui::TableNextColumn(); pct(s.viewCover);
-                ImGui::TableNextColumn(); pct(s.viewExtra);
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn(); ImGui::TextUnformatted("Closed vs sphere");
-                ImGui::TableNextColumn(); pct(s.sphereViewCover);
-                ImGui::TableNextColumn(); pct(s.sphereViewExtra);
-                ImGui::EndTable();
-            }
-            if (s.silhouettes) {
-                ImGui::SetItemTooltip("Means over the views. Covered: target pixels the design covers, as a share of the target's.\n"
-                                      "Extra: design pixels where the target has none, as a share of the target's.");
-                ImVec4 worstColor = s.worstView < m_AutoParams.minViewCoverage ? Amber : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
-                ImGui::TextColored(worstColor, "Worst view %.0f%% covered", s.worstView * 100.0f);
-                if (s.offFrame > 0.005f) {
-                    ImGui::SameLine();
-                    ImGui::TextDisabled("  %.0f%% of the material outside the views", s.offFrame * 100.0f);
-                }
-                if (m_HasAutoViews) {
-                    float wAvail = ImGui::GetContentRegionAvail().x;
-                    float k = wAvail / m_AutoViews.width;
-                    rlImGuiImageSize(&m_AutoViews, (int)wAvail, (int)(m_AutoViews.height * k));
-                    ImGui::SetItemTooltip("Each view: open design vs the mesh (top), closed design vs the sphere (bottom).\n"
-                                          "Dark: both cover the pixel. Red: only the target (missing). Blue: only the design (extra).");
-                }
-            }
-            if (!s.silhouettes && ImGui::BeginTable("score", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
-                ImGui::TableSetupColumn("");
-                ImGui::TableSetupColumn("covered");
-                ImGui::TableSetupColumn("outside");
-                ImGui::TableSetupColumn("surface gap");
-                ImGui::TableHeadersRow();
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn(); ImGui::TextUnformatted("Open vs mesh");
-                ImGui::TableNextColumn(); pct(s.fitCover);
-                ImGui::TableNextColumn(); pct(s.fitOutside);
-                ImGui::TableNextColumn(); pct(s.fitGap);
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn(); ImGui::TextUnformatted("Closed vs sphere");
-                ImGui::TableNextColumn(); pct(s.sphereIoU);
-                ImGui::TableNextColumn(); pct(s.sphereSpill);
-                ImGui::TableNextColumn(); pct(s.sphereGap);
-                ImGui::EndTable();
-            }
-            if (!s.silhouettes) ImGui::SetItemTooltip("Open: share of the mesh's volume the design fills, share of the design's volume outside the\n"
-                                  "mesh, and how far the mesh surface is from the design's (share of 8%% of the mesh's size).\n"
-                                  "Closed: overlap with the sphere (shared over combined volume), how far material reaches\n"
-                                  "outside it on average (share of its radius), and the surface gap (share of 30%% of the radius).");
-            ImVec4 clashColor = s.clashOpen + s.clashClosed + s.clashMotion > 0.005f ? Amber : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
-            if (p.motionChecks > 0) {
-                ImGui::TextColored(clashColor, "Bodies overlapping: %.1f%% open, %.1f%% closed, %.1f%% on the way", s.clashOpen * 100.0f,
-                                   s.clashClosed * 100.0f, s.clashMotion * 100.0f);
-                ImGui::SetItemTooltip("Share of the design's volume inside two bodies at once. On the way: the worst checked moment\n"
-                                      "(%.0f%% of the %s)", s.clashMotionT * 100.0f, s.clashMotionOpening ? "opening" : "closing");
-            } else {
-                ImGui::TextColored(clashColor, "Bodies overlapping: %.1f%% open, %.1f%% closed", s.clashOpen * 100.0f, s.clashClosed * 100.0f);
-                ImGui::SetItemTooltip("Share of the design's volume inside two bodies at once (the positions between are not checked)");
-            }
-            ImGui::TextDisabled("score %.3f (fit %.3f, sphere %.3f, collisions %.3f, costs %.3f)", s.total, s.fit, s.sphere,
-                                s.collision, s.penalty);
-            ImGui::SetItemTooltip("Lower is better: (1 - goal) * fit + goal * sphere + collisions * their weight + costs.\n"
-                                  "Fit: missing and extra volume against the mesh (both as shares of its volume), how far extra\n"
-                                  "material reaches, the surface gap. Costs: per shape and group (Simplicity), pivots off their\n"
-                                  "bodies, bodies on no hinge.");
-            ImGui::TextDisabled("sphere %.1f mm across", s.radius * 2.0f);
-            if (m_AutoHistory.size() > 1) {
-                float lo = *std::min_element(m_AutoHistory.begin(), m_AutoHistory.end());
-                float hi = *std::max_element(m_AutoHistory.begin(), m_AutoHistory.end());
-                ImGui::PlotLines("##history", m_AutoHistory.data(), (int)m_AutoHistory.size(), 0, "best score", lo - 0.01f, hi + 0.01f,
-                                 ImVec2(-FLT_MIN, 60));
-            }
-        }
-
-        // ---- test suite
-        ImGui::SeparatorText("Test suite");
-        Hint("Runs these settings on every .obj in a folder, one after another, and renders one square video of them "
-             "all: each mesh's best design over the whole search, then the result closing and opening.");
-        bool suiteBusy = m_SuiteJob.Busy();
-        ImGui::BeginDisabled(suiteBusy);
-        float browseW = ImGui::CalcTextSize("Choose...").x + ImGui::GetStyle().FramePadding.x * 2.0f;
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - browseW - ImGui::GetStyle().ItemSpacing.x);
-        ImGui::InputTextWithHint("##suitefolder", "folder of .obj files", m_SuiteFolder, sizeof(m_SuiteFolder));
-        ImGui::SameLine();
-        if (ImGui::Button("Choose...")) BrowseSuiteFolder();
-        // counted again when the folder changes, and every couple of seconds (not every frame: it may be slow to list)
-        static std::string countedFolder;
-        static int meshes = 0;
-        static double countedAt = -10.0;
-        if (countedFolder != m_SuiteFolder || GetTime() - countedAt > 2.0) {
-            countedFolder = m_SuiteFolder;
-            countedAt = GetTime();
-            meshes = m_SuiteFolder[0] ? (int)SuiteMeshes(m_SuiteFolder).size() : 0;
-        }
-        if (m_SuiteFolder[0]) ImGui::TextDisabled("%d .obj file%s; results go to its autodesign_suite folder", meshes, meshes == 1 ? "" : "s");
-        SuiteParams& sp = m_SuiteParams;
-        ImGui::DragFloat("Mesh size", &sp.meshSize, 1.0f, 0.0f, 1000.0f, sp.meshSize > 0.0f ? "%.0f mm" : "as is");
-        ImGui::SetItemTooltip("Each mesh is centred and scaled so its longest side is this long (0 keeps the file's units)");
-        const int sizes[] = { 720, 1080, 1440, 2160 };
-        ImGui::TextUnformatted("Video");
-        for (int sz : sizes) {
-            ImGui::SameLine();
-            char label[16];
-            snprintf(label, sizeof(label), "%d##vs", sz);
-            if (ImGui::RadioButton(label, sp.videoSize == sz)) sp.videoSize = sz;
-        }
-        ImGui::SliderFloat("Search part", &sp.searchSeconds, 2.0f, 30.0f, "%.0f s");
-        ImGui::SetItemTooltip("Video time for the search: one frame per evenly spaced snapshot of the best design");
-        ImGui::SliderFloat("Each motion", &sp.motionSeconds, 0.5f, 8.0f, "%.1f s");
-        ImGui::SetItemTooltip("Closing, then opening, after a short pause on the result");
-        ImGui::EndDisabled();
-        if (suiteBusy) {
-            std::string phase, name;
-            int index = 0, count = 0, it = 0, n = 0;
-            float progress = 0.0f;
-            if (m_SuiteLive) {
-                std::lock_guard<std::mutex> l(m_SuiteLive->mutex);
-                phase = m_SuiteLive->phase;
-                name = m_SuiteLive->name;
-                index = m_SuiteLive->index;
-                count = m_SuiteLive->count;
-                progress = m_SuiteLive->progress;
-                if (m_SuiteLive->search) {
-                    std::lock_guard<std::mutex> l2(m_SuiteLive->search->mutex);
-                    it = m_SuiteLive->search->iteration;
-                    n = m_SuiteLive->search->iterations;
-                }
-            }
-            char label[160];
-            float frac = progress;
-            if (phase == "Searching") {
-                frac = count > 0 ? (index + (n > 0 ? (float)it / n : 0.0f)) / count : 0.0f;
-                snprintf(label, sizeof(label), "%d / %d: %s  (%.0f s)", index + 1, count, name.c_str(), GetTime() - m_SuiteStart);
-            } else {
-                snprintf(label, sizeof(label), "%s  (%.0f s)", phase.empty() ? "Starting" : phase.c_str(), GetTime() - m_SuiteStart);
-            }
-            ImGui::ProgressBar(frac, ImVec2(ImGui::GetContentRegionAvail().x - 60, 0), label);
-            ImGui::SameLine();
-            if (ImGui::Button("Stop##suite", ImVec2(-FLT_MIN, 0))) m_SuiteJob.Cancel();
-        } else {
-            ImGui::BeginDisabled(meshes == 0 || busy);
-            if (ImGui::Button("Run test suite", ImVec2(-FLT_MIN, 30))) StartSuite();
-            ImGui::SetItemTooltip("Uses the settings above (always starting from each mesh). Needs ffmpeg on the PATH.");
-            ImGui::EndDisabled();
-            if (!m_SuiteVideo.empty()) {
-                if (ImGui::Button("Open video")) OpenURL(m_SuiteVideo.c_str());
-                ImGui::SameLine();
-                if (ImGui::Button("Open folder")) OpenURL(GetDirectoryPath(m_SuiteVideo.c_str()));
-                ImGui::SameLine();
-                ImGui::TextDisabled("%s", GetFileName(m_SuiteVideo.c_str()));
-            }
-        }
     }
 
     void App::DrawFilesPanel() {

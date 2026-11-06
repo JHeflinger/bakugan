@@ -1,5 +1,6 @@
 #include "field.hpp"
 #include "util/utils.hpp"
+#include "util/box.hpp"
 #include <raymath.h>
 #include <algorithm>
 #include <cfloat>
@@ -36,14 +37,6 @@ namespace Bakugan {
             *x = Vector3DotProduct(q, h.leaf);
             *y = Vector3DotProduct(q, h.side);
             *z = Vector3DotProduct(q, h.axis);
-        }
-
-        BoundingBox Grow(BoundingBox b, float m) {
-            return { Vector3Subtract(b.min, { m, m, m }), Vector3Add(b.max, { m, m, m }) };
-        }
-
-        BoundingBox Merge(BoundingBox a, BoundingBox b) {
-            return { Vector3Min(a.min, b.min), Vector3Max(a.max, b.max) };
         }
 
         bool EmptyBox(BoundingBox b) { return b.max.x <= b.min.x && b.max.y <= b.min.y && b.max.z <= b.min.z; }

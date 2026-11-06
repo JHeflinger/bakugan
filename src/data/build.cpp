@@ -7,6 +7,7 @@
 #include <tbb/enumerable_thread_specific.h>
 #include <tbb/parallel_for.h>
 #include "build.hpp"
+#include "util/box.hpp"
 #include "util/utils.hpp"
 #include <raymath.h>
 #include <algorithm>
@@ -21,30 +22,6 @@ namespace Bakugan {
         void InitVDB() {
             static std::once_flag once;
             std::call_once(once, [] { openvdb::initialize(); });
-        }
-
-        BoundingBox TransformBox(BoundingBox b, const Rigid& r) {
-            Vector3 lo = { 1e30f, 1e30f, 1e30f }, hi = { -1e30f, -1e30f, -1e30f };
-            for (int i = 0; i < 8; i++) {
-                Vector3 c = { (i & 1) ? b.max.x : b.min.x, (i & 2) ? b.max.y : b.min.y, (i & 4) ? b.max.z : b.min.z };
-                Vector3 w = r.Apply(c);
-                lo = Vector3Min(lo, w);
-                hi = Vector3Max(hi, w);
-            }
-            return { lo, hi };
-        }
-
-        bool Overlap(BoundingBox a, BoundingBox b) {
-            return a.min.x <= b.max.x && a.max.x >= b.min.x && a.min.y <= b.max.y && a.max.y >= b.min.y && a.min.z <= b.max.z &&
-                   a.max.z >= b.min.z;
-        }
-
-        bool InBox(Vector3 p, BoundingBox b) {
-            return p.x >= b.min.x && p.x <= b.max.x && p.y >= b.min.y && p.y <= b.max.y && p.z >= b.min.z && p.z <= b.max.z;
-        }
-
-        BoundingBox Grow(BoundingBox b, float m) {
-            return { Vector3SubtractValue(b.min, m), Vector3AddValue(b.max, m) };
         }
 
         std::string FileSafe(const std::string& s) {

@@ -66,11 +66,6 @@ namespace Bakugan {
         return GetScreenToWorldRayEx(m_LocalMouse, m_Camera, m_TexWidth, m_TexHeight);
     }
 
-    static void ToFloat16(const Matrix& m, float* out) {
-        float16 f = MatrixToFloatV(m);
-        memcpy(out, f.v, sizeof(f.v));
-    }
-
     void Viewport::GizmoMatrices(float* view, float* proj) const {
         ToFloat16(GetCameraMatrix(m_Camera), view);
         float w = m_ScreenRectangle.width, h = fmaxf(m_ScreenRectangle.height, 1.0f);

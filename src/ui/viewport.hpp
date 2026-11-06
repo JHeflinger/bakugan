@@ -1,10 +1,18 @@
 #pragma once
 #include "util/structs.hpp"
+#include <raymath.h>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <imgui.h>
 
 namespace Bakugan {
+    // A matrix as the 16 column-major floats ImGuizmo works with.
+    inline void ToFloat16(const Matrix& m, float* out) {
+        float16 f = MatrixToFloatV(m);
+        memcpy(out, f.v, sizeof(f.v));
+    }
+
     // A 3D panel: render target, orbit camera, Blender-style axis widget, and mouse/keyboard navigation.
     // What is drawn inside is up to the owner (Begin3D/End3D), as are the toolbar and gizmos (callbacks).
     class Viewport {

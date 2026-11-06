@@ -11,30 +11,9 @@ namespace Bakugan {
     // the closed pose is as round as possible. One score covers both, and every change is judged by it, so the shapes,
     // the CSG and the hinges are tuned together rather than in stages.
     //
-    // The fits are measured by silhouettes (by default): the input mesh's outline is drawn from several directions
-    // once, and every design's open pose is drawn from the same directions and compared pixel by pixel (target pixels
-    // covered, minus design pixels where the target has none); the closed pose is compared the same way against a disc
-    // of the sphere's size around its centre. Each view must reach a minimum coverage, or the score suffers steeply.
-    // The Volume option measures filled volumes and surfaces in 3D instead.
-    //
-    // The search is Stochastic Rewrite Descent (SRD; Kodnongbua, Zhang, Sharp, Schulz: "Design for Descent: What Makes
-    // a Shape Grammar Easy to Optimize?", SIGGRAPH Asia 2025). It alternates two kinds of steps:
-    //   descent   with the structure fixed, gradient steps on every continuous parameter (shape poses, sizes and
-    //             profiles, pivots, axes, closing angles, blends)
-    //   rewrites  sample a batch of grammar rewrites, give each a short lookahead, and apply every one that improves
-    //             the score (best first, skipping any that conflict with one already taken), all at once
-    // The grammar's rewrites come in reversible pairs:
-    //   groups:   add / remove a body, split a shape off into a hinged body / merge a body into its parent,
-    //             add / dissolve a blended feature
-    //   shapes:   add / remove a superfrustum, move one to another body, remove or shrink one off the mesh
-    //   material: make a shape (or a feature) add or cut material, carve a cut where two bodies overlap
-    //   hinges:   add / remove a hinge, hang one from another body, turn its closing angle by a large step
-    // New material and cuts are proposed where the last score found the mesh uncovered, the design sticking out of
-    // it, the closed sphere dented or bulging, or two bodies overlapping. Collisions count in the open and the closed
-    // pose only, not on the way between them. Hinge hardware (knuckles, leaves) is never part of the score.
-    //
-    // Unlike the paper, the score here is not differentiable code (it samples signed distance fields), so gradients
-    // are estimated by SPSA: two scorings per step, whatever the number of parameters.
+    // This header is the whole interface (what the editor and the test suite use). How it works, module by module,
+    // starts at search.hpp; the algorithm itself, step by step, is Search::Run in search.cpp.
+
     // What the fit to the mesh and to the sphere is measured by.
     enum class AutoLoss {
         Silhouettes,                 // outlines from several directions: the open pose's against the mesh's, the
@@ -65,7 +44,7 @@ namespace Bakugan {
         int stepsPerRound = 40;      // SRD: descent steps between rewrite rounds (the paper's code uses 25)
         int lookaheadSteps = 3;      // SRD: descent steps a rewrite gets before it is judged (the paper: 1 exact step)
         float stepSize = 1.0f;       // SRD: starting descent step, in parameter scale units
-        float collisionWeight = 1.0f;    // how much bodies overlapping in the open or closed pose cost (0: ignored)
+        float collisionWeight = 1.0f;    // how much bodies overlapping each other cost (0: ignored)
         int motionChecks = 4;        // in-between moments of the closing motion also checked for bodies overlapping
                                      // (and of the opening motion, when a hinge has its own opening timing); 0: only
                                      // the open and closed poses
