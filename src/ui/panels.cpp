@@ -1,6 +1,7 @@
 #include "core/app.hpp"
 #include "util/utils.hpp"
 #include <imgui_internal.h>
+#include <rlImGui.h>
 #include <algorithm>
 #include <raymath.h>
 #include <cfloat>
@@ -1044,6 +1045,25 @@ namespace Bakugan {
         ImGui::SliderFloat("##bias", &p.sphereBias, 0.0f, 1.0f, fmt);
         ImGui::SetItemTooltip("How much each half of the score counts: how well the open design matches the mesh,\n"
                               "against how round the closed design is");
+        ImGui::TextUnformatted("Score by");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Silhouettes", p.loss == AutoLoss::Silhouettes)) p.loss = AutoLoss::Silhouettes;
+        ImGui::SetItemTooltip("Compare outlines from several directions: the open design's against the mesh's, the closed\n"
+                              "design's against a disc of the sphere's size. Outlines can't see depth or hidden hollows:\n"
+                              "more views pin the shape down better.");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Volume", p.loss == AutoLoss::Volume)) p.loss = AutoLoss::Volume;
+        ImGui::SetItemTooltip("Compare filled volumes and surfaces in 3D");
+        if (p.loss == AutoLoss::Silhouettes) {
+            ImGui::SliderInt("Views", &p.views, 1, 16);
+            ImGui::SetItemTooltip("Directions the outlines are compared from, spread over a half sphere (from the other\n"
+                                  "half they would only be mirror images)");
+            ImGui::SliderInt("View pixels", &p.viewResolution, 32, 192);
+            ImGui::SetItemTooltip("Pixels across each view: finer is more exact and slower");
+            ImGui::SliderFloat("Min coverage", &p.minViewCoverage, 0.0f, 1.0f, "%.2f");
+            ImGui::SetItemTooltip("Share of every view's target outline the design must cover. Each view short of it costs\n"
+                                  "steeply (10 per whole share missing), so no single view can be given up.");
+        }
         ImGui::DragFloat("Sphere size", &p.sphereDiameter, 0.5f, 0.0f, 500.0f, p.sphereDiameter > 0.0f ? "%.1f mm across" : "auto");
         ImGui::SetItemTooltip("Diameter the closed design should have. Auto: a sphere of the closed design's own volume.");
 
@@ -1078,14 +1098,32 @@ namespace Bakugan {
         ImGui::SetItemTooltip("Give the result's hinges knuckles and leaves. Off, they are bare pivots: nothing is added\n"
                               "to the bodies. The score never includes hardware either way.");
         ImGui::SliderFloat("Collisions", &p.collisionWeight, 0.0f, 5.0f, p.collisionWeight > 0.0f ? "%.2f" : "ignored");
-        ImGui::SetItemTooltip("What bodies overlapping each other costs, in the open and in the closed pose (not on the\n"
-                              "way between). It starts low and reaches this by 60%% of the run, so folds can form first.");
+        ImGui::SetItemTooltip("What bodies overlapping each other costs, in the open and in the closed pose (and on the way\n"
+                              "between with motion checks). It starts low and reaches this by 60%% of the run, so folds can\n"
+                              "form first.");
+        ImGui::BeginDisabled(p.collisionWeight <= 0.0f);
+        ImGui::SliderInt("Motion checks", &p.motionChecks, 0, 32, p.motionChecks > 0 ? "%d moments" : "ends only");
+        ImGui::SetItemTooltip("Moments between open and closed also checked for bodies overlapping, evenly spaced and eased\n"
+                              "like the animation (the opening motion's too, for hinges with their own opening timing).\n"
+                              "Together they weigh as much as one end pose. More catch quicker swings, and cost more.");
+        ImGui::BeginDisabled(p.motionChecks <= 0);
+        ImGui::Checkbox("Hinge timing", &p.allowTiming);
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Let the search change when each hinge turns: slide and stretch its share of the closing\n"
+                              "motion, move it before or after another hinge's, give it its own opening timing. Only the\n"
+                              "motion checks can see timing, so it needs them.");
+        ImGui::EndDisabled();
         ImGui::SliderFloat("Simplicity", &p.simplicity, 0.0f, 1.0f, "%.2f");
         ImGui::SetItemTooltip("What each shape and group costs in the score: higher keeps the design leaner");
 
         ImGui::SeparatorText("Search");
-        ImGui::SliderInt("Iterations", &p.iterations, 500, 60000, "%d", ImGuiSliderFlags_Logarithmic);
-        ImGui::SetItemTooltip("Designs tried. Each one is scored in both poses.");
+        ImGui::SliderInt("Scorings", &p.iterations, 500, 60000, "%d", ImGuiSliderFlags_Logarithmic);
+        ImGui::SetItemTooltip("How many designs the search may score (each in both poses): its budget");
+        ImGui::SliderInt("Rewrites per round", &p.rewritesPerRound, 1, 64);
+        ImGui::SetItemTooltip("Stochastic Rewrite Descent: grammar rewrites drawn and tried in each round. Every one that\n"
+                              "improves the score is applied, all together (skipping any that conflict).");
+        ImGui::SliderInt("Steps per round", &p.stepsPerRound, 0, 100);
+        ImGui::SetItemTooltip("Descent steps on the shapes', hinges' and blends' values between rewrite rounds");
         int q = std::clamp(p.quality, 0, 2);
         ImGui::TextUnformatted("Samples");
         ImGui::SameLine();
@@ -1111,12 +1149,13 @@ namespace Bakugan {
 
         if (busy) {
             const JobControl* c = m_AutoJob.Control();
-            int it = 0, n = 0, accepted = 0;
+            int it = 0, n = 0, accepted = 0, rounds = 0;
             if (m_AutoLive) {
                 std::lock_guard<std::mutex> l(m_AutoLive->mutex);
                 it = m_AutoLive->iteration;
                 n = m_AutoLive->iterations;
                 accepted = m_AutoLive->accepted;
+                rounds = m_AutoLive->rounds;
             }
             char label[96];
             std::string stage = c ? c->Stage() : std::string();
@@ -1126,7 +1165,7 @@ namespace Bakugan {
             ImGui::SameLine();
             if (ImGui::Button("Stop", ImVec2(-FLT_MIN, 0))) m_AutoJob.Cancel();
             ImGui::SetItemTooltip("Stop and keep the best design found so far");
-            if (it > 0) ImGui::TextDisabled("%d changes kept", accepted);
+            if (it > 0) ImGui::TextDisabled("%d rewrites applied in %d rounds", accepted, rounds);
         } else {
             ImGui::BeginDisabled(!m_HasReference || m_SuiteJob.Busy());
             float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
@@ -1146,7 +1185,39 @@ namespace Bakugan {
             const AutoScore& s = m_AutoScore;
             if (!busy && !(m_AutoScoreFor == m_Design)) ImGui::TextColored(Amber, "The design changed since: score it again to update.");
             auto pct = [](float v) { ImGui::Text("%.0f%%", v * 100.0f); };
-            if (ImGui::BeginTable("score", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+            if (s.silhouettes && ImGui::BeginTable("views", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn("outlines");
+                ImGui::TableSetupColumn("covered");
+                ImGui::TableSetupColumn("extra");
+                ImGui::TableHeadersRow();
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::TextUnformatted("Open vs mesh");
+                ImGui::TableNextColumn(); pct(s.viewCover);
+                ImGui::TableNextColumn(); pct(s.viewExtra);
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::TextUnformatted("Closed vs sphere");
+                ImGui::TableNextColumn(); pct(s.sphereViewCover);
+                ImGui::TableNextColumn(); pct(s.sphereViewExtra);
+                ImGui::EndTable();
+            }
+            if (s.silhouettes) {
+                ImGui::SetItemTooltip("Means over the views. Covered: target pixels the design covers, as a share of the target's.\n"
+                                      "Extra: design pixels where the target has none, as a share of the target's.");
+                ImVec4 worstColor = s.worstView < m_AutoParams.minViewCoverage ? Amber : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+                ImGui::TextColored(worstColor, "Worst view %.0f%% covered", s.worstView * 100.0f);
+                if (s.offFrame > 0.005f) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("  %.0f%% of the material outside the views", s.offFrame * 100.0f);
+                }
+                if (m_HasAutoViews) {
+                    float wAvail = ImGui::GetContentRegionAvail().x;
+                    float k = wAvail / m_AutoViews.width;
+                    rlImGuiImageSize(&m_AutoViews, (int)wAvail, (int)(m_AutoViews.height * k));
+                    ImGui::SetItemTooltip("Each view: open design vs the mesh (top), closed design vs the sphere (bottom).\n"
+                                          "Dark: both cover the pixel. Red: only the target (missing). Blue: only the design (extra).");
+                }
+            }
+            if (!s.silhouettes && ImGui::BeginTable("score", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
                 ImGui::TableSetupColumn("");
                 ImGui::TableSetupColumn("covered");
                 ImGui::TableSetupColumn("outside");
@@ -1164,13 +1235,20 @@ namespace Bakugan {
                 ImGui::TableNextColumn(); pct(s.sphereGap);
                 ImGui::EndTable();
             }
-            ImGui::SetItemTooltip("Open: share of the mesh's volume the design fills, share of the design's volume outside the\n"
+            if (!s.silhouettes) ImGui::SetItemTooltip("Open: share of the mesh's volume the design fills, share of the design's volume outside the\n"
                                   "mesh, and how far the mesh surface is from the design's (share of 8%% of the mesh's size).\n"
                                   "Closed: overlap with the sphere (shared over combined volume), how far material reaches\n"
                                   "outside it on average (share of its radius), and the surface gap (share of 30%% of the radius).");
-            ImVec4 clashColor = s.clashOpen + s.clashClosed > 0.005f ? Amber : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
-            ImGui::TextColored(clashColor, "Bodies overlapping: %.1f%% open, %.1f%% closed", s.clashOpen * 100.0f, s.clashClosed * 100.0f);
-            ImGui::SetItemTooltip("Share of the design's volume inside two bodies at once (the intermediate positions are not checked)");
+            ImVec4 clashColor = s.clashOpen + s.clashClosed + s.clashMotion > 0.005f ? Amber : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+            if (p.motionChecks > 0) {
+                ImGui::TextColored(clashColor, "Bodies overlapping: %.1f%% open, %.1f%% closed, %.1f%% on the way", s.clashOpen * 100.0f,
+                                   s.clashClosed * 100.0f, s.clashMotion * 100.0f);
+                ImGui::SetItemTooltip("Share of the design's volume inside two bodies at once. On the way: the worst checked moment\n"
+                                      "(%.0f%% of the %s)", s.clashMotionT * 100.0f, s.clashMotionOpening ? "opening" : "closing");
+            } else {
+                ImGui::TextColored(clashColor, "Bodies overlapping: %.1f%% open, %.1f%% closed", s.clashOpen * 100.0f, s.clashClosed * 100.0f);
+                ImGui::SetItemTooltip("Share of the design's volume inside two bodies at once (the positions between are not checked)");
+            }
             ImGui::TextDisabled("score %.3f (fit %.3f, sphere %.3f, collisions %.3f, costs %.3f)", s.total, s.fit, s.sphere,
                                 s.collision, s.penalty);
             ImGui::SetItemTooltip("Lower is better: (1 - goal) * fit + goal * sphere + collisions * their weight + costs.\n"

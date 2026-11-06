@@ -678,9 +678,15 @@ namespace Bakugan {
                 cv.Fill(x0 + pad, by, x0 + cell - pad, by + 4, Rgb{ 232, 235, 241 });
                 cv.Fill(x0 + pad, by, x0 + pad + (int)((cell - 2 * pad) * std::clamp(progress, 0.0f, 1.0f)), by + 4, Accent);
                 const AutoScore& s = af.score;
-                std::vector<std::string> words = { Utils::Format("score %.3f", s.total), "cover " + Pct(s.fitCover),
-                                                   "outside " + Pct(s.fitOutside), "sphere " + Pct(s.sphereIoU),
-                                                   Utils::Format("overlap %.1f%%", (s.clashOpen + s.clashClosed) * 50.0f) };
+                std::vector<std::string> words = s.silhouettes
+                    ? std::vector<std::string>{ Utils::Format("score %.3f", s.total), "outline " + Pct(s.viewCover),
+                                                "extra " + Pct(s.viewExtra), "sphere " + Pct(s.sphereViewCover),
+                                                Utils::Format("overlap %.1f%%", (s.clashOpen + s.clashClosed) * 50.0f),
+                                                Utils::Format("moving %.1f%%", s.clashMotion * 100.0f) }
+                    : std::vector<std::string>{ Utils::Format("score %.3f", s.total), "cover " + Pct(s.fitCover),
+                                                "outside " + Pct(s.fitOutside), "sphere " + Pct(s.sphereIoU),
+                                                Utils::Format("overlap %.1f%%", (s.clashOpen + s.clashClosed) * 50.0f),
+                                                Utils::Format("moving %.1f%%", s.clashMotion * 100.0f) };
                 int ly = by + 4 + pad, maxW = cell - 2 * pad;
                 std::string lineText;
                 int lines = 0;

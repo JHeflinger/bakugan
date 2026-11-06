@@ -7,6 +7,7 @@
 #include <cfloat>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -36,12 +37,6 @@ namespace Bakugan {
         Quaternion RandomRotation(Rng& r) {
             Quaternion q = { Normal(r), Normal(r), Normal(r), Normal(r) };
             return QuaternionNormalize(q);
-        }
-
-        // Turns q by a small random rotation (radians, standard deviation).
-        Quaternion Jiggle(Quaternion q, float sigma, Rng& r) {
-            Quaternion d = QuaternionFromAxisAngle(RandomUnit(r), Normal(r, sigma));
-            return QuaternionNormalize(QuaternionMultiply(d, q));
         }
 
         float WrapAngle(float a) {
@@ -444,6 +439,7 @@ namespace Bakugan {
             std::vector<Vector3> sphereUnit;     // in [-1.35, 1.35]^3, around the sphere (overlap)
             std::vector<char> sphereIn;          // ... inside the unit sphere
             std::vector<Vector3> shellDirs;      // on the unit sphere (its surface)
+            std::vector<Vector3> pairUnit;       // in [0, 1]^3, mapped into where two bodies' boxes meet (motion checks)
         };
 
         // The bodies of a design as fields, for scoring. Distances are capped: anything farther than the cap counts
@@ -525,21 +521,288 @@ namespace Bakugan {
             std::vector<Spot> excess;    // open pose: inside the design, outside the mesh
             std::vector<Spot> holes;     // closed pose: inside the sphere, outside the closed shape
             std::vector<Spot> bumps;     // closed pose: inside the closed shape, outside the sphere
-            std::vector<Spot> clashes;   // inside two bodies: open (body = the first) ...
+            std::vector<Spot> clashes;   // inside two bodies (body = the first), world position at that moment ...
             std::vector<int> clashOther; // ... the second body (group index)
-            std::vector<char> clashClosed;   // ... and whether it is in the closed pose
+            std::vector<float> clashT;   // ... the moment (0 open, 1 closed)
+            std::vector<char> clashOpening;  // ... of the opening motion (else closing)
+        };
+
+        // A hinge's timing windows kept inside the motion, each a tenth of it at least (a hinge that snaps over in an
+        // instant could swing through another body between two checked moments).
+        void ClampTiming(Bakugan::Hinge& h) {
+            auto window = [](float& a, float& b) {
+                float w = std::clamp(b - a, 0.1f, 1.0f);
+                a = std::clamp(a, 0.0f, 1.0f - w);
+                b = a + w;
+            };
+            window(h.t0, h.t1);
+            if (h.ownOpening) window(h.o0, h.o1);
+        }
+
+        // A spot where two bodies overlap at a checked moment of the motion.
+        struct MotionClash {
+            Vector3 p;                   // world position then
+            int a = -1, b = -1;          // group indices of the two bodies
+            float t = 0.0f;
+            char opening = 0;
         };
 
         // What a structural change touched, so it can be tuned a little before it is judged.
         struct Focus {
             int shape = -1;              // shape id
             int hinge = -1;              // hinge id
+            int group = -1;              // group id (its blend)
+            int part = -1;               // only one kind of parameter (PartOf), or all of them (-1)
         };
+
+        // Kinds of parameters that are moved together in a descent step: a shape's position, size, rotation or
+        // profile; a hinge's pivot, axis or angle; a blend.
+        int PartOf(int dof) {
+            static const int parts[] = { 0, 1, 2, 3, 3, 3, 3, 4, 5, 6, 7, 8 };   // in Dof order
+            return parts[dof];
+        }
 
         struct State {
             Design design;
             AutoScore score;
             Diagnostics diag;
+        };
+
+        // ---- silhouettes -----------------------------------------------------------------------------------------------
+
+        // One orthographic view: looking along `dir`, with `u` to the right and `v` up in the picture.
+        struct SilView {
+            Vector3 dir = { 0, 0, -1 }, u = { 1, 0, 0 }, v = { 0, 1, 0 };
+        };
+
+        // Every view frames the same square, `half` wide either side of `centre` (2·half across, `res` pixels).
+        struct SilFrame {
+            Vector3 centre = { 0, 0, 0 };
+            float half = 1.0f;
+            int res = 64;
+            std::vector<SilView> views;
+            float Pixel() const { return 2.0f * half / res; }
+            // where a world point lands in a view, in pixels (x right, y down)
+            Vector2 ToPixel(const SilView& w, Vector3 p) const {
+                Vector3 q = Vector3Subtract(p, centre);
+                return { (Vector3DotProduct(q, w.u) / half + 1.0f) * 0.5f * res, (1.0f - Vector3DotProduct(q, w.v) / half) * 0.5f * res };
+            }
+        };
+
+        // `n` directions spread evenly over the upper half of a sphere (a Fibonacci spiral): from steep top views to
+        // nearly level side views. Silhouettes from opposite directions are mirror images, so a half covers them all.
+        std::vector<SilView> MakeViews(int n) {
+            std::vector<SilView> out;
+            for (int i = 0; i < n; i++) {
+                float y = 1.0f - (i + 0.5f) / n;             // height of the eye above the centre, 1 (top) .. 0 (level)
+                float r = sqrtf(fmaxf(0.0f, 1.0f - y * y)), phi = i * 2.39996323f + 0.6f;
+                SilView w;
+                Vector3 eye = { r * cosf(phi), y, r * sinf(phi) };
+                w.dir = Vector3Negate(eye);
+                Vector3 up = fabsf(w.dir.y) < 0.99f ? Vector3{ 0, 1, 0 } : Vector3{ 0, 0, -1 };
+                w.u = Vector3Normalize(Vector3CrossProduct(w.dir, up));
+                w.v = Vector3CrossProduct(w.u, w.dir);
+                out.push_back(w);
+            }
+            return out;
+        }
+
+        // The mesh's outline in one view: triangles filled at 4x4 samples per pixel, then each pixel's covered share.
+        std::vector<float> RasterMesh(const TriMesh& m, const SilFrame& fr, const SilView& w) {
+            const int ss = 4, n = fr.res * ss;
+            std::vector<unsigned char> hit((size_t)n * n, 0);
+            std::vector<Vector2> pts(m.positions.size());
+            for (size_t i = 0; i < pts.size(); i++) pts[i] = Vector2Scale(fr.ToPixel(w, m.positions[i]), (float)ss);
+            for (size_t t = 0; t + 2 < m.indices.size(); t += 3) {
+                Vector2 a = pts[m.indices[t]], b = pts[m.indices[t + 1]], c = pts[m.indices[t + 2]];
+                float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+                if (fabsf(area) < 1e-12f) continue;
+                int x0 = std::max(0, (int)floorf(fminf(a.x, fminf(b.x, c.x)))), x1 = std::min(n - 1, (int)ceilf(fmaxf(a.x, fmaxf(b.x, c.x))));
+                int y0 = std::max(0, (int)floorf(fminf(a.y, fminf(b.y, c.y)))), y1 = std::min(n - 1, (int)ceilf(fmaxf(a.y, fmaxf(b.y, c.y))));
+                for (int y = y0; y <= y1; y++)
+                    for (int x = x0; x <= x1; x++) {
+                        float px = x + 0.5f, py = y + 0.5f;
+                        float e0 = (b.x - a.x) * (py - a.y) - (b.y - a.y) * (px - a.x);
+                        float e1 = (c.x - b.x) * (py - b.y) - (c.y - b.y) * (px - b.x);
+                        float e2 = (a.x - c.x) * (py - c.y) - (a.y - c.y) * (px - c.x);
+                        if ((e0 >= 0 && e1 >= 0 && e2 >= 0) || (e0 <= 0 && e1 <= 0 && e2 <= 0)) hit[(size_t)y * n + x] = 1;
+                    }
+            }
+            std::vector<float> out((size_t)fr.res * fr.res, 0.0f);
+            for (int y = 0; y < n; y++)
+                for (int x = 0; x < n; x++)
+                    if (hit[(size_t)y * n + x]) out[(size_t)(y / ss) * fr.res + x / ss] += 1.0f / (ss * ss);
+            return out;
+        }
+
+        // One body's outline in one view, rows [y0, y1): a ray per pixel along the view direction, sphere traced
+        // through the body's field (in the body's own frame) inside its box. A pixel's coverage comes from the
+        // nearest the ray gets to the body, or the deepest into it, over a pixel's width: 0 when it passes half a
+        // pixel outside, 1 when it goes half a pixel inside, linear between. That is roughly the share of the pixel
+        // the body covers, and it changes smoothly as the body moves, which the descent needs (hard 0/1 pixels
+        // would not change at all under a small step).
+        void RenderBody(const BodyField& f, const BoundingBox& box, const Rigid& xf, const SilFrame& fr, const SilView& w,
+                        int y0, int y1, unsigned char* out) {
+            const float tau = 0.5f * fr.Pixel();
+            const float far = 4.0f * fr.half + Vector3Length(Vector3Subtract(box.max, box.min));
+            // the view in the body's frame
+            Quaternion inv = { -xf.rotation.x, -xf.rotation.y, -xf.rotation.z, xf.rotation.w };
+            Vector3 dir = Vector3RotateByQuaternion(w.dir, inv), u = Vector3RotateByQuaternion(w.u, inv), v = Vector3RotateByQuaternion(w.v, inv);
+            Vector3 base = xf.ApplyInverse(Vector3Subtract(fr.centre, Vector3Scale(w.dir, far)));
+            for (int y = y0; y < y1; y++)
+                for (int x = 0; x < fr.res; x++) {
+                    float sx = ((x + 0.5f) / fr.res * 2.0f - 1.0f) * fr.half, sy = (1.0f - (y + 0.5f) / fr.res * 2.0f) * fr.half;
+                    Vector3 o = Vector3Add(base, Vector3Add(Vector3Scale(u, sx), Vector3Scale(v, sy)));
+                    // the ray's stretch inside the box (slabs)
+                    float tn = 0.0f, tf = 2.0f * far;
+                    bool miss = false;
+                    for (int a = 0; a < 3 && !miss; a++) {
+                        float oa = Coord(o, a), da = Coord(dir, a), lo = Coord(box.min, a) - tau, hi = Coord(box.max, a) + tau;
+                        if (fabsf(da) < 1e-9f) { miss = oa < lo || oa > hi; continue; }
+                        float t0 = (lo - oa) / da, t1 = (hi - oa) / da;
+                        if (t0 > t1) std::swap(t0, t1);
+                        tn = fmaxf(tn, t0);
+                        tf = fminf(tf, t1);
+                        miss = tn > tf;
+                    }
+                    unsigned char cover = 0;
+                    if (!miss) {
+                        float t = tn, dmin = FLT_MAX;
+                        for (int k = 0; k < 64 && t <= tf; k++) {
+                            float d = f.Distance(Vector3Add(o, Vector3Scale(dir, t)));
+                            dmin = fminf(dmin, d);
+                            if (d < -tau) break;                       // well inside: fully covered
+                            t += d > tau ? 0.9f * d : 0.5f * tau;     // sphere tracing, small steps near the surface
+                        }
+                        float c = std::clamp(0.5f - dmin / (2.0f * tau), 0.0f, 1.0f);
+                        cover = (unsigned char)lroundf(c * 255.0f);
+                    }
+                    out[(size_t)y * fr.res + x] = cover;
+                }
+        }
+
+        // FNV-1a, for the silhouette cache's keys.
+        struct Hasher {
+            unsigned long long h = 1469598103934665603ull;
+            void Bytes(const void* p, size_t n) {
+                const unsigned char* b = (const unsigned char*)p;
+                for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
+            }
+            template <class T> void Add(const T& v) { Bytes(&v, sizeof(T)); }
+        };
+
+        // Everything a body's field depends on: its groups' operations and blends, nested as they are, and its shapes'
+        // operations and values (hinge hardware is off while searching, so it never adds to a body).
+        void HashGroup(const Design& d, int groupIndex, Hasher& hs) {
+            const Group& g = d.groups[groupIndex];
+            hs.Add((int)g.op);
+            hs.Add(g.blend);
+            for (int s : d.DirectShapes(g.id)) {
+                const Shape& sh = d.shapes[s];
+                const SuperFrustum& f = sh.sf;
+                hs.Add((int)sh.op);
+                hs.Add(f.position); hs.Add(f.rotation); hs.Add(f.size);
+                hs.Add(f.rounding); hs.Add(f.taper); hs.Add(f.bulge); hs.Add(f.dilation); hs.Add(f.onion);
+            }
+            for (int c : d.ChildGroups(g.id)) {
+                hs.Add(-7);              // marks nesting
+                HashGroup(d, c, hs);
+            }
+        }
+
+        // Rendered body outlines (every view, one pose), kept by what was rendered: the body's contents and where the
+        // pose puts it. A descent step usually changes one body, so the others are found here instead of traced again.
+        class SilCache {
+        public:
+            void Limit(size_t entryBytes) { m_Cap = std::max<size_t>(32, (size_t)(96u << 20) / std::max<size_t>(1, entryBytes)); }
+            std::vector<unsigned char>* Find(unsigned long long key) {
+                auto it = m_Map.find(key);
+                if (it == m_Map.end()) return nullptr;
+                it->second.used = ++m_Tick;
+                return &it->second.pixels;
+            }
+            std::vector<unsigned char>* Add(unsigned long long key, size_t bytes) {
+                if (m_Map.size() >= m_Cap) {
+                    // drop the least recently used quarter
+                    std::vector<std::pair<unsigned long long, unsigned long long>> age;
+                    for (const auto& [k, e] : m_Map) age.push_back({ e.used, k });
+                    std::sort(age.begin(), age.end());
+                    for (size_t i = 0; i < age.size() / 4; i++) m_Map.erase(age[i].second);
+                }
+                Entry& e = m_Map[key];
+                e.used = ++m_Tick;
+                e.pixels.assign(bytes, 0);
+                return &e.pixels;
+            }
+        private:
+            struct Entry {
+                std::vector<unsigned char> pixels;
+                unsigned long long used = 0;
+            };
+            std::unordered_map<unsigned long long, Entry> m_Map;
+            unsigned long long m_Tick = 0;
+            size_t m_Cap = 256;
+        };
+
+        // ---- the grammar's rewrites -----------------------------------------------------------------------------
+
+        enum class Rule : unsigned char {
+            AddShape, AddCut, RemoveShape, ToggleOp, MoveShape,           // shapes and material
+            AddBody, SplitBody, RemoveBody, MergeBody,                     // bodies
+            AddFeature, DissolveFeature, ToggleFeature,                    // blended features
+            AddHinge, RemoveHinge, Rehang, TurnHinge,                      // hinges
+            RemoveStray, CarveClash,                                       // data-driven repairs
+            Retime, OwnOpening,                                            // hinge timing
+            Count
+        };
+
+        // One rewrite, with everything random about it already decided, so it can be applied to the design it was
+        // sampled for, alone or together with other rewrites. Elements are named by id (stable while a design is
+        // edited), never by index.
+        struct Rewrite {
+            Rule rule = Rule::AddShape;
+            int shape = -1;              // the shape it acts on
+            int group = -1;              // the body or feature it acts on, or that receives a shape
+            int other = -1;              // a second body (a hinge's parent, a shape's new body)
+            int hinge = -1;              // the hinge it acts on
+            std::vector<int> shapes;     // shapes it groups (AddFeature)
+            bool hasShape = false;       // `sf` is a new shape, or `shape`'s new values
+            SuperFrustum sf;
+            bool hasHinge = false;       // a new hinge's (or `hinge`'s new) pivot, axis and turn
+            bool hasTiming = false;      // ... and its timing: when it turns while closing (t0..t1), and while opening
+            float t0 = 0.0f, t1 = 1.0f;  //     (o0..o1, of the opening motion) if it has its own opening timing
+            bool ownOpening = false;
+            float o0 = 0.0f, o1 = 1.0f;
+            Vector3 pivot = { 0, 0, 0 }, axis = { 0, 1, 0 };
+            float angle = 0.0f;          // closing turn (end - start)
+            float value = 0.0f;          // a new feature's blend
+            std::vector<long long> owns; // elements it changes or removes ...
+            std::vector<long long> uses; // ... and elements it only needs to still be there
+            float gain = 0.0f;           // how much it improved the objective in its lookahead
+        };
+
+        long long Key(char kind, int id) { return ((long long)kind << 32) | (unsigned)id; }
+        const long long TreeKey = ((long long)'T' << 32);   // the hinge tree's shape: one change to it per round
+
+        // Two rewrites conflict when one changes something the other changes or needs.
+        bool Conflict(const Rewrite& a, const Rewrite& b) {
+            auto hits = [](const std::vector<long long>& x, const std::vector<long long>& y) {
+                for (long long k : x)
+                    if (std::find(y.begin(), y.end(), k) != y.end()) return true;
+                return false;
+            };
+            return hits(a.owns, b.owns) || hits(a.owns, b.uses) || hits(b.owns, a.uses);
+        }
+
+        // ---- continuous parameters ------------------------------------------------------------------------------
+
+        // A continuous degree of freedom. Values are moved in units of DofScale (the paper's grammar-specific scaling:
+        // one unit is a small, comparable change for every kind), sizes on a log scale, rotations as small turns.
+        enum class Dof : unsigned char { Pos, LogSize, Rot, Rounding, Taper, Bulge, Dilation, Pivot, Axis, Angle, Blend, Timing };
+        struct Param {
+            Dof dof;
+            int id;                      // shape, hinge or group id
+            int axis;                    // 0..2 for the vector ones
         };
 
         // ---- the search ------------------------------------------------------------------------------------------------
@@ -551,6 +814,9 @@ namespace Bakugan {
                   m_Pool(std::max(0, (int)std::thread::hardware_concurrency() - 1)) {
                 m_P.maxBodies = std::max(1, m_P.maxBodies);
                 m_P.minBodies = std::clamp(m_P.minBodies, 1, m_P.maxBodies);
+                m_P.rewritesPerRound = std::max(1, m_P.rewritesPerRound);
+                m_P.stepsPerRound = std::max(0, m_P.stepsPerRound);
+                m_P.stepSize = std::max(1e-3f, m_P.stepSize);
             }
 
             AutoResult Run(const Design& start);
@@ -560,14 +826,33 @@ namespace Bakugan {
             Design Seed();
             Design FromCurrent(const Design& start);
             AutoScore Evaluate(const Design& d, Diagnostics* diag);
-            bool Propose(Design& d, const Diagnostics& dg, float progress, Focus* focus, bool* small);
-            bool Perturb(Design& d, const Focus& f, float scale);
-            bool PerturbShape(Design& d, int s, float scale);
-            bool PerturbHinge(Design& d, int h, float scale);
-            bool Structural(Design& d, const Diagnostics& dg, Focus* focus);
+            void ScoreMotion(const Design& d, const Probe& pr, double designVolume, AutoScore* sc, std::vector<MotionClash>* spots);
+            void ScoreSilhouettes(const Design& d, const Probe& pr, const std::vector<Rigid>& open,
+                                  const std::vector<Rigid>& closed, float offOpen, float offClosed, AutoScore* sc);
+            void ViewsImage(std::vector<unsigned char>* rgba, int* w, int* h) const;
+            float Objective(const AutoScore& s) const { return s.base + m_Ramp * m_P.collisionWeight * s.collision; }
+            void Consider(const Design& d, const AutoScore& s);     // keeps it if it is the best so far
             bool Sanitize(Design& d) const;
+            void Project(Design& d) const;
             void Finalize(Design& d) const;
-            void Publish(const State& best, int iteration, bool force);
+            void Publish(bool force);
+
+            // descent
+            float DofScale(Dof k) const;
+            std::vector<Param> Params(const Design& d, const Focus* only) const;
+            std::vector<Param> AllParams(const Design& d, const Focus* only) const;
+            void Step(Design& d, const std::vector<Param>& ps, const std::vector<float>& x) const;
+            Focus RandomBlock(const Design& d);
+            bool DescentStep(State& cur, const std::vector<Param>& ps, float lr);
+            void Lookahead(State& cand, const Focus& f);
+
+            // rewrites
+            bool Sample(const Design& d, const Diagnostics& dg, Rewrite* r);
+            bool Apply(Design& d, const Rewrite& r, Focus* f) const;
+            bool ApplyRule(Design& d, const Rewrite& r, Focus* f) const;
+            bool Timing() const { return m_P.allowTiming && m_P.motionChecks > 0 && m_P.collisionWeight > 0.0f; }
+            void Remember(Rewrite& r, const Design& d, const Focus& f) const;   // the lookahead's values into the rewrite
+            int RewriteRound(State& cur);
 
             // grammar helpers
             SuperFrustum NewShape(Vector3 at, bool cut);
@@ -576,6 +861,8 @@ namespace Bakugan {
             int NearestBody(const Design& d, Vector3 p, int except = -1) const;   // group index
             Vector3 BodyHint(const Design& d, int bodyId) const;                   // a point inside the body
             Vector3 PivotBetween(const Design& d, int bodyA, int bodyB, Vector3 a, Vector3 b) const;
+            void ChooseHinge(Vector3 pivot, Vector3 childPoint, Vector3* axis, float* angle);
+            void SetupHinge(Design& d, int index, Vector3 pivot, Vector3 axis, float angle, bool fresh) const;
             int AttachHinge(Design& d, int parent, int child, Vector3 pivot, Vector3 childPoint);
             void RemoveBody(Design& d, int bodyId) const;
             bool MergeBody(Design& d, int bodyId) const;
@@ -591,14 +878,25 @@ namespace Bakugan {
             Target m_T;
             Samples m_S;
             float m_Tau = 1.0f;              // occupancy softness (mm)
-            float m_Step = 1.0f;             // size of small changes: grows while they keep helping, shrinks while they don't
             std::unique_ptr<InsideTest> m_Inside;
             MeshField m_MeshField;
+            // silhouettes
+            SilFrame m_Frame;
+            std::vector<std::vector<float>> m_Target;          // the mesh's outline in each view (pixel coverage 0..1)
+            SilCache m_Cache;
+            std::vector<unsigned char> m_LastOpen, m_LastClosed;   // the design scored last: its outlines, every view
+            std::vector<unsigned char> m_BestOpen, m_BestClosed;   // ... and the best design's
             // the box the search stays in (shared by every design, so a start design outside it is never stuck)
             float m_Reach = 0.0f;            // how far shapes and pivots may be from the mesh's centre
             float m_MinSize = 0.0f, m_MaxSize = 0.0f, m_MaxDilation = 0.0f, m_MaxBlend = 0.0f;
-            AutoScore m_Score;               // of the design moves are proposed for (its sphere)
+            AutoScore m_Score;               // of the design rewrites are sampled for (its sphere)
             std::unordered_map<int, bool> m_Hardware;   // hinge id -> hardware flag of a design we started from
+            // the run
+            float m_Ramp = 0.1f;             // share of the collision weight in force (it grows over the run)
+            float m_Lr = 0.5f;               // descent step (parameter scale units)
+            float m_SpsaRms = 0.0f;          // running RMS of SPSA slopes: steps are measured against it
+            State m_Best;
+            int m_Accepted = 0, m_Rounds = 0;
             Clock::time_point m_LastPublish;
             int m_Evaluations = 0;
         };
@@ -678,6 +976,21 @@ namespace Bakugan {
             m_C.SetStage("Measuring distances to the mesh");
             const int res[3] = { 48, 72, 96 };
             m_MeshField.Build(m_T.box, 0.2f * L, res[q], [&](Vector3 p) { return test.Inside(p); }, m_Pool);
+
+            if (m_P.loss == AutoLoss::Silhouettes) {
+                // every view frames the same square around the mesh's box, a little wider than the mesh can ever
+                // reach (it is all within half the box's diagonal of the centre); material beyond the frame is caught
+                // by the off-frame share instead
+                if (m_C.Cancelled()) return false;
+                m_C.SetStage("Drawing the mesh's outlines");
+                m_Frame.centre = Vector3Scale(Vector3Add(lo, hi), 0.5f);
+                m_Frame.half = 0.55f * L;
+                m_Frame.res = std::clamp(m_P.viewResolution, 16, 256);
+                m_Frame.views = MakeViews(std::clamp(m_P.views, 1, 24));
+                m_Target.assign(m_Frame.views.size(), {});
+                m_Pool.For((int)m_Frame.views.size(), [&](int v) { m_Target[v] = RasterMesh(m, m_Frame, m_Frame.views[v]); });
+                m_Cache.Limit(m_Frame.views.size() * m_Frame.res * m_Frame.res);
+            }
             // more inside points from the box, for seeding and placing new shapes
             for (int round = 0; round < 6 && m_T.inside.size() < 2000; round++) {
                 std::vector<Vector3> cand(4000);
@@ -702,6 +1015,7 @@ namespace Bakugan {
             const int closedCount[3] = { 1000, 2000, 4000 };
             const int sphereCount[3] = { 1200, 2500, 5000 };
             const int shellCount[3] = { 200, 400, 800 };
+            const int pairCount[3] = { 64, 128, 256 };
             int q = std::clamp(m_P.quality, 0, 2);
             Rng r(m_P.seed * 7919u + 17u);
             for (int i = 0; i < closedCount[q]; i++) m_S.closedUnit.push_back({ Uniform(r), Uniform(r), Uniform(r) });
@@ -711,6 +1025,7 @@ namespace Bakugan {
                 m_S.sphereUnit.push_back(u);
                 m_S.sphereIn.push_back(Vector3Length(u) <= 1.0f);
             }
+            for (int i = 0; i < pairCount[q]; i++) m_S.pairUnit.push_back({ Uniform(r), Uniform(r), Uniform(r) });
             // a Fibonacci sphere: even coverage of the surface
             int n = shellCount[q];
             for (int i = 0; i < n; i++) {
@@ -721,14 +1036,18 @@ namespace Bakugan {
 
         // ---- the score -------------------------------------------------------------------------------------------------
 
-        // One number for both poses, lower is better:
+        // One number for both poses, lower is better. Below is the Volume loss; with Silhouettes (ScoreSilhouettes),
+        // fit and sphere are replaced by the outline comparisons, and the volume and surface samples are only measured
+        // when a rewrite round needs their spots. Collisions, costs and the sphere's size and centre are the same.
+
         //   fit       open pose against the mesh: the mesh volume the design misses and the design volume outside the
         //             mesh (sampled wherever the design is), both relative to the mesh's volume, how far out that extra
         //             material reaches, and how far the mesh surface is from the design surface
         //   sphere    closed pose against a sphere of its own volume around its own centroid: the same overlap and
         //             surface measures, and how far closed material reaches outside the sphere
         //   total     (1 - bias) * fit + bias * sphere + collisions * weight + costs
-        // Collisions are bodies overlapping each other in the open pose and in the closed pose (not on the way).
+        // Collisions are bodies overlapping each other in the open pose and in the closed pose, and with motion checks
+        // at evenly spaced moments of the motion between them (ScoreMotion).
         // Costs keep it simple and buildable: per shape and group, pivots off their bodies, bodies on no hinge.
         AutoScore Search::Evaluate(const Design& d, Diagnostics* diag) {
             m_Evaluations++;
@@ -763,7 +1082,12 @@ namespace Bakugan {
 
             const float occCap = 6.0f * tau;     // the soft occupancy is flat past this
             const float fitCap = 0.08f * L;
-            int nV = (int)m_T.vol.size(), nS = (int)m_T.surf.size(), nO = (int)m_S.openUnit.size(), nC = (int)m_S.closedUnit.size();
+            // scored by silhouettes, the volume and surface samples only find the spots a rewrite round aims at; the
+            // samples over the open and closed designs are always needed (collisions, the sphere's size and centre)
+            const bool silhouettes = m_P.loss == AutoLoss::Silhouettes;
+            const bool useVolume = !silhouettes || diag;
+            int nV = useVolume ? (int)m_T.vol.size() : 0, nS = useVolume ? (int)m_T.surf.size() : 0;
+            int nO = (int)m_S.openUnit.size(), nC = (int)m_S.closedUnit.size();
             int oBase = nV + nS, cBase = oBase + nO, n1 = cBase + nC;
             std::vector<float> dist(n1), dist2(n1, occCap), meshD(nO, 0.0f);
             std::vector<int> who(n1, -1), who2(n1, -1);
@@ -805,8 +1129,11 @@ namespace Bakugan {
 
             // open pose, on samples over the design's own volume: material off the mesh, and bodies overlapping
             std::vector<int> clashes;
+            double designVolume = 0.0;                   // the design's material (mm^3), from the open samples
+            float offOpen = 0.0f, offClosed = 0.0f;      // share of the material outside the views' frame
+            auto outsideFrame = [&](Vector3 p) { return Vector3Distance(p, m_Frame.centre) > m_Frame.half; };
             {
-                double mass = 0.0, off = 0.0, far = 0.0, overlap = 0.0, depth = 0.0;
+                double mass = 0.0, off = 0.0, far = 0.0, overlap = 0.0, depth = 0.0, unseen = 0.0;
                 for (int k = 0; k < nO; k++) {
                     int i = oBase + k;
                     float a = occupancy(dist[i]);
@@ -817,9 +1144,12 @@ namespace Bakugan {
                     depth += fminf(fmaxf(0.0f, -dist2[i]), occCap);
                     if (dist[i] < 0.0f && meshD[k] > 0.0f) excess.push_back({ inBox(olo, oext, m_S.openUnit[k]), who[i] });
                     if (dist2[i] < -tau) clashes.push_back(i);
+                    if (silhouettes && outsideFrame(inBox(olo, oext, m_S.openUnit[k]))) unseen += a;
                 }
                 if (mass > 1e-6) {
+                    offOpen = (float)(unseen / mass);
                     double sampleVolume = (double)oext.x * oext.y * oext.z / nO;
+                    designVolume = mass * sampleVolume;
                     sc.fitOutside = (float)(off / mass);
                     sc.fitExcess = (float)(off * sampleVolume / fmax(m_MeshField.Volume(), 1e-9));
                     sc.fitSpill = (float)(far / mass / (0.1 * L));
@@ -832,7 +1162,7 @@ namespace Bakugan {
             sc.fit = 0.35f * (1.0f - sc.fitCover) + 0.35f * fminf(sc.fitExcess, 2.0f) + 0.15f * sc.fitGap + 0.15f * fminf(sc.fitSpill, 2.0f);
 
             // closed pose: volume and centroid, then the sphere it should be; bodies overlapping
-            double mass = 0.0, overlapC = 0.0, depthC = 0.0;
+            double mass = 0.0, overlapC = 0.0, depthC = 0.0, unseenC = 0.0;
             Vector3 centroid = { 0, 0, 0 };
             for (int k = 0; k < nC; k++) {
                 int i = cBase + k;
@@ -843,11 +1173,15 @@ namespace Bakugan {
                 if (dist2[i] < occCap) overlapC += clash(dist2[i]);
                 depthC += fminf(fmaxf(0.0f, -dist2[i]), occCap);
                 if (dist2[i] < -tau) clashes.push_back(i);
+                if (silhouettes && outsideFrame(p)) unseenC += a;
             }
             if (mass > 1e-6) {
+                offClosed = (float)(unseenC / mass);
                 sc.clashClosed = (float)(overlapC / mass);
                 sc.collision += 0.5f * sc.clashClosed + 0.5f * (float)(depthC / mass / occCap);
             }
+            std::vector<MotionClash> motionClashes;
+            if (m_P.motionChecks > 0 && designVolume > 0.0) ScoreMotion(d, pr, designVolume, &sc, diag ? &motionClashes : nullptr);
             double boxVolume = (double)cext.x * cext.y * cext.z;
             double volume = nC > 0 ? mass / nC * boxVolume : 0.0;
             if (mass < 1e-3 || volume <= 0.0) {
@@ -855,6 +1189,8 @@ namespace Bakugan {
             } else {
                 sc.centre = Vector3Scale(centroid, (float)(1.0 / mass));
                 sc.radius = m_P.sphereDiameter > 0.0f ? m_P.sphereDiameter * 0.5f : (float)cbrt(3.0 * volume / (4.0 * PI));
+            }
+            if (sc.radius > 0.0f && useVolume) {
                 float R = fmaxf(sc.radius, 1e-3f);
                 const float shellCap = 0.3f * R;
                 int nP = (int)m_S.sphereUnit.size(), nH = (int)m_S.shellDirs.size(), n2 = nP + nH;
@@ -907,16 +1243,27 @@ namespace Bakugan {
                 for (int k = 0; k < 24 && !excess.empty(); k++) diag->excess.push_back(excess[Pick(m_Rng, (int)excess.size())]);
                 diag->clashes.clear();
                 diag->clashOther.clear();
-                diag->clashClosed.clear();
+                diag->clashT.clear();
+                diag->clashOpening.clear();
                 for (int k = 0; k < 24 && !clashes.empty(); k++) {
                     int i = clashes[Pick(m_Rng, (int)clashes.size())];
                     bool isClosed = i >= cBase;
                     Vector3 p = isClosed ? inBox(clo, cext, m_S.closedUnit[i - cBase]) : inBox(olo, oext, m_S.openUnit[i - oBase]);
                     diag->clashes.push_back({ p, who[i] });
                     diag->clashOther.push_back(who2[i]);
-                    diag->clashClosed.push_back(isClosed);
+                    diag->clashT.push_back(isClosed ? 1.0f : 0.0f);
+                    diag->clashOpening.push_back(0);
+                }
+                for (int k = 0; k < 16 && !motionClashes.empty(); k++) {
+                    const MotionClash& mc = motionClashes[Pick(m_Rng, (int)motionClashes.size())];
+                    diag->clashes.push_back({ mc.p, mc.a });
+                    diag->clashOther.push_back(mc.b);
+                    diag->clashT.push_back(mc.t);
+                    diag->clashOpening.push_back(mc.opening);
                 }
             }
+
+            if (silhouettes) ScoreSilhouettes(d, pr, open, closed, offOpen, offClosed, &sc);
 
             // buildability and simplicity
             int features = 0;
@@ -933,10 +1280,276 @@ namespace Bakugan {
             }
             sc.penalty = penalty;
             float w = std::clamp(m_P.sphereBias, 0.0f, 1.0f);
-            sc.base = (1.0f - w) * sc.fit + w * sc.sphere + penalty;
+            sc.base = (1.0f - w) * sc.fit + w * sc.sphere + sc.coveragePenalty + penalty;
             sc.total = sc.base + m_P.collisionWeight * sc.collision;
             sc.valid = true;
             return sc;
+        }
+
+        // Bodies overlapping on the way: at motionChecks evenly spaced moments strictly between open and closed (of the
+        // closing motion, and of the opening one too when a hinge has its own opening timing), eased as the editor
+        // animates it. Two bodies can only overlap where their boxes do, so each moment only samples the meeting box
+        // of every pair of bodies whose world boxes meet (a fixed set of points, the same for every design, so
+        // scores compare without sampling noise). A point counts as overlapping as the endpoints' samples do: inside
+        // both bodies by more than about tau, softly. A moment scores like an endpoint pose (half the share of the
+        // design's volume inside two bodies, half how deep, capped) and the moments' mean adds to the collisions, so
+        // the whole motion between weighs as much as one end pose, however many moments are checked.
+        void Search::ScoreMotion(const Design& d, const Probe& pr, double designVolume, AutoScore* sc, std::vector<MotionClash>* spots) {
+            const int n = std::max(0, m_P.motionChecks), nf = (int)pr.fields.size();
+            if (n == 0 || nf < 2) return;
+            const float tau = m_Tau, occCap = 6.0f * tau;
+            auto occupancy = [&](float dd) { return 1.0f / (1.0f + expf(dd / tau)); };
+
+            struct Moment {
+                float t;
+                bool opening;
+                std::vector<Rigid> xf;
+                double overlap = 0.0, depth = 0.0;
+            };
+            std::vector<Moment> moments;
+            const int motions = d.HasOwnOpening() ? 2 : 1;
+            for (int m = 0; m < motions; m++)
+                for (int k = 1; k <= n; k++) {
+                    float t = (float)k / (n + 1);
+                    moments.push_back({ t, m == 1, d.Transforms(t, true, m == 1 ? Motion::Opening : Motion::Closing) });
+                }
+
+            // the pairs of bodies whose boxes meet, per moment
+            struct Task {
+                int moment, a, b;
+                Vector3 lo, ext;
+                double overlap = 0.0, depth = 0.0;
+                std::vector<Vector3> deep;    // a few points well inside both
+            };
+            std::vector<Task> tasks;
+            std::vector<Vector3> wlo(nf), whi(nf);
+            for (int m = 0; m < (int)moments.size(); m++) {
+                const std::vector<Rigid>& xf = moments[m].xf;
+                for (int i = 0; i < nf; i++) {
+                    const BoundingBox& b = pr.box[i];
+                    wlo[i] = { FLT_MAX, FLT_MAX, FLT_MAX };
+                    whi[i] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+                    for (int c = 0; c < 8; c++) {
+                        Vector3 q = { (c & 1) ? b.max.x : b.min.x, (c & 2) ? b.max.y : b.min.y, (c & 4) ? b.max.z : b.min.z };
+                        Vector3 w = xf[pr.group[i]].Apply(q);
+                        wlo[i] = Vector3Min(wlo[i], w);
+                        whi[i] = Vector3Max(whi[i], w);
+                    }
+                }
+                for (int i = 0; i < nf; i++)
+                    for (int j = i + 1; j < nf; j++) {
+                        Vector3 lo = Vector3Max(wlo[i], wlo[j]), hi = Vector3Min(whi[i], whi[j]);
+                        if (lo.x >= hi.x || lo.y >= hi.y || lo.z >= hi.z) continue;
+                        Task t;
+                        t.moment = m;
+                        t.a = i;
+                        t.b = j;
+                        t.lo = lo;
+                        t.ext = Vector3Subtract(hi, lo);
+                        tasks.push_back(std::move(t));
+                    }
+            }
+            auto inside = [](const BoundingBox& b, Vector3 q) {
+                return q.x >= b.min.x && q.x <= b.max.x && q.y >= b.min.y && q.y <= b.max.y && q.z >= b.min.z && q.z <= b.max.z;
+            };
+            m_Pool.For((int)tasks.size(), [&](int k) {
+                Task& t = tasks[k];
+                const Rigid& xa = moments[t.moment].xf[pr.group[t.a]];
+                const Rigid& xb = moments[t.moment].xf[pr.group[t.b]];
+                double overlap = 0.0, depth = 0.0;
+                for (const Vector3& u : m_S.pairUnit) {
+                    Vector3 p = { t.lo.x + u.x * t.ext.x, t.lo.y + u.y * t.ext.y, t.lo.z + u.z * t.ext.z };
+                    Vector3 qa = xa.ApplyInverse(p);
+                    if (!inside(pr.box[t.a], qa)) continue;        // outside a body's box: outside the body
+                    float da = pr.fields[t.a].Distance(qa);
+                    if (da >= occCap) continue;
+                    Vector3 qb = xb.ApplyInverse(p);
+                    if (!inside(pr.box[t.b], qb)) continue;
+                    float db = pr.fields[t.b].Distance(qb);
+                    float dd = fmaxf(da, db);                       // inside both by dd (negative)
+                    if (dd >= occCap) continue;
+                    overlap += occupancy(dd + tau);
+                    depth += fminf(fmaxf(0.0f, -dd), occCap);
+                    if (dd < -tau && t.deep.size() < 4) t.deep.push_back(p);
+                }
+                double vol = (double)t.ext.x * t.ext.y * t.ext.z / m_S.pairUnit.size();
+                t.overlap = overlap * vol;
+                t.depth = depth * vol;
+            });
+            for (const Task& t : tasks) {
+                moments[t.moment].overlap += t.overlap;
+                moments[t.moment].depth += t.depth;
+                if (spots)
+                    for (const Vector3& p : t.deep)
+                        spots->push_back({ p, pr.group[t.a], pr.group[t.b], moments[t.moment].t, (char)moments[t.moment].opening });
+            }
+            double sum = 0.0;
+            for (const Moment& m : moments) {
+                float share = (float)std::min(1.0, m.overlap / designVolume);
+                sum += 0.5 * share + 0.5 * std::min(1.0, m.depth / designVolume / occCap);
+                if (share > sc->clashMotion) {
+                    sc->clashMotion = share;
+                    sc->clashMotionT = m.t;
+                    sc->clashMotionOpening = m.opening;
+                }
+            }
+            sc->collision += (float)(sum / moments.size());
+        }
+
+        // The silhouette score. Every body's outline in every view, in the open and in the closed pose, comes from the
+        // cache or is traced now (in parallel); a pose's outline is the union of its bodies' (each pixel the most any
+        // body covers). Then, per view, against the target T (the mesh's outline for the open pose, the sphere's disc
+        // for the closed one), with D the design's outline:
+        //   covered = sum(min(T, D)) / sum(T)          the share of the target the design covers
+        //   extra   = sum(max(0, D - T)) / sum(T)      the design's pixels where the target has none, by the same yardstick
+        //   loss    = (1 - covered) + extra
+        // fit and sphere are the mean losses over the views, plus twice the share of material outside the frame
+        // (pixels there are never seen, so that material would otherwise be free). A view covered less than
+        // minViewCoverage costs 10 for each whole unit it falls short (a 10% shortfall costs 1, more than the rest of
+        // the score): steep enough that no view can be traded away, but still a slope, so a design short of it can
+        // climb back (a flat "very bad" would leave the search with no direction). The mesh's views only count while
+        // the goal leaves the mesh any weight, the sphere's only while it gives the sphere any.
+        void Search::ScoreSilhouettes(const Design& d, const Probe& pr, const std::vector<Rigid>& open,
+                                      const std::vector<Rigid>& closed, float offOpen, float offClosed, AutoScore* sc) {
+            const SilFrame& fr = m_Frame;
+            const int nv = (int)fr.views.size(), px = fr.res * fr.res;
+            const size_t bytes = (size_t)nv * px;
+
+            // each body's outlines in each pose: found in the cache, or queued to be traced
+            struct Trace {
+                std::vector<unsigned char>* out;
+                int body;
+                Rigid xf;
+            };
+            std::vector<Trace> traces;
+            std::vector<std::vector<unsigned char>*> layers[2];
+            for (int pose = 0; pose < 2; pose++) {
+                const std::vector<Rigid>& xf = pose == 0 ? open : closed;
+                for (size_t i = 0; i < pr.fields.size(); i++) {
+                    const Rigid& r = xf[pr.group[i]];
+                    Hasher hs;
+                    HashGroup(d, pr.group[i], hs);
+                    hs.Add(r.rotation);
+                    hs.Add(r.position);
+                    std::vector<unsigned char>* img = m_Cache.Find(hs.h);
+                    if (!img) {
+                        img = m_Cache.Add(hs.h, bytes);
+                        traces.push_back({ img, (int)i, r });
+                    }
+                    layers[pose].push_back(img);
+                }
+            }
+            const int rows = 8, blocks = (fr.res + rows - 1) / rows;
+            m_Pool.For((int)traces.size() * nv * blocks, [&](int t) {
+                const Trace& tr = traces[t / (nv * blocks)];
+                int v = (t / blocks) % nv, b = t % blocks;
+                RenderBody(pr.fields[tr.body], pr.box[tr.body], tr.xf, fr, fr.views[v], b * rows, std::min(fr.res, (b + 1) * rows),
+                           tr.out->data() + (size_t)v * px);
+            });
+            for (int pose = 0; pose < 2; pose++) {
+                std::vector<unsigned char>& out = pose == 0 ? m_LastOpen : m_LastClosed;
+                out.assign(bytes, 0);
+                for (const std::vector<unsigned char>* img : layers[pose])
+                    for (size_t k = 0; k < bytes; k++) out[k] = std::max(out[k], (*img)[k]);
+            }
+
+            float w = std::clamp(m_P.sphereBias, 0.0f, 1.0f);
+            const float minCover = std::clamp(m_P.minViewCoverage, 0.0f, 1.0f);
+            float worst = 1.0f, penalty = 0.0f;
+            auto compare = [&](const unsigned char* design, const auto& target, bool counts, float* cover, float* extra) {
+                double tsum = 0.0, hit = 0.0, spill = 0.0;
+                for (int k = 0; k < px; k++) {
+                    float t = target(k), dd = design[k] * (1.0f / 255.0f);
+                    tsum += t;
+                    hit += fminf(t, dd);
+                    spill += fmaxf(0.0f, dd - t);
+                }
+                *cover = tsum > 0.0 ? (float)(hit / tsum) : 0.0f;
+                *extra = tsum > 0.0 ? (float)(spill / tsum) : (spill > 0.0 ? 1.0f : 0.0f);
+                if (counts) {
+                    worst = fminf(worst, *cover);
+                    penalty += 10.0f * fmaxf(0.0f, minCover - *cover);
+                }
+            };
+
+            // the open pose against the mesh's outlines
+            double fit = 0.0, cover = 0.0, extra = 0.0;
+            for (int v = 0; v < nv; v++) {
+                float c, e;
+                const std::vector<float>& target = m_Target[v];
+                compare(m_LastOpen.data() + (size_t)v * px, [&](int k) { return target[k]; }, w < 1.0f, &c, &e);
+                fit += (1.0f - c) + e;
+                cover += c;
+                extra += e;
+            }
+            sc->viewCover = (float)(cover / nv);
+            sc->viewExtra = (float)(extra / nv);
+            sc->fit = (float)(fit / nv) + 2.0f * offOpen;
+
+            // the closed pose against the sphere: the same disc in every view, centred where the sphere's centre
+            // lands in it (exact to a fraction of a pixel, so the score moves smoothly with the centre)
+            if (sc->radius > 0.0f) {
+                double sph = 0.0, scover = 0.0, sextra = 0.0;
+                const float rpx = sc->radius / fr.Pixel();
+                for (int v = 0; v < nv; v++) {
+                    Vector2 c0 = fr.ToPixel(fr.views[v], sc->centre);
+                    auto disc = [&](int k) {
+                        float x = (k % fr.res) + 0.5f - c0.x, y = (k / fr.res) + 0.5f - c0.y;
+                        return std::clamp(rpx - sqrtf(x * x + y * y) + 0.5f, 0.0f, 1.0f);
+                    };
+                    float c, e;
+                    compare(m_LastClosed.data() + (size_t)v * px, disc, w > 0.0f, &c, &e);
+                    sph += (1.0f - c) + e;
+                    scover += c;
+                    sextra += e;
+                }
+                sc->sphereViewCover = (float)(scover / nv);
+                sc->sphereViewExtra = (float)(sextra / nv);
+                sc->sphere = (float)(sph / nv) + 2.0f * offClosed;
+            } else {
+                sc->sphere = 2.0f;
+                if (w > 0.0f) penalty += 10.0f * minCover * nv;
+                worst = 0.0f;
+            }
+            sc->silhouettes = true;
+            sc->worstView = worst;
+            sc->coveragePenalty = penalty;
+            sc->offFrame = offOpen + offClosed;
+        }
+
+        // The best design's views as one picture: a row of the open pose against the mesh, a row of the closed pose
+        // against the sphere. Dark where both cover a pixel, red where only the target does (missing), blue where only
+        // the design does (extra), white where neither.
+        void Search::ViewsImage(std::vector<unsigned char>* rgba, int* w, int* h) const {
+            const SilFrame& fr = m_Frame;
+            const int nv = (int)fr.views.size(), px = fr.res * fr.res, gap = 3;
+            if (m_BestOpen.size() != (size_t)nv * px) { *w = *h = 0; rgba->clear(); return; }
+            *w = nv * fr.res + (nv + 1) * gap;
+            *h = 2 * fr.res + 3 * gap;
+            rgba->assign((size_t)*w * *h * 4, 0);
+            for (size_t k = 0; k < rgba->size(); k += 4) { (*rgba)[k] = 222; (*rgba)[k + 1] = 225; (*rgba)[k + 2] = 232; (*rgba)[k + 3] = 255; }
+            const float both[3] = { 70, 74, 86 }, miss[3] = { 235, 110, 95 }, extra[3] = { 90, 140, 235 };
+            const float rpx = m_Best.score.radius / fr.Pixel();
+            for (int row = 0; row < 2; row++)
+                for (int v = 0; v < nv; v++) {
+                    Vector2 c0 = fr.ToPixel(fr.views[v], m_Best.score.centre);
+                    const unsigned char* design = (row == 0 ? m_BestOpen : m_BestClosed).data() + (size_t)v * px;
+                    int ox = gap + v * (fr.res + gap), oy = gap + row * (fr.res + gap);
+                    for (int k = 0; k < px; k++) {
+                        int x = k % fr.res, y = k / fr.res;
+                        float t;
+                        if (row == 0) {
+                            t = m_Target[v][k];
+                        } else {
+                            float dx = x + 0.5f - c0.x, dy = y + 0.5f - c0.y;
+                            t = rpx > 0.0f ? std::clamp(rpx - sqrtf(dx * dx + dy * dy) + 0.5f, 0.0f, 1.0f) : 0.0f;
+                        }
+                        float dd = design[k] / 255.0f, ov = fminf(t, dd), ms = t - ov, ex = dd - ov, rest = 1.0f - fmaxf(t, dd);
+                        unsigned char* o = &(*rgba)[((size_t)(oy + y) * *w + ox + x) * 4];
+                        for (int c = 0; c < 3; c++)
+                            o[c] = (unsigned char)std::clamp(lroundf(ov * both[c] + ms * miss[c] + ex * extra[c] + rest * 255.0f), 0L, 255L);
+                    }
+                }
         }
 
         // ---- helpers ---------------------------------------------------------------------------------------------------
@@ -994,38 +1607,55 @@ namespace Bakugan {
             return Vector3Lerp(a, b, (lo + hi) * 0.5f);
         }
 
-        // A new hinge, sized to the model. Half the time it folds the child towards the middle of the mesh (where the
-        // sphere wants to be), otherwise about a random axis by a random angle.
-        int Search::AttachHinge(Design& d, int parent, int child, Vector3 pivot, Vector3 childPoint) {
-            if (!d.CanHinge(parent, child)) return -1;
-            int h = d.AddHinge(parent, child);
-            Bakugan::Hinge& hg = d.hinges[h];
-            const float L = m_T.L;
-            hg.pivot = pivot;
-            hg.start = 0.0f;
-            hg.hardware = false;     // the score ignores it; Finalize puts it back
-            hg.radius = std::clamp(0.03f * L, 1.6f, 4.0f);
-            hg.pinRadius = hg.radius * 0.4f;
-            hg.length = std::clamp(0.2f * L, 6.0f, 30.0f);
-            hg.leafLength = std::clamp(0.07f * L, 2.0f, 10.0f);
-            hg.leafThickness = std::clamp(0.025f * L, 1.2f, 3.0f);
-            hg.knuckles = 3;
+        // How a new hinge turns its child: half the time folding it towards the middle of the mesh (where the sphere
+        // wants to be), about the axis that swings it there, most of the way; otherwise about a random axis across
+        // the child's direction, by a random angle.
+        void Search::ChooseHinge(Vector3 pivot, Vector3 childPoint, Vector3* axis, float* angle) {
             Vector3 out = Vector3Subtract(childPoint, pivot);
             if (Vector3Length(out) < 1e-4f) out = RandomUnit(m_Rng);
             out = Vector3Normalize(out);
             Vector3 in = Vector3Subtract(m_T.centre, pivot);
-            Vector3 axis = Vector3CrossProduct(out, in);
-            if (Chance(m_Rng, 0.5f) && Vector3Length(axis) > 1e-3f * Vector3Length(in)) {
-                hg.axis = Vector3Normalize(axis);
+            Vector3 swing = Vector3CrossProduct(out, in);
+            if (Chance(m_Rng, 0.5f) && Vector3Length(swing) > 1e-3f * Vector3Length(in)) {
+                *axis = Vector3Normalize(swing);
                 float cosang = Vector3DotProduct(out, Vector3Normalize(in));
-                hg.end = acosf(std::clamp(cosang, -1.0f, 1.0f)) * Uniform(m_Rng, 0.6f, 1.0f);
+                *angle = acosf(std::clamp(cosang, -1.0f, 1.0f)) * Uniform(m_Rng, 0.6f, 1.0f);
             } else {
                 Vector3 r = RandomUnit(m_Rng);
                 r = Vector3Subtract(r, Vector3Scale(out, Vector3DotProduct(r, out)));
-                hg.axis = Vector3Length(r) > 1e-3f ? Vector3Normalize(r) : Utils::AnyPerpendicular(out);
-                hg.end = Uniform(m_Rng, -PI, PI);
+                *axis = Vector3Length(r) > 1e-3f ? Vector3Normalize(r) : Utils::AnyPerpendicular(out);
+                *angle = Uniform(m_Rng, -PI, PI);
             }
-            return hg.id;
+        }
+
+        // Puts a pivot, an axis and a closing turn on hinge `index`. A fresh hinge also starts open at 0 and gets
+        // hardware sized to the model (switched off: the score ignores it, Finalize decides).
+        void Search::SetupHinge(Design& d, int index, Vector3 pivot, Vector3 axis, float angle, bool fresh) const {
+            Bakugan::Hinge& hg = d.hinges[index];
+            if (fresh) {
+                const float L = m_T.L;
+                hg.start = 0.0f;
+                hg.hardware = false;
+                hg.radius = std::clamp(0.03f * L, 1.6f, 4.0f);
+                hg.pinRadius = hg.radius * 0.4f;
+                hg.length = std::clamp(0.2f * L, 6.0f, 30.0f);
+                hg.leafLength = std::clamp(0.07f * L, 2.0f, 10.0f);
+                hg.leafThickness = std::clamp(0.025f * L, 1.2f, 3.0f);
+                hg.knuckles = 3;
+            }
+            hg.pivot = pivot;
+            hg.axis = Vector3Length(axis) > 1e-6f ? Vector3Normalize(axis) : Vector3{ 0, 1, 0 };
+            hg.end = hg.start + angle;
+        }
+
+        int Search::AttachHinge(Design& d, int parent, int child, Vector3 pivot, Vector3 childPoint) {
+            if (!d.CanHinge(parent, child)) return -1;
+            int h = d.AddHinge(parent, child);
+            Vector3 axis;
+            float angle;
+            ChooseHinge(pivot, childPoint, &axis, &angle);
+            SetupHinge(d, h, pivot, axis, angle, true);
+            return d.hinges[h].id;
         }
 
         // Takes a body out and keeps the hinge tree whole: its children hang from its parent instead (or, for a root,
@@ -1152,301 +1782,494 @@ namespace Bakugan {
                 return true;
             }
             *f = BoxAround(keep, 0.04f, 0.015f * L);
-            f->size = Vector3Scale(f->size, Uniform(m_Rng, 0.95f, 1.15f));
+            // smaller than the region: a rewrite should change the shape only a little (the paper's jump continuity),
+            // and the descent grows it from inside the gap rather than shrinking it back out of the neighbours
+            f->size = Vector3Scale(f->size, Uniform(m_Rng, 0.5f, 0.8f));
             f->rounding = Chance(m_Rng, 0.5f) ? Uniform(m_Rng, 0.4f, 1.0f) : Uniform(m_Rng);
             return true;
         }
 
-        // ---- moves -----------------------------------------------------------------------------------------------------
+        // ---- descent: the continuous half of SRD ---------------------------------------------------------------------
 
-        bool Search::PerturbShape(Design& d, int s, float scale) {
+        // How far one unit of each kind of parameter moves it: comparable small changes for every kind, relative to
+        // the mesh's size where it is a length.
+        float Search::DofScale(Dof k) const {
             const float L = m_T.L;
-            SuperFrustum& f = d.shapes[s].sf;
-            float r = Uniform(m_Rng);
-            if (r < 0.32f) {
-                f.position = Vector3Add(f.position, Vector3Scale(RandomUnit(m_Rng), fabsf(Normal(m_Rng, 0.035f * L * scale))));
-            } else if (r < 0.54f) {
-                if (Chance(m_Rng, 0.5f)) {
-                    int a = Pick(m_Rng, 3);
-                    (&f.size.x)[a] *= expf(Normal(m_Rng, 0.18f * scale));
+            switch (k) {
+                case Dof::Pos: return 0.01f * L;
+                case Dof::LogSize: return 0.05f;         // 5% bigger or smaller
+                case Dof::Rot: return 0.05f;             // radians
+                case Dof::Rounding:
+                case Dof::Taper:
+                case Dof::Bulge: return 0.05f;
+                case Dof::Dilation: return 0.004f * L;
+                case Dof::Pivot: return 0.01f * L;
+                case Dof::Axis: return 0.05f;            // radians
+                case Dof::Angle: return 0.06f;           // radians
+                case Dof::Blend: return 0.004f * L;
+                case Dof::Timing: return 0.04f;          // share of the motion
+            }
+            return 1.0f;
+        }
+
+        // The continuous parameters of a design (or only those of the focused shape, hinge and group): per shape its
+        // position, size, rotation, rounding, taper, bulge and dilation; per hinge its pivot, axis and closing angle;
+        // per group of two or more shapes its blend. A shape's shell (onion) is left alone: it is all or nothing in
+        // effect, so a small step of it carries no useful slope.
+        std::vector<Param> Search::Params(const Design& d, const Focus* only) const {
+            std::vector<Param> ps = AllParams(d, only);
+            if (only && only->part >= 0)
+                ps.erase(std::remove_if(ps.begin(), ps.end(), [&](const Param& p) { return PartOf((int)p.dof) != only->part; }), ps.end());
+            return ps;
+        }
+
+        std::vector<Param> Search::AllParams(const Design& d, const Focus* only) const {
+            std::vector<Param> ps;
+            for (const Shape& sh : d.shapes) {
+                if (only && sh.id != only->shape) continue;
+                for (int a = 0; a < 3; a++) ps.push_back({ Dof::Pos, sh.id, a });
+                for (int a = 0; a < 3; a++) ps.push_back({ Dof::LogSize, sh.id, a });
+                for (int a = 0; a < 3; a++) ps.push_back({ Dof::Rot, sh.id, a });
+                ps.push_back({ Dof::Rounding, sh.id, 0 });
+                ps.push_back({ Dof::Taper, sh.id, 0 });
+                ps.push_back({ Dof::Bulge, sh.id, 0 });
+                ps.push_back({ Dof::Dilation, sh.id, 0 });
+            }
+            for (const Bakugan::Hinge& h : d.hinges) {
+                if (only && h.id != only->hinge) continue;
+                for (int a = 0; a < 3; a++) ps.push_back({ Dof::Pivot, h.id, a });
+                for (int a = 0; a < 3; a++) ps.push_back({ Dof::Axis, h.id, a });
+                ps.push_back({ Dof::Angle, h.id, 0 });
+                if (Timing()) {
+                    // closing window: where it sits, how long it is; the same for its own opening window
+                    ps.push_back({ Dof::Timing, h.id, 0 });
+                    ps.push_back({ Dof::Timing, h.id, 1 });
+                    if (h.ownOpening) {
+                        ps.push_back({ Dof::Timing, h.id, 2 });
+                        ps.push_back({ Dof::Timing, h.id, 3 });
+                    }
+                }
+            }
+            for (const Group& g : d.groups) {
+                if (only && g.id != only->group) continue;
+                if (d.GroupShapes(g.id).size() >= 2) ps.push_back({ Dof::Blend, g.id, 0 });
+            }
+            return ps;
+        }
+
+        // Moves every parameter by x[i] of its units, then pulls values back into range. Rotations collect their three
+        // components first and turn once, about the combined axis.
+        void Search::Step(Design& d, const std::vector<Param>& ps, const std::vector<float>& x) const {
+            std::unordered_map<int, Vector3> turnShape, turnAxis;
+            for (size_t i = 0; i < ps.size(); i++) {
+                const Param& p = ps[i];
+                float v = x[i] * DofScale(p.dof);
+                if (v == 0.0f) continue;
+                if (p.dof == Dof::Rot) {
+                    (&turnShape[p.id].x)[p.axis] += v;
+                } else if (p.dof == Dof::Axis) {
+                    (&turnAxis[p.id].x)[p.axis] += v;
+                } else if (p.dof <= Dof::Dilation) {
+                    int s = d.ShapeIndex(p.id);
+                    if (s < 0) continue;
+                    SuperFrustum& f = d.shapes[s].sf;
+                    switch (p.dof) {
+                        case Dof::Pos: (&f.position.x)[p.axis] += v; break;
+                        case Dof::LogSize: (&f.size.x)[p.axis] *= expf(v); break;
+                        case Dof::Rounding: f.rounding += v; break;
+                        case Dof::Taper: f.taper += v; break;
+                        case Dof::Bulge: f.bulge += v; break;
+                        case Dof::Dilation: f.dilation += v; break;
+                        default: break;
+                    }
+                } else if (p.dof == Dof::Timing) {
+                    int h = d.HingeIndex(p.id);
+                    if (h < 0) continue;
+                    Bakugan::Hinge& hg = d.hinges[h];
+                    float& a = p.axis < 2 ? hg.t0 : hg.o0;
+                    float& b = p.axis < 2 ? hg.t1 : hg.o1;
+                    if (p.axis % 2 == 0) { a += v; b += v; }               // slide the window
+                    else { a -= 0.5f * v; b += 0.5f * v; }                 // stretch it about its middle
+                } else if (p.dof == Dof::Blend) {
+                    int g = d.GroupIndex(p.id);
+                    if (g >= 0) d.groups[g].blend += v;
                 } else {
-                    float k = expf(Normal(m_Rng, 0.1f * scale));
-                    f.size = Vector3Scale(f.size, k);
-                }
-            } else if (r < 0.70f) {
-                f.rotation = Jiggle(f.rotation, 0.3f * scale, m_Rng);
-            } else if (r < 0.80f) {
-                // resize one side and shift by half as much: the opposite face stays put
-                int a = Pick(m_Rng, 3);
-                float before = (&f.size.x)[a];
-                (&f.size.x)[a] = fmaxf(before + Normal(m_Rng, 0.04f * L * scale), 0.01f * L);
-                float sign = Chance(m_Rng, 0.5f) ? 1.0f : -1.0f;
-                f.position = Vector3Add(f.position, Vector3Scale(f.Axis(a), sign * ((&f.size.x)[a] - before) * 0.5f));
-            } else {
-                switch (Pick(m_Rng, 5)) {
-                    case 0: f.rounding = std::clamp(f.rounding + Normal(m_Rng, 0.25f * scale), 0.0f, 1.0f); break;
-                    case 1: f.taper = std::clamp(f.taper + Normal(m_Rng, 0.25f * scale), 0.0f, 1.0f); break;
-                    case 2: f.bulge = std::clamp(f.bulge + Normal(m_Rng, 0.2f * scale), -1.0f, 1.0f); break;
-                    case 3: f.dilation = fmaxf(0.0f, f.dilation + Normal(m_Rng, 0.01f * L * scale)); break;
-                    case 4: f.onion = Chance(m_Rng, 0.7f) ? 0.0f : Uniform(m_Rng, 0.3f, 0.9f); break;
+                    int h = d.HingeIndex(p.id);
+                    if (h < 0) continue;
+                    if (p.dof == Dof::Pivot) (&d.hinges[h].pivot.x)[p.axis] += v;
+                    else if (p.dof == Dof::Angle) d.hinges[h].end += v;
                 }
             }
+            auto turn = [](Vector3 r) {
+                float a = Vector3Length(r);
+                return a > 1e-9f ? QuaternionFromAxisAngle(Vector3Scale(r, 1.0f / a), a) : QuaternionIdentity();
+            };
+            for (const auto& [id, r] : turnShape) {
+                int s = d.ShapeIndex(id);
+                if (s >= 0) d.shapes[s].sf.rotation = QuaternionNormalize(QuaternionMultiply(turn(r), d.shapes[s].sf.rotation));
+            }
+            for (const auto& [id, r] : turnAxis) {
+                int h = d.HingeIndex(id);
+                if (h >= 0) d.hinges[h].axis = Vector3Normalize(Vector3RotateByQuaternion(d.hinges[h].axis, turn(r)));
+            }
+            Project(d);
+        }
+
+        // The parameters the next descent step moves: one element of the design (a shape, a hinge or a blended
+        // group, each as likely as the next), and usually one kind of its parameters (a shape's position, size,
+        // rotation or profile; a hinge's pivot, axis or angle), now and then all of them. In few dimensions a random
+        // probe direction lines up with the gradient far more often.
+        Focus Search::RandomBlock(const Design& d) {
+            int blends = 0;
+            for (const Group& g : d.groups) blends += d.GroupShapes(g.id).size() >= 2;
+            int n = (int)d.shapes.size() + (int)d.hinges.size() + blends;
+            Focus f;
+            if (n == 0) return f;
+            int k = Pick(m_Rng, n);
+            bool all = Chance(m_Rng, 0.2f);
+            if (k < (int)d.shapes.size()) {
+                f.shape = d.shapes[k].id;
+                if (!all) f.part = Pick(m_Rng, 4);          // position, size, rotation, profile
+                return f;
+            }
+            k -= (int)d.shapes.size();
+            if (k < (int)d.hinges.size()) {
+                f.hinge = d.hinges[k].id;
+                if (!all) {
+                    int k2 = Pick(m_Rng, Timing() ? 4 : 3);   // pivot, axis, angle, timing
+                    f.part = k2 < 3 ? 4 + k2 : 8;
+                }
+                return f;
+            }
+            k -= (int)d.hinges.size();
+            for (const Group& g : d.groups)
+                if (d.GroupShapes(g.id).size() >= 2 && k-- == 0) { f.group = g.id; break; }
+            return f;
+        }
+
+        // One descent step on the parameters `ps` (one block, see RandomBlock), with an SPSA gradient (simultaneous
+        // perturbation stochastic approximation): every parameter in the block is pushed by +1 or -1 unit at random,
+        // all at once, and the score there against the score here gives the slope along that direction. The step
+        // goes downhill along it, by `lr` units at a typical slope (slopes are measured against their running RMS)
+        // and at most twice that (the paper's gradient clipping).
+        //
+        // This is where the paper and this code differ: there, the score is differentiable code and every step
+        // follows its exact gradient over all parameters at once. A sampled distance field score has no gradient to
+        // take, and a two-scoring SPSA estimate over every parameter at once is too noisy to descend on (it measured
+        // worse than standing still). So each step estimates the gradient of one block (randomized block coordinate
+        // descent), and a step is only taken if it lowers the score: whichever of the probe and the step is better
+        // replaces the design when it beats it. The current score is known exactly, so one probe gives the slope (a
+        // one-sided estimate): two scorings per step.
+        bool Search::DescentStep(State& cur, const std::vector<Param>& ps, float lr) {
+            if (ps.empty() || !cur.score.valid) return false;
+            std::vector<float> delta(ps.size());
+            for (float& x : delta) x = Chance(m_Rng, 0.5f) ? 1.0f : -1.0f;
+            State probe;
+            probe.design = cur.design;
+            Step(probe.design, ps, delta);
+            if (!Sanitize(probe.design)) return false;
+            probe.score = Evaluate(probe.design, nullptr);
+            if (!probe.score.valid) return false;
+            Consider(probe.design, probe.score);       // a real design: it may be the best so far
+            const float here = Objective(cur.score);
+            float slope = Objective(probe.score) - here;
+            m_SpsaRms = m_SpsaRms > 0.0f ? sqrtf(0.9f * m_SpsaRms * m_SpsaRms + 0.1f * slope * slope) : fabsf(slope);
+            State* best = &probe;
+            State next;
+            if (m_SpsaRms > 1e-12f) {
+                float g = std::clamp(slope / m_SpsaRms, -2.0f, 2.0f);
+                std::vector<float> step(ps.size());
+                for (size_t i = 0; i < ps.size(); i++) step[i] = -lr * g * delta[i];
+                next.design = cur.design;
+                Step(next.design, ps, step);
+                if (Sanitize(next.design)) {
+                    next.score = Evaluate(next.design, nullptr);
+                    if (next.score.valid) {
+                        Consider(next.design, next.score);
+                        if (Objective(next.score) < Objective(probe.score)) best = &next;
+                    }
+                }
+            }
+            if (Objective(best->score) >= here) return false;
+            cur.design = std::move(best->design);
+            cur.score = best->score;
             return true;
         }
 
-        bool Search::PerturbHinge(Design& d, int h, float scale) {
-            const float L = m_T.L;
-            Bakugan::Hinge& hg = d.hinges[h];
-            float r = Uniform(m_Rng);
-            if (r < 0.38f) {
-                // the closed pose only depends on the angle modulo a full turn (collisions are ignored)
-                hg.end = hg.start + WrapAngle(hg.end - hg.start + Normal(m_Rng, 0.35f * scale));
-            } else if (r < 0.46f) {
-                // a fresh angle, or a quarter / half turn
-                float turn = Chance(m_Rng, 0.5f) ? Uniform(m_Rng, -PI, PI) : (float)(Pick(m_Rng, 4) - 1) * PI * 0.5f;
-                if (turn == 0.0f) turn = PI;
-                hg.end = hg.start + turn;
-            } else if (r < 0.70f) {
-                hg.pivot = Vector3Add(hg.pivot, Vector3Scale(RandomUnit(m_Rng), fabsf(Normal(m_Rng, 0.035f * L * scale))));
-            } else if (r < 0.93f) {
-                Quaternion q = QuaternionFromAxisAngle(RandomUnit(m_Rng), Normal(m_Rng, 0.3f * scale));
-                hg.axis = Vector3Normalize(Vector3RotateByQuaternion(hg.axis, q));
-            } else {
-                // hang it from another body
-                std::vector<int> bodies = d.Bodies();
-                int b = d.groups[bodies[Pick(m_Rng, (int)bodies.size())]].id;
-                if (b == hg.parent || !d.CanHinge(b, hg.child, h)) return false;
-                hg.parent = b;
-                hg.pivot = PivotBetween(d, b, hg.child, BodyHint(d, b), BodyHint(d, hg.child));
-            }
-            return true;
+        // The paper's LocalOptimize, before a rewrite is judged: descent steps on just the parameters the rewrite
+        // created or changed, so a good idea that landed slightly off isn't judged by its first guess. The paper
+        // takes one exact gradient step; the estimated steps here are weaker, so up to `lookaheadSteps` are taken,
+        // stopping at the first that doesn't help.
+        void Search::Lookahead(State& cand, const Focus& f) {
+            std::vector<Param> ps = Params(cand.design, &f);
+            if (ps.empty()) return;
+            for (int k = 0; k < m_P.lookaheadSteps && m_Evaluations + 2 <= m_P.iterations; k++)
+                if (!DescentStep(cand, ps, m_P.stepSize)) break;
         }
 
-        // Small changes to the focused shape / hinge (or a random one): the continuous part of the grammar.
-        bool Search::Perturb(Design& d, const Focus& f, float scale) {
-            int s = d.ShapeIndex(f.shape), h = d.HingeIndex(f.hinge);
-            if (s >= 0 && h >= 0) return Chance(m_Rng, 0.6f) ? PerturbShape(d, s, scale) : PerturbHinge(d, h, scale);
-            if (s >= 0) return PerturbShape(d, s, scale);
-            if (h >= 0) return PerturbHinge(d, h, scale);
-            float r = Uniform(m_Rng);
-            if (!d.hinges.empty() && r < 0.24f) return PerturbHinge(d, Pick(m_Rng, (int)d.hinges.size()), scale);
-            if (r < 0.31f) {
-                // a group's blend (a body's own members, or a feature's)
-                int g = Pick(m_Rng, (int)d.groups.size());
-                if (d.groups.empty() || d.GroupShapes(d.groups[g].id).size() < 2) return false;
-                d.groups[g].blend = fmaxf(0.0f, d.groups[g].blend + Normal(m_Rng, 0.012f * m_T.L * scale));
-                if (Chance(m_Rng, 0.15f)) d.groups[g].blend = 0.0f;
-                return true;
-            }
-            if (d.shapes.empty()) return false;
-            return PerturbShape(d, Pick(m_Rng, (int)d.shapes.size()), scale);
-        }
+        // ---- rewrites: the discrete half of SRD ----------------------------------------------------------------------
 
-        // The discrete part of the grammar. False when the chosen change doesn't apply to this design.
-        bool Search::Structural(Design& d, const Diagnostics& dg, Focus* focus) {
-            enum Move { AddShape, AddCut, RemoveShape, ToggleOp, MoveShape, AddBody, SplitBody, RemoveBodyMove, MergeBodyMove,
-                        AddFeature, DissolveFeature, ToggleFeature, AddHinge, RemoveHinge, RemoveStray, CarveClash, Count };
-            float weight[Count] = { 3.0f, 1.2f, 1.6f, 0.6f, 0.8f, 1.2f, 1.2f, 0.4f, 0.8f, 0.5f, 0.4f, 0.3f, 1.0f, 0.2f, 1.0f, 1.2f };
-            if (dg.excess.empty()) weight[RemoveStray] = 0.0f;
-            if (dg.clashes.empty() || m_P.collisionWeight <= 0.0f) weight[CarveClash] = 0.0f;
-            if (!m_P.allowCuts) weight[AddCut] = weight[ToggleOp] = weight[ToggleFeature] = weight[CarveClash] = 0.0f;
-            if (!m_P.allowFeatures) weight[AddFeature] = weight[ToggleFeature] = 0.0f;
+        // Draws one rewrite for design d (with the diagnostics of its score), all its random choices made. False
+        // when the drawn kind doesn't apply to this design. Rewrite kinds are drawn with fixed weights (the paper
+        // draws them about evenly; additions are made a little more likely here, since they carry most early progress).
+        bool Search::Sample(const Design& d, const Diagnostics& dg, Rewrite* out) {
+            float weight[(int)Rule::Count] = {
+                2.0f, 1.0f, 1.5f, 0.6f, 0.8f,     // AddShape, AddCut, RemoveShape, ToggleOp, MoveShape
+                1.0f, 1.0f, 0.5f, 0.8f,           // AddBody, SplitBody, RemoveBody, MergeBody
+                0.5f, 0.4f, 0.3f,                 // AddFeature, DissolveFeature, ToggleFeature
+                1.0f, 0.3f, 0.6f, 1.2f,           // AddHinge, RemoveHinge, Rehang, TurnHinge
+                1.0f, 1.2f,                       // RemoveStray, CarveClash
+                0.8f, 0.3f                        // Retime, OwnOpening
+            };
+            auto off = [&](Rule r) { weight[(int)r] = 0.0f; };
+            if (!m_P.allowCuts) { off(Rule::AddCut); off(Rule::ToggleOp); off(Rule::ToggleFeature); off(Rule::CarveClash); }
+            if (!m_P.allowFeatures) { off(Rule::AddFeature); off(Rule::ToggleFeature); }
+            if (dg.excess.empty()) off(Rule::RemoveStray);
+            if (dg.clashes.empty() || m_P.collisionWeight <= 0.0f) off(Rule::CarveClash);
+            if (d.hinges.empty()) { off(Rule::RemoveHinge); off(Rule::Rehang); off(Rule::TurnHinge); off(Rule::MergeBody); }
+            if (d.hinges.empty() || !Timing()) { off(Rule::Retime); off(Rule::OwnOpening); }
             float sum = 0.0f;
             for (float w : weight) sum += w;
-            float r = Uniform(m_Rng) * sum;
-            int move = 0;
-            while (move < Count - 1 && r >= weight[move]) r -= weight[move++];
+            float pick = Uniform(m_Rng) * sum;
+            int k = 0;
+            while (k < (int)Rule::Count - 1 && pick >= weight[k]) pick -= weight[k++];
 
+            Rewrite r;
+            r.rule = (Rule)k;
             std::vector<int> bodies = d.Bodies();
-            int nBodies = (int)bodies.size();
-            bool roomShape = (int)d.shapes.size() < m_P.maxShapes, roomBody = nBodies < m_P.maxBodies;
-            switch (move) {
-                case AddShape: {
-                    if (!roomShape) return false;
-                    SuperFrustum f;
+            const int nBodies = (int)bodies.size();
+            auto randomBody = [&]() { return d.groups[bodies[Pick(m_Rng, nBodies)]].id; };
+            std::vector<int> features;
+            for (const Group& g : d.groups)
+                if (g.parent >= 0) features.push_back(g.id);
+            switch (r.rule) {
+                case Rule::AddShape: {
                     int g;
-                    if (!FitRegion(d, dg, false, &f, &g)) return false;
-                    int target = d.groups[g].id;
+                    if (!FitRegion(d, dg, false, &r.sf, &g)) return false;
+                    int body = d.groups[g].id;
+                    r.group = body;
                     // sometimes into one of the body's blended features
                     std::vector<int> feats;
-                    for (const Group& gr : d.groups)
-                        if (gr.parent >= 0 && gr.op == Op::Union && d.BodyOf(gr.id) == target) feats.push_back(gr.id);
-                    if (!feats.empty() && Chance(m_Rng, 0.3f)) target = feats[Pick(m_Rng, (int)feats.size())];
-                    int s = d.AddShape(f, target, "Shape");
-                    focus->shape = d.shapes[s].id;
-                    return true;
+                    for (int id : features) {
+                        const Group& gr = d.groups[d.GroupIndex(id)];
+                        if (gr.op == Op::Union && d.BodyOf(id) == body) feats.push_back(id);
+                    }
+                    if (!feats.empty() && Chance(m_Rng, 0.3f)) r.group = feats[Pick(m_Rng, (int)feats.size())];
+                    r.hasShape = true;
+                    r.uses = { Key('G', body), Key('G', r.group) };
+                    break;
                 }
-                case AddCut: {
-                    if (!roomShape) return false;
-                    SuperFrustum f;
+                case Rule::AddCut: {
                     int g;
-                    if (!FitRegion(d, dg, true, &f, &g)) return false;
-                    int s = d.AddShape(f, d.groups[g].id, "Cut", Op::Cut);
-                    focus->shape = d.shapes[s].id;
-                    return true;
+                    if (!FitRegion(d, dg, true, &r.sf, &g)) return false;
+                    r.group = d.groups[g].id;
+                    r.hasShape = true;
+                    r.uses = { Key('G', r.group) };
+                    break;
                 }
-                case RemoveShape: {
-                    if (d.shapes.size() <= 1) return false;
-                    int s = Pick(m_Rng, (int)d.shapes.size());
-                    int body = d.ShapeBody(s);
-                    if (d.AddsMaterial(s) && MaterialShapes(d, body) <= 1) return false;
-                    d.RemoveShape(s);
-                    return true;
-                }
-                case ToggleOp: {
+                case Rule::RemoveShape:
+                case Rule::ToggleOp: {
                     if (d.shapes.empty()) return false;
                     int s = Pick(m_Rng, (int)d.shapes.size());
-                    if (d.AddsMaterial(s) && MaterialShapes(d, d.ShapeBody(s)) <= 1) return false;
-                    Shape& sh = d.shapes[s];
-                    sh.op = sh.op == Op::Union ? Op::Cut : Op::Union;
-                    sh.color = sh.op == Op::Cut ? Color{ 225, 90, 90, 255 } : d.groups[d.GroupIndex(sh.group)].color;
-                    focus->shape = sh.id;
-                    return true;
+                    r.shape = d.shapes[s].id;
+                    r.owns = { Key('S', r.shape) };
+                    r.uses = { Key('G', d.ShapeBody(s)) };
+                    break;
                 }
-                case MoveShape: {
+                case Rule::MoveShape: {
                     if (nBodies < 2 || d.shapes.empty()) return false;
                     int s = Pick(m_Rng, (int)d.shapes.size());
                     int from = d.ShapeBody(s);
-                    if (d.AddsMaterial(s) && MaterialShapes(d, from) <= 1) return false;
-                    int to = d.groups[bodies[Pick(m_Rng, nBodies)]].id;
-                    if (to == from) return false;
-                    d.MoveShape(s, to);
-                    if (d.shapes[s].op == Op::Union) d.shapes[s].color = d.groups[d.GroupIndex(to)].color;
-                    focus->shape = d.shapes[s].id;
-                    return true;
+                    r.shape = d.shapes[s].id;
+                    r.other = randomBody();
+                    if (r.other == from) return false;
+                    r.owns = { Key('S', r.shape) };
+                    r.uses = { Key('G', from), Key('G', r.other) };
+                    break;
                 }
-                case AddBody: {
+                case Rule::AddBody: {
                     // a new piece where material is missing, hinged to the nearest body
-                    if (!roomShape || !roomBody) return false;
-                    SuperFrustum f;
                     int g;
-                    if (!FitRegion(d, dg, false, &f, &g)) return false;
-                    Vector3 at = f.position;
-                    int parent = d.groups[g].id;
-                    int nb = d.AddGroup("Body", -1);
-                    int body = d.groups[nb].id;
-                    int s = d.AddShape(f, body, "Shape");
-                    Vector3 pivot = PivotBetween(d, parent, body, BodyHint(d, parent), at);
-                    focus->shape = d.shapes[s].id;
-                    focus->hinge = AttachHinge(d, parent, body, pivot, at);
-                    return true;
+                    if (!FitRegion(d, dg, false, &r.sf, &g)) return false;
+                    r.group = d.groups[g].id;
+                    Design tmp = d;
+                    int body = tmp.groups[tmp.AddGroup("Body", -1)].id;
+                    tmp.AddShape(r.sf, body, "Shape");
+                    r.pivot = PivotBetween(tmp, r.group, body, BodyHint(tmp, r.group), r.sf.position);
+                    ChooseHinge(r.pivot, r.sf.position, &r.axis, &r.angle);
+                    r.hasShape = r.hasHinge = true;
+                    r.uses = { Key('G', r.group) };
+                    break;
                 }
-                case SplitBody: {
+                case Rule::SplitBody: {
                     // one shape of a body becomes a body of its own, hinged to what is left
-                    if (!roomBody) return false;
-                    int b = d.groups[bodies[Pick(m_Rng, nBodies)]].id;
+                    if (nBodies < 1) return false;
+                    int b = randomBody();
                     std::vector<int> mat;
                     for (int s : d.DirectShapes(b))
                         if (d.AddsMaterial(s)) mat.push_back(s);
                     if (mat.size() < 2) return false;
                     int s = mat[Pick(m_Rng, (int)mat.size())];
-                    int nb = d.AddGroup("Body", -1);
-                    int body = d.groups[nb].id;
-                    d.MoveShape(s, body);
-                    d.shapes[s].color = d.groups[nb].color;
+                    r.shape = d.shapes[s].id;
+                    Design tmp = d;
+                    int body = tmp.groups[tmp.AddGroup("Body", -1)].id;
+                    tmp.MoveShape(s, body);
                     Vector3 at = d.shapes[s].sf.position;
-                    Vector3 pivot = PivotBetween(d, b, body, BodyHint(d, b), at);
-                    focus->hinge = AttachHinge(d, b, body, pivot, at);
-                    return focus->hinge >= 0;
+                    r.pivot = PivotBetween(tmp, b, body, BodyHint(tmp, b), at);
+                    ChooseHinge(r.pivot, at, &r.axis, &r.angle);
+                    r.hasHinge = true;
+                    r.owns = { Key('S', r.shape) };
+                    r.uses = { Key('G', b) };
+                    break;
                 }
-                case RemoveBodyMove: {
+                case Rule::RemoveBody: {
                     if (nBodies < 2) return false;
-                    RemoveBody(d, d.groups[bodies[Pick(m_Rng, nBodies)]].id);
-                    return true;
+                    r.group = randomBody();
+                    r.owns = { Key('G', r.group), TreeKey };
+                    break;
                 }
-                case MergeBodyMove: {
-                    if (d.hinges.empty()) return false;
-                    return MergeBody(d, d.hinges[Pick(m_Rng, (int)d.hinges.size())].child);
+                case Rule::MergeBody: {
+                    const Bakugan::Hinge& h = d.hinges[Pick(m_Rng, (int)d.hinges.size())];
+                    r.group = h.child;
+                    r.owns = { Key('G', h.child), TreeKey };
+                    r.uses = { Key('G', h.parent) };
+                    break;
                 }
-                case AddFeature: {
+                case Rule::AddFeature: {
                     // one or two shapes of a group become a blended feature
-                    if (d.groups.empty()) return false;
                     int g = d.groups[Pick(m_Rng, (int)d.groups.size())].id;
                     std::vector<int> direct = d.DirectShapes(g);
                     if (direct.size() < 2) return false;
                     std::shuffle(direct.begin(), direct.end(), m_Rng);
-                    std::vector<int> ids = { d.shapes[direct[0]].id };
-                    if (Chance(m_Rng, 0.6f)) ids.push_back(d.shapes[direct[1]].id);
-                    int f = d.GroupItems(ids, {});
-                    int fi = d.GroupIndex(f);
-                    if (fi < 0 || d.groups[fi].parent < 0) return false;
-                    d.groups[fi].blend = Uniform(m_Rng, 0.01f, 0.06f) * m_T.L;
-                    return true;
+                    r.shapes = { d.shapes[direct[0]].id };
+                    if (Chance(m_Rng, 0.6f)) r.shapes.push_back(d.shapes[direct[1]].id);
+                    r.value = Uniform(m_Rng, 0.01f, 0.04f) * m_T.L;
+                    for (int id : r.shapes) r.owns.push_back(Key('S', id));
+                    r.uses = { Key('G', g) };
+                    break;
                 }
-                case DissolveFeature: {
-                    std::vector<int> feats;
-                    for (int g = 0; g < (int)d.groups.size(); g++)
-                        if (d.groups[g].parent >= 0) feats.push_back(g);
-                    if (feats.empty()) return false;
-                    d.Ungroup(feats[Pick(m_Rng, (int)feats.size())]);
-                    return true;
+                case Rule::DissolveFeature:
+                case Rule::ToggleFeature: {
+                    if (features.empty()) return false;
+                    r.group = features[Pick(m_Rng, (int)features.size())];
+                    r.owns = { Key('G', r.group) };
+                    r.uses = { Key('G', d.BodyOf(r.group)) };
+                    break;
                 }
-                case ToggleFeature: {
-                    std::vector<int> feats;
-                    for (int g = 0; g < (int)d.groups.size(); g++)
-                        if (d.groups[g].parent >= 0) feats.push_back(g);
-                    if (feats.empty()) return false;
-                    Group& gr = d.groups[feats[Pick(m_Rng, (int)feats.size())]];
-                    gr.op = gr.op == Op::Union ? Op::Cut : Op::Union;
-                    return MaterialShapes(d, d.BodyOf(gr.id)) > 0;
-                }
-                case AddHinge: {
+                case Rule::AddHinge: {
                     // hang a loose body on the nearest body it can hang from
                     std::vector<int> roots = Roots(d);
                     if (roots.size() < 2) return false;
-                    int child = roots[Pick(m_Rng, (int)roots.size())];
-                    Vector3 at = BodyHint(d, child);
-                    int g = NearestBody(d, at, child);
+                    r.group = roots[Pick(m_Rng, (int)roots.size())];
+                    Vector3 at = BodyHint(d, r.group);
+                    int g = NearestBody(d, at, r.group);
                     if (g < 0) return false;
-                    int parent = d.groups[g].id;
-                    if (!d.CanHinge(parent, child)) {
-                        int other = d.groups[bodies[Pick(m_Rng, nBodies)]].id;
-                        if (!d.CanHinge(other, child)) return false;
-                        parent = other;
+                    r.other = d.groups[g].id;
+                    if (!d.CanHinge(r.other, r.group)) {
+                        r.other = randomBody();
+                        if (!d.CanHinge(r.other, r.group)) return false;
                     }
-                    Vector3 pivot = PivotBetween(d, parent, child, BodyHint(d, parent), at);
-                    focus->hinge = AttachHinge(d, parent, child, pivot, at);
-                    return focus->hinge >= 0;
+                    r.pivot = PivotBetween(d, r.other, r.group, BodyHint(d, r.other), at);
+                    ChooseHinge(r.pivot, at, &r.axis, &r.angle);
+                    r.hasHinge = true;
+                    r.owns = { TreeKey, Key('G', r.group) };
+                    r.uses = { Key('G', r.other) };
+                    break;
                 }
-                case RemoveHinge: {
-                    if (d.hinges.empty()) return false;
-                    d.RemoveHinge(Pick(m_Rng, (int)d.hinges.size()));
-                    return true;
+                case Rule::RemoveHinge: {
+                    r.hinge = d.hinges[Pick(m_Rng, (int)d.hinges.size())].id;
+                    r.owns = { TreeKey, Key('H', r.hinge) };
+                    break;
                 }
-                case RemoveStray: {
-                    // the shape that put material off the mesh at a spot the score found
+                case Rule::Rehang: {
+                    // hang a body from another one
+                    const Bakugan::Hinge& h = d.hinges[Pick(m_Rng, (int)d.hinges.size())];
+                    r.hinge = h.id;
+                    r.other = randomBody();
+                    if (r.other == h.parent || !d.CanHinge(r.other, h.child, d.HingeIndex(h.id))) return false;
+                    r.pivot = PivotBetween(d, r.other, h.child, BodyHint(d, r.other), BodyHint(d, h.child));
+                    r.owns = { TreeKey, Key('H', r.hinge) };
+                    r.uses = { Key('G', r.other) };
+                    break;
+                }
+                case Rule::TurnHinge: {
+                    // a large turn the descent can't make in small steps: anywhere, or a quarter / half turn on
+                    const Bakugan::Hinge& h = d.hinges[Pick(m_Rng, (int)d.hinges.size())];
+                    r.hinge = h.id;
+                    r.angle = Chance(m_Rng, 0.5f) ? Uniform(m_Rng, -PI, PI)
+                                                  : WrapAngle(h.end - h.start + (float)(1 + Pick(m_Rng, 3)) * PI * 0.5f);
+                    r.owns = { Key('H', r.hinge) };
+                    break;
+                }
+                case Rule::Retime: {
+                    // a new window for when a hinge turns: anywhere, or just before or after another hinge's (folding
+                    // one part out of the way of another first is a jump the descent can't make in small steps)
+                    const Bakugan::Hinge& h = d.hinges[Pick(m_Rng, (int)d.hinges.size())];
+                    r.hinge = h.id;
+                    r.hasTiming = true;
+                    r.ownOpening = h.ownOpening;
+                    r.t0 = h.t0; r.t1 = h.t1; r.o0 = h.o0; r.o1 = h.o1;
+                    bool opening = h.ownOpening && Chance(m_Rng, 0.5f);
+                    float w = Uniform(m_Rng, 0.2f, 0.8f), a = Uniform(m_Rng, 0.0f, 1.0f - w);
+                    if (d.hinges.size() >= 2 && Chance(m_Rng, 0.5f)) {
+                        const Bakugan::Hinge& o = d.hinges[Pick(m_Rng, (int)d.hinges.size())];
+                        float oa = opening ? o.o0 : o.t0, ob = opening ? o.o1 : o.t1;
+                        a = Chance(m_Rng, 0.5f) ? ob : oa - w;                 // after it, or before it
+                        a = std::clamp(a, 0.0f, 1.0f - w);
+                    }
+                    (opening ? r.o0 : r.t0) = a;
+                    (opening ? r.o1 : r.t1) = a + w;
+                    r.owns = { Key('H', r.hinge) };
+                    break;
+                }
+                case Rule::OwnOpening: {
+                    // a hinge opens on its own timing (a window of the opening motion), or goes back to retracing its
+                    // closing in reverse
+                    const Bakugan::Hinge& h = d.hinges[Pick(m_Rng, (int)d.hinges.size())];
+                    r.hinge = h.id;
+                    r.hasTiming = true;
+                    r.t0 = h.t0; r.t1 = h.t1;
+                    r.ownOpening = !h.ownOpening;
+                    float w = Uniform(m_Rng, 0.2f, 0.8f), a = Uniform(m_Rng, 0.0f, 1.0f - w);
+                    r.o0 = a;
+                    r.o1 = a + w;
+                    r.owns = { Key('H', r.hinge) };
+                    break;
+                }
+                case Rule::RemoveStray: {
+                    // the shape that put material off the mesh at a spot the score found: removed, or shrunk towards
+                    // the mesh
                     const Spot& sp = dg.excess[Pick(m_Rng, (int)dg.excess.size())];
-                    if (sp.body < 0 || sp.body >= (int)d.groups.size()) return false;
+                    if (sp.body < 0 || sp.body >= (int)d.groups.size() || d.groups[sp.body].parent >= 0) return false;
                     int body = d.groups[sp.body].id;
                     Vector3 q = d.Transforms(0.0f, false)[sp.body].ApplyInverse(sp.p);
-                    int pick = -1;
-                    float best = FLT_MAX;
+                    int best = -1;
+                    float bd = FLT_MAX;
                     for (int s : d.GroupShapes(body)) {
                         if (!d.AddsMaterial(s)) continue;
                         float dd = d.shapes[s].sf.Distance(q);
-                        if (dd < best) { best = dd; pick = s; }
+                        if (dd < bd) { bd = dd; best = s; }
                     }
-                    if (pick < 0 || MaterialShapes(d, body) <= 1) return false;
+                    if (best < 0) return false;
+                    r.shape = d.shapes[best].id;
                     if (Chance(m_Rng, 0.5f)) {
-                        d.RemoveShape(pick);
-                    } else {
-                        // or pull it back: shrink it towards the mesh
-                        SuperFrustum& f = d.shapes[pick].sf;
-                        Vector3 toward = Vector3Subtract(m_T.centre, f.position);
-                        f.size = Vector3Scale(f.size, Uniform(m_Rng, 0.5f, 0.85f));
-                        f.position = Vector3Add(f.position, Vector3Scale(toward, Uniform(m_Rng, 0.0f, 0.3f)));
-                        focus->shape = d.shapes[pick].id;
+                        r.sf = d.shapes[best].sf;
+                        Vector3 toward = Vector3Subtract(m_T.centre, r.sf.position);
+                        r.sf.size = Vector3Scale(r.sf.size, Uniform(m_Rng, 0.5f, 0.85f));
+                        r.sf.position = Vector3Add(r.sf.position, Vector3Scale(toward, Uniform(m_Rng, 0.0f, 0.3f)));
+                        r.hasShape = true;
                     }
-                    return true;
+                    r.owns = { Key('S', r.shape) };
+                    r.uses = { Key('G', body) };
+                    break;
                 }
-                case CarveClash: {
+                case Rule::CarveClash: {
                     // a cut in one of two overlapping bodies, fitted to where they overlap
-                    int k = Pick(m_Rng, (int)dg.clashes.size());
-                    int ga = dg.clashes[k].body, gb = dg.clashOther[k];
+                    int k2 = Pick(m_Rng, (int)dg.clashes.size());
+                    int ga = dg.clashes[k2].body, gb = dg.clashOther[k2];
                     if (ga < 0 || gb < 0 || ga >= (int)d.groups.size() || gb >= (int)d.groups.size()) return false;
-                    if ((int)d.shapes.size() >= m_P.maxShapes) return false;
                     if (Chance(m_Rng, 0.5f)) std::swap(ga, gb);
-                    std::vector<Rigid> xf = d.Transforms(dg.clashClosed[k] ? 1.0f : 0.0f, false);
+                    std::vector<Rigid> xf = d.Transforms(dg.clashT[k2], true, dg.clashOpening[k2] ? Motion::Opening : Motion::Closing);
                     BodyField fa = BodyField::Body(d, d.groups[ga].id), fb = BodyField::Body(d, d.groups[gb].id);
                     if (fa.Empty() || fb.Empty()) return false;
                     float rho = m_T.L * Uniform(m_Rng, 0.04f, 0.15f);
@@ -1455,27 +2278,300 @@ namespace Bakugan {
                         Vector3 p;
                         do p = { Uniform(m_Rng, -1, 1), Uniform(m_Rng, -1, 1), Uniform(m_Rng, -1, 1) };
                         while (Vector3LengthSqr(p) > 1.0f);
-                        p = Vector3Add(dg.clashes[k].p, Vector3Scale(p, rho));
+                        p = Vector3Add(dg.clashes[k2].p, Vector3Scale(p, rho));
                         Vector3 qa = xf[ga].ApplyInverse(p);
                         if (fa.Distance(qa) < 0.0f && fb.Distance(xf[gb].ApplyInverse(p)) < 0.0f) keep.push_back(qa);
                     }
                     if (keep.size() < 10) return false;
-                    SuperFrustum f = BoxAround(keep, 0.02f, 0.015f * m_T.L);
-                    f.size = Vector3Scale(f.size, Uniform(m_Rng, 1.05f, 1.3f));
-                    f.rounding = Uniform(m_Rng);
-                    int s = d.AddShape(f, d.groups[ga].id, "Cut", Op::Cut);
-                    focus->shape = d.shapes[s].id;
+                    r.sf = BoxAround(keep, 0.02f, 0.015f * m_T.L);
+                    r.sf.size = Vector3Scale(r.sf.size, Uniform(m_Rng, 1.05f, 1.3f));
+                    r.sf.rounding = Uniform(m_Rng);
+                    r.hasShape = true;
+                    r.group = d.groups[ga].id;
+                    r.uses = { Key('G', r.group) };
+                    break;
+                }
+                case Rule::Count:
+                    return false;
+            }
+            *out = std::move(r);
+            return true;
+        }
+
+        // Applies a rewrite (sampled for this design, or for one it was combined into). False when it no longer
+        // applies: what it acts on is gone, or it would leave a body without material. The shapes and hinges it
+        // creates or changes go into *f, for the lookahead.
+        // Applies a rewrite, then the timing its lookahead found (or it drew) to the hinge it touched.
+        bool Search::Apply(Design& d, const Rewrite& r, Focus* f) const {
+            if (!ApplyRule(d, r, f)) return false;
+            if (r.hasTiming) {
+                int h = d.HingeIndex(f->hinge >= 0 ? f->hinge : r.hinge);
+                if (h >= 0) {
+                    Bakugan::Hinge& hg = d.hinges[h];
+                    hg.t0 = r.t0; hg.t1 = r.t1;
+                    hg.ownOpening = r.ownOpening;
+                    hg.o0 = r.o0; hg.o1 = r.o1;
+                    ClampTiming(hg);
+                    if (f->hinge < 0) f->hinge = hg.id;
+                }
+            }
+            return true;
+        }
+
+        bool Search::ApplyRule(Design& d, const Rewrite& r, Focus* f) const {
+            auto isBody = [&](int id) {
+                int g = d.GroupIndex(id);
+                return g >= 0 && d.groups[g].parent < 0;
+            };
+            auto roomShape = [&]() { return (int)d.shapes.size() < m_P.maxShapes; };
+            auto roomBody = [&]() { return (int)d.Bodies().size() < m_P.maxBodies; };
+            // the shape's values found by the lookahead
+            auto tuned = [&](int s) {
+                if (r.hasShape) d.shapes[s].sf = r.sf;
+                f->shape = d.shapes[s].id;
+            };
+            auto lastMaterial = [&](int s) { return d.AddsMaterial(s) && MaterialShapes(d, d.ShapeBody(s)) <= 1; };
+            switch (r.rule) {
+                case Rule::AddShape: {
+                    if (d.GroupIndex(r.group) < 0 || !roomShape()) return false;
+                    f->shape = d.shapes[d.AddShape(r.sf, r.group, "Shape")].id;
                     return true;
                 }
+                case Rule::AddCut:
+                case Rule::CarveClash: {
+                    if (!isBody(r.group) || !roomShape()) return false;
+                    f->shape = d.shapes[d.AddShape(r.sf, r.group, "Cut", Op::Cut)].id;
+                    return true;
+                }
+                case Rule::RemoveShape: {
+                    int s = d.ShapeIndex(r.shape);
+                    if (s < 0 || d.shapes.size() <= 1 || lastMaterial(s)) return false;
+                    d.RemoveShape(s);
+                    return true;
+                }
+                case Rule::ToggleOp: {
+                    int s = d.ShapeIndex(r.shape);
+                    if (s < 0 || lastMaterial(s)) return false;
+                    Shape& sh = d.shapes[s];
+                    sh.op = sh.op == Op::Union ? Op::Cut : Op::Union;
+                    sh.color = sh.op == Op::Cut ? Color{ 225, 90, 90, 255 } : d.groups[d.GroupIndex(sh.group)].color;
+                    tuned(s);
+                    return true;
+                }
+                case Rule::MoveShape: {
+                    int s = d.ShapeIndex(r.shape);
+                    if (s < 0 || !isBody(r.other) || d.ShapeBody(s) == r.other || lastMaterial(s)) return false;
+                    d.MoveShape(s, r.other);
+                    if (d.shapes[s].op == Op::Union) d.shapes[s].color = d.groups[d.GroupIndex(r.other)].color;
+                    tuned(s);
+                    return true;
+                }
+                case Rule::AddBody: {
+                    if (!isBody(r.group) || !roomShape() || !roomBody()) return false;
+                    int body = d.groups[d.AddGroup("Body", -1)].id;
+                    f->shape = d.shapes[d.AddShape(r.sf, body, "Shape")].id;
+                    if (!d.CanHinge(r.group, body)) return false;
+                    int h = d.AddHinge(r.group, body);
+                    SetupHinge(d, h, r.pivot, r.axis, r.angle, true);
+                    f->hinge = d.hinges[h].id;
+                    return true;
+                }
+                case Rule::SplitBody: {
+                    int s = d.ShapeIndex(r.shape);
+                    if (s < 0 || !roomBody()) return false;
+                    int from = d.ShapeBody(s);
+                    // a body's own material shape, and not its last
+                    if (d.shapes[s].group != from || !d.AddsMaterial(s) || MaterialShapes(d, from) <= 1) return false;
+                    int nb = d.AddGroup("Body", -1);
+                    int body = d.groups[nb].id;
+                    d.MoveShape(s, body);
+                    d.shapes[s].color = d.groups[nb].color;
+                    if (!d.CanHinge(from, body)) return false;
+                    int h = d.AddHinge(from, body);
+                    SetupHinge(d, h, r.pivot, r.axis, r.angle, true);
+                    f->hinge = d.hinges[h].id;
+                    return true;
+                }
+                case Rule::RemoveBody: {
+                    if (!isBody(r.group) || d.Bodies().size() <= 1) return false;
+                    RemoveBody(d, r.group);
+                    return true;
+                }
+                case Rule::MergeBody: {
+                    if (!isBody(r.group)) return false;
+                    return MergeBody(d, r.group);
+                }
+                case Rule::AddFeature: {
+                    int parent = -1;
+                    for (int id : r.shapes) {
+                        int s = d.ShapeIndex(id);
+                        if (s < 0 || (parent >= 0 && d.shapes[s].group != parent)) return false;
+                        parent = d.shapes[s].group;
+                    }
+                    if (parent < 0) return false;
+                    int g = d.GroupIndex(d.GroupItems(r.shapes, {}));
+                    if (g < 0 || d.groups[g].parent < 0) return false;
+                    d.groups[g].blend = r.value;
+                    return true;
+                }
+                case Rule::DissolveFeature: {
+                    int g = d.GroupIndex(r.group);
+                    if (g < 0 || d.groups[g].parent < 0) return false;
+                    d.Ungroup(g);
+                    return true;
+                }
+                case Rule::ToggleFeature: {
+                    int g = d.GroupIndex(r.group);
+                    if (g < 0 || d.groups[g].parent < 0) return false;
+                    d.groups[g].op = d.groups[g].op == Op::Union ? Op::Cut : Op::Union;
+                    return MaterialShapes(d, d.BodyOf(r.group)) > 0;
+                }
+                case Rule::AddHinge: {
+                    if (!isBody(r.group) || !isBody(r.other) || d.ParentHinge(r.group) >= 0 || !d.CanHinge(r.other, r.group)) return false;
+                    int h = d.AddHinge(r.other, r.group);
+                    SetupHinge(d, h, r.pivot, r.axis, r.angle, true);
+                    f->hinge = d.hinges[h].id;
+                    return true;
+                }
+                case Rule::RemoveHinge: {
+                    int h = d.HingeIndex(r.hinge);
+                    if (h < 0) return false;
+                    d.RemoveHinge(h);
+                    return true;
+                }
+                case Rule::Rehang: {
+                    int h = d.HingeIndex(r.hinge);
+                    if (h < 0 || !isBody(r.other) || !d.CanHinge(r.other, d.hinges[h].child, h)) return false;
+                    d.hinges[h].parent = r.other;
+                    d.hinges[h].pivot = r.pivot;
+                    if (r.hasHinge) SetupHinge(d, h, r.pivot, r.axis, r.angle, false);
+                    f->hinge = r.hinge;
+                    return true;
+                }
+                case Rule::TurnHinge: {
+                    int h = d.HingeIndex(r.hinge);
+                    if (h < 0) return false;
+                    if (r.hasHinge) SetupHinge(d, h, r.pivot, r.axis, r.angle, false);
+                    else d.hinges[h].end = d.hinges[h].start + r.angle;
+                    f->hinge = r.hinge;
+                    return true;
+                }
+                case Rule::Retime:
+                case Rule::OwnOpening: {
+                    if (d.HingeIndex(r.hinge) < 0) return false;
+                    f->hinge = r.hinge;                  // Apply sets the timing
+                    return true;
+                }
+                case Rule::RemoveStray: {
+                    int s = d.ShapeIndex(r.shape);
+                    if (s < 0) return false;
+                    if (r.hasShape) {
+                        tuned(s);
+                        return true;
+                    }
+                    if (lastMaterial(s) || !d.AddsMaterial(s)) return false;
+                    d.RemoveShape(s);
+                    return true;
+                }
+                case Rule::Count:
+                    break;
             }
             return false;
         }
 
-        bool Search::Propose(Design& d, const Diagnostics& dg, float progress, Focus* focus, bool* small) {
-            float structural = 0.08f + 0.3f * (1.0f - progress);
-            *small = !Chance(m_Rng, structural);
-            if (!*small) return Structural(d, dg, focus);
-            return Perturb(d, Focus{}, m_Step);
+        // Writes what the lookahead settled on back into the rewrite, so applying it again (combined with other
+        // rewrites) gives the tuned shape and hinge rather than the first guess.
+        void Search::Remember(Rewrite& r, const Design& d, const Focus& f) const {
+            int s = d.ShapeIndex(f.shape);
+            if (s >= 0) {
+                r.sf = d.shapes[s].sf;
+                r.hasShape = true;
+            }
+            int h = d.HingeIndex(f.hinge);
+            if (h >= 0) {
+                const Bakugan::Hinge& hg = d.hinges[h];
+                r.pivot = hg.pivot;
+                r.axis = hg.axis;
+                r.angle = hg.end - hg.start;
+                r.hasHinge = true;
+                r.hasTiming = true;
+                r.t0 = hg.t0; r.t1 = hg.t1;
+                r.ownOpening = hg.ownOpening;
+                r.o0 = hg.o0; r.o1 = hg.o1;
+            }
+        }
+
+        // One rewrite round: score the current design exactly (its diagnostics guide the sampling), draw rewrites,
+        // give each a lookahead, and apply every one that improved the objective by more than a small threshold, best
+        // first, skipping any that conflict with one already taken: all at once (the paper's greedy selection). Should
+        // the combination score worse than the best rewrite alone (rewrites can interact), that one alone is taken.
+        // Returns how many rewrites were applied.
+        int Search::RewriteRound(State& cur) {
+            const int N = m_P.iterations;
+            cur.score = Evaluate(cur.design, &cur.diag);
+            if (!cur.score.valid) return 0;
+            Consider(cur.design, cur.score);
+            m_Score = cur.score;
+            const float base = Objective(cur.score);
+            const float threshold = fmaxf(1e-4f, 1e-3f * base);
+            struct Kept {
+                Rewrite r;
+                State s;
+            };
+            std::vector<Kept> kept;
+            int drawn = 0;
+            for (int tries = 0; drawn < m_P.rewritesPerRound && tries < 4 * m_P.rewritesPerRound; tries++) {
+                if (m_Evaluations >= N || m_C.Cancelled()) break;
+                Rewrite r;
+                if (!Sample(cur.design, cur.diag, &r)) continue;
+                State cand;
+                cand.design = cur.design;
+                Focus f;
+                if (!Apply(cand.design, r, &f) || !Sanitize(cand.design)) continue;
+                drawn++;
+                cand.score = Evaluate(cand.design, nullptr);
+                if (!cand.score.valid) continue;
+                Consider(cand.design, cand.score);
+                // a lookahead step costs two scorings: spent on rewrites that landed close enough for it to matter
+                bool close = base - Objective(cand.score) > -0.1f * base;
+                if (close && (f.shape >= 0 || f.hinge >= 0)) Lookahead(cand, f);
+                Remember(r, cand.design, f);
+                r.gain = base - Objective(cand.score);
+                if (r.gain > threshold) kept.push_back({ std::move(r), std::move(cand) });
+            }
+            if (kept.empty()) return 0;
+            std::sort(kept.begin(), kept.end(), [](const Kept& a, const Kept& b) { return a.r.gain > b.r.gain; });
+            std::vector<const Rewrite*> chosen;
+            for (const Kept& k : kept) {
+                bool clash = false;
+                for (const Rewrite* c : chosen) clash = clash || Conflict(k.r, *c);
+                if (!clash) chosen.push_back(&k.r);
+            }
+            if (chosen.size() > 1) {
+                Design combined = cur.design;
+                int applied = 0;
+                for (const Rewrite* r : chosen) {
+                    Design t = combined;
+                    Focus f;
+                    if (Apply(t, *r, &f) && Sanitize(t)) {
+                        combined = std::move(t);
+                        applied++;
+                    }
+                }
+                if (applied > 1) {
+                    AutoScore cs = Evaluate(combined, nullptr);
+                    if (cs.valid) {
+                        Consider(combined, cs);
+                        if (Objective(cs) <= Objective(kept[0].s.score)) {
+                            cur.design = std::move(combined);
+                            cur.score = cs;
+                            return applied;
+                        }
+                    }
+                }
+            }
+            cur = std::move(kept[0].s);
+            return 1;
         }
 
         // Keeps a design inside the space the search works in. False rejects it.
@@ -1527,17 +2623,62 @@ namespace Bakugan {
             d.Repair();
         }
 
-        void Search::Publish(const State& best, int iteration, bool force) {
+        // The paper's projection to constraints: after a descent step, values are pulled back into their ranges (a
+        // step should be clamped, not thrown away the way Sanitize would throw away the design).
+        void Search::Project(Design& d) const {
+            auto pull = [&](Vector3& p) {
+                Vector3 off = Vector3Subtract(p, m_T.centre);
+                float l = Vector3Length(off);
+                if (l > m_Reach) p = Vector3Add(m_T.centre, Vector3Scale(off, 0.999f * m_Reach / l));
+            };
+            for (Shape& sh : d.shapes) {
+                SuperFrustum& f = sh.sf;
+                for (int a = 0; a < 3; a++) (&f.size.x)[a] = std::clamp((&f.size.x)[a], m_MinSize, m_MaxSize);
+                f.rounding = std::clamp(f.rounding, 0.0f, 1.0f);
+                f.taper = std::clamp(f.taper, 0.0f, 1.0f);
+                f.bulge = std::clamp(f.bulge, -1.0f, 1.0f);
+                f.dilation = std::clamp(f.dilation, 0.0f, m_MaxDilation);
+                pull(f.position);
+            }
+            for (Group& g : d.groups) g.blend = std::clamp(g.blend, 0.0f, m_MaxBlend);
+            for (Bakugan::Hinge& h : d.hinges) {
+                pull(h.pivot);
+                h.axis = Vector3Length(h.axis) > 1e-6f ? Vector3Normalize(h.axis) : Vector3{ 0, 1, 0 };
+                if (Timing()) ClampTiming(h);
+            }
+        }
+
+        // Every design scored exactly is a candidate for the result: the start, every probe, every rewrite.
+        void Search::Consider(const Design& d, const AutoScore& s) {
+            if (!s.valid) return;
+            if (m_Best.score.valid && Objective(s) >= Objective(m_Best.score) - 1e-6f) return;
+            m_Best.design = d;
+            m_Best.score = s;
+            if (s.silhouettes) {
+                // Consider always follows the scoring of this design, so the last outlines are its
+                m_BestOpen = m_LastOpen;
+                m_BestClosed = m_LastClosed;
+            }
+            Publish(false);
+        }
+
+        void Search::Publish(bool force) {
             if (!m_Live) return;
             Clock::time_point now = Clock::now();
             if (!force && now - m_LastPublish < std::chrono::milliseconds(250)) return;
             m_LastPublish = now;
-            Design d = best.design;
+            Design d = m_Best.design;
             Finalize(d);
+            std::vector<unsigned char> views;
+            int vw = 0, vh = 0;
+            if (m_Best.score.silhouettes) ViewsImage(&views, &vw, &vh);
             std::lock_guard<std::mutex> l(m_Live->mutex);
+            m_Live->views = std::move(views);
+            m_Live->viewsWidth = vw;
+            m_Live->viewsHeight = vh;
             m_Live->best = std::move(d);
-            m_Live->score = best.score;
-            m_Live->iteration = iteration;
+            m_Live->score = m_Best.score;
+            m_Live->iteration = m_Evaluations;
             m_Live->version++;
         }
 
@@ -1619,7 +2760,7 @@ namespace Bakugan {
                 for (int a : tree)
                     for (int c : order) {
                         if (std::find(tree.begin(), tree.end(), c) != tree.end()) continue;
-                        Vector3 mid = (Vector3){ 0 };
+                        Vector3 mid = { 0, 0, 0 };
                         float g = gapBetween(a, c, &mid);
                         if (g < best) { best = g; bp = a; bc = c; bmid = mid; }
                     }
@@ -1664,6 +2805,11 @@ namespace Bakugan {
 
         // ---- the run ---------------------------------------------------------------------------------------------------
 
+        // Stochastic Rewrite Descent: rounds of descent steps (structure fixed) and rewrite batches (structure
+        // changing), until the scorings run out. The descent step size follows the success rate of the steps and goes
+        // back to full size after every rewrite round, when the structure has changed under it (as the paper's code
+        // raises its step after each round). Every design scored exactly is a candidate for the result; should the
+        // search wander far from the best, it starts again from there.
         AutoResult Search::Run(const Design& start) {
             AutoResult res;
             if (!Prepare()) {
@@ -1679,121 +2825,121 @@ namespace Bakugan {
             m_P.minBodies = std::min(m_P.minBodies, (int)cur.design.Bodies().size());
             if (!Sanitize(cur.design))
                 for (Bakugan::Hinge& h : cur.design.hinges) h.hardware = false;
+            Project(cur.design);
+            m_Ramp = 0.1f;
             cur.score = Evaluate(cur.design, &cur.diag);
             if (!cur.score.valid) { res.message = "Could not score the starting design."; return res; }
-            State best = cur;
-            Publish(best, 0, true);
+            m_Best = cur;
+            m_BestOpen = m_LastOpen;
+            m_BestClosed = m_LastClosed;
+            Publish(true);
 
             const int N = std::max(0, m_P.iterations);
+            m_P.iterations = N;
             // evenly spaced snapshots of the best design, for a recording of the run
             int recordCount = 0, recorded = 0;
             if (m_Live) {
                 std::lock_guard<std::mutex> l(m_Live->mutex);
                 recordCount = m_Live->recordFrames;
                 m_Live->frames.clear();
+                m_Live->iterations = N;
+                m_Live->history.clear();
+                m_Live->history.push_back(m_Best.score.total);
             }
-            auto record = [&](int iteration, bool last) {
+            auto record = [&](bool last) {
                 if (recordCount <= 0) return;
                 while (recorded < recordCount &&
-                       (last || (long long)iteration * std::max(1, recordCount - 1) >= (long long)recorded * std::max(1, N))) {
+                       (last || (long long)m_Evaluations * std::max(1, recordCount - 1) >= (long long)recorded * std::max(1, N))) {
                     AutoFrame f;
-                    f.design = best.design;
+                    f.design = m_Best.design;
                     Finalize(f.design);
-                    f.score = best.score;
-                    f.iteration = iteration;
+                    f.score = m_Best.score;
+                    f.iteration = std::min(m_Evaluations, N);
                     std::lock_guard<std::mutex> l(m_Live->mutex);
                     m_Live->frames.push_back(std::move(f));
                     recorded++;
                 }
             };
-            record(0, false);
-            // collisions start cheap and reach their full weight at 60% of the run: hinges and folds get to form
-            // before overlaps between the bodies have to be carved or moved away
-            float ramp = 0.1f;
-            auto objective = [&](const AutoScore& sc) { return sc.base + ramp * m_P.collisionWeight * sc.collision; };
-            const float T0 = 0.004f, T1 = 0.00005f;
-            int it = 0, accepted = 0, sinceBest = 0;
             int historyEvery = std::max(1, N / 240), nextHistory = historyEvery;
-            if (m_Live) {
-                std::lock_guard<std::mutex> l(m_Live->mutex);
-                m_Live->iterations = N;
-                m_Live->history.clear();
-                m_Live->history.push_back(best.score.total);
-            }
-            m_C.SetStage("Searching");
-            while (it < N && !m_C.Cancelled()) {
-                float progress = (float)it / (float)std::max(1, N);
-                float T = T0 * powf(T1 / T0, progress);
-                ramp = std::min(1.0f, 0.1f + 0.9f * progress / 0.6f);
-                State cand;
-                cand.design = cur.design;
-                Focus focus;
-                bool ok = false, small = false;
-                for (int tries = 0; tries < 8 && !ok; tries++) {
-                    cand.design = cur.design;
-                    focus = Focus{};
-                    m_Score = cur.score;
-                    ok = Propose(cand.design, cur.diag, progress, &focus, &small) && Sanitize(cand.design);
-                }
-                if (!ok) { it++; continue; }
-                cand.score = Evaluate(cand.design, &cand.diag);
-                it++;
-                // a new shape or hinge rarely lands well: let it settle a few steps before it is judged
-                if (focus.shape >= 0 || focus.hinge >= 0) {
-                    for (int k = 0; k < 6 && it < N; k++) {
-                        State t;
-                        t.design = cand.design;
-                        if (!Perturb(t.design, focus, fmaxf(m_Step, 0.3f)) || !Sanitize(t.design)) continue;
-                        t.score = Evaluate(t.design, &t.diag);
-                        it++;
-                        if (t.score.valid && objective(t.score) < objective(cand.score)) cand = std::move(t);
-                    }
-                }
-                if (!cand.score.valid) continue;
-                // about a quarter of small changes should help: bigger steps while more do, smaller while fewer do
-                if (small) m_Step = std::clamp(m_Step * (objective(cand.score) < objective(cur.score) ? 1.03f : 0.99f), 0.05f, 2.0f);
-                float delta = objective(cand.score) - objective(cur.score);
-                if (delta < 0.0f || Uniform(m_Rng) < expf(-delta / T)) {
-                    cur = std::move(cand);
-                    accepted++;
-                    // the best is judged by the weights of the moment (fully weighted from 60% of the run on)
-                    if (objective(cur.score) < objective(best.score) - 1e-6f) {
-                        best = cur;
-                        sinceBest = 0;
-                        Publish(best, it, false);
-                    }
-                }
-                // wandered off: go back to the best
-                if (++sinceBest > 400 && objective(cur.score) > objective(best.score) + 0.01f) {
-                    cur = best;
-                    sinceBest = 0;
-                }
-                m_C.SetProgress(progress);
-                record(it, false);
-                if (m_Live && it >= nextHistory) {
-                    nextHistory = it + historyEvery;
+            auto report = [&]() {
+                m_C.SetProgress(N > 0 ? std::min(1.0f, (float)m_Evaluations / N) : 1.0f);
+                record(false);
+                if (m_Live && m_Evaluations >= nextHistory) {
+                    nextHistory = m_Evaluations + historyEvery;
                     std::lock_guard<std::mutex> l(m_Live->mutex);
-                    m_Live->history.push_back(best.score.total);
-                    m_Live->iteration = it;
-                    m_Live->accepted = accepted;
-                    m_Live->temperature = T;
+                    m_Live->history.push_back(m_Best.score.total);
+                    m_Live->iteration = m_Evaluations;
+                    m_Live->accepted = m_Accepted;
+                    m_Live->rounds = m_Rounds;
+                    m_Live->stepSize = m_Lr;
                 }
+            };
+            record(false);
+
+            m_Lr = m_P.stepSize;
+            const float minLr = 0.05f * m_P.stepSize;
+            m_C.SetStage("Searching");
+            while (m_Evaluations < N && !m_C.Cancelled()) {
+                // collisions start cheap and reach their full weight at 60% of the run: hinges and folds get to form
+                // before overlaps between the bodies have to be carved or moved away
+                m_Ramp = std::min(1.0f, 0.1f + 0.9f * ((float)m_Evaluations / N) / 0.6f);
+
+                // descent, the structure fixed: steps on one random element's parameters at a time. A step that
+                // doesn't help mostly means that element is already where it should be, not that the step is too
+                // big, so the step size follows the success rate instead of runs of failures: it settles where about
+                // one step in four helps (x1.25 on success, x0.93 otherwise)
+                for (int k = 0; k < m_P.stepsPerRound && m_Evaluations + 2 <= N && !m_C.Cancelled(); k++) {
+                    Focus block = RandomBlock(cur.design);
+                    std::vector<Param> ps = Params(cur.design, &block);
+                    bool helped = DescentStep(cur, ps, m_Lr);
+                    m_Lr = std::clamp(m_Lr * (helped ? 1.25f : 0.93f), minLr, 2.0f * m_P.stepSize);
+                    report();
+                }
+                if (m_Evaluations >= N || m_C.Cancelled()) break;
+
+                // rewrites
+                int applied = RewriteRound(cur);
+                m_Accepted += applied;
+                m_Rounds++;
+                m_Lr = fmaxf(m_Lr, m_P.stepSize);          // a new structure: full size steps again
+                // wandered off: go back to the best
+                if (cur.score.valid && Objective(cur.score) > Objective(m_Best.score) + 0.02f) cur = m_Best;
+                report();
+            }
+            // the descent since the last round has not been scored exactly
+            if (!m_C.Cancelled() && N > 0) {
+                AutoScore last = Evaluate(cur.design, nullptr);
+                Consider(cur.design, last);
             }
             m_C.SetProgress(1.0f);
-            if (!m_C.Cancelled()) record(it, true);
-            Publish(best, it, true);
+            if (!m_C.Cancelled()) record(true);
+            Publish(true);
+            if (m_Live) {
+                std::lock_guard<std::mutex> l(m_Live->mutex);
+                m_Live->history.push_back(m_Best.score.total);
+                m_Live->iteration = m_Evaluations;
+                m_Live->accepted = m_Accepted;
+                m_Live->rounds = m_Rounds;
+                m_Live->stepSize = m_Lr;
+            }
             res.ok = true;
             res.cancelled = m_C.Cancelled();
-            res.design = best.design;
+            res.design = m_Best.design;
             Finalize(res.design);
-            res.score = best.score;
-            const AutoScore& s = best.score;
-            res.message = Utils::Format("%s %d bodies, %d shapes, %d hinges: covers %.0f%% of the mesh, %.0f%% outside it, sphere %.0f%%, "
-                                        "overlapping %.1f%% open / %.1f%% closed (score %.3f, %d evaluations).",
-                                        res.cancelled ? "Stopped, kept the best so far:" : (N == 0 ? "Scored:" : "Generated"),
-                                        (int)res.design.Bodies().size(), (int)res.design.shapes.size(), (int)res.design.hinges.size(),
-                                        s.fitCover * 100.0f, s.fitOutside * 100.0f, s.sphereIoU * 100.0f, s.clashOpen * 100.0f,
-                                        s.clashClosed * 100.0f, s.total, m_Evaluations);
+            res.score = m_Best.score;
+            const AutoScore& s = m_Best.score;
+            const char* what = res.cancelled ? "Stopped, kept the best so far:" : (N == 0 ? "Scored:" : "Generated");
+            std::string shape = Utils::Format("%d bodies, %d shapes, %d hinges", (int)res.design.Bodies().size(), (int)res.design.shapes.size(),
+                                              (int)res.design.hinges.size());
+            std::string fits = s.silhouettes
+                ? Utils::Format("outlines cover %.0f%% of the mesh's (+%.0f%% extra) and %.0f%% of the sphere's (+%.0f%% extra), worst view %.0f%%",
+                                s.viewCover * 100.0f, s.viewExtra * 100.0f, s.sphereViewCover * 100.0f, s.sphereViewExtra * 100.0f, s.worstView * 100.0f)
+                : Utils::Format("covers %.0f%% of the mesh, %.0f%% outside it, sphere %.0f%%", s.fitCover * 100.0f, s.fitOutside * 100.0f,
+                                s.sphereIoU * 100.0f);
+            res.message = Utils::Format("%s %s: %s, overlapping %.1f%% open / %.1f%% closed%s (score %.3f; %d scorings, %d rewrites in %d rounds).",
+                                        what, shape.c_str(), fits.c_str(), s.clashOpen * 100.0f, s.clashClosed * 100.0f,
+                                        m_P.motionChecks > 0 ? Utils::Format(" / %.1f%% on the way", s.clashMotion * 100.0f).c_str() : "", s.total,
+                                        m_Evaluations, m_Accepted, m_Rounds);
             return res;
         }
     }

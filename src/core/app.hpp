@@ -234,6 +234,8 @@ namespace Bakugan {
         bool m_HasAutoScore = false;
         AutoScore m_AutoScore;
         Design m_AutoScoreFor;                        // the design m_AutoScore belongs to
+        Texture2D m_AutoViews = {};                   // the scored silhouettes of the best design (Silhouettes loss)
+        bool m_HasAutoViews = false;
         bool m_ShowAutoSphere = true;
         std::vector<float> m_AutoHistory;
         double m_AutoStart = 0.0;

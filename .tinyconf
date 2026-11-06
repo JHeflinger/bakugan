@@ -7,4 +7,3 @@ MODULE nfd https://github.com/JHeflinger/minis.git nfd
 COMPILER g++
 RAW -std=c++17 -O2 -Wno-missing-field-initializers
 FLAG qv
-PORT assets

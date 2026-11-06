@@ -52,6 +52,7 @@ namespace Bakugan {
         for (auto& [id, sm] : m_ShapeModels)
             if (sm.loaded) UnloadModel(sm.model);
         if (m_HasReference) UnloadModel(m_Reference);
+        if (m_HasAutoViews) UnloadTexture(m_AutoViews);
         if (m_HasNotifySound) UnloadSound(m_NotifySound);
         if (m_Audio) CloseAudioDevice();
         m_Sdf.Unload();
@@ -491,6 +492,24 @@ namespace Bakugan {
                              : "Generating a design for " + m_ReferenceName + (p.fromCurrent ? " from the current one..." : "...");
     }
 
+    // The scored silhouettes of the best design, as a texture for the Generate tab (on this thread: it has the GL
+    // context). A new size makes a new texture.
+    static void UploadViews(const std::vector<unsigned char>& rgba, int w, int h, Texture2D* tex, bool* has) {
+        if (w <= 0 || h <= 0 || rgba.size() != (size_t)w * h * 4) return;
+        if (*has && (tex->width != w || tex->height != h)) {
+            UnloadTexture(*tex);
+            *has = false;
+        }
+        if (!*has) {
+            Image img = { (void*)rgba.data(), w, h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
+            *tex = LoadTextureFromImage(img);
+            SetTextureFilter(*tex, TEXTURE_FILTER_POINT);
+            *has = IsTextureValid(*tex);
+        } else {
+            UpdateTexture(*tex, rgba.data());
+        }
+    }
+
     void App::PollAuto() {
         if (m_AutoLive && m_AutoJob.Busy()) {
             std::lock_guard<std::mutex> l(m_AutoLive->mutex);
@@ -499,6 +518,7 @@ namespace Bakugan {
                 m_AutoSeen = m_AutoLive->version;
                 m_AutoScore = m_AutoLive->score;
                 m_HasAutoScore = m_AutoScore.valid;
+                UploadViews(m_AutoLive->views, m_AutoLive->viewsWidth, m_AutoLive->viewsHeight, &m_AutoViews, &m_HasAutoViews);
                 if (!m_AutoScoreOnly && m_AutoPreview) {
                     m_Design = m_AutoLive->best;
                     m_AutoScoreFor = m_Design;
@@ -512,6 +532,7 @@ namespace Bakugan {
         if (m_AutoLive) {
             std::lock_guard<std::mutex> l(m_AutoLive->mutex);
             m_AutoHistory = m_AutoLive->history;
+            UploadViews(m_AutoLive->views, m_AutoLive->viewsWidth, m_AutoLive->viewsHeight, &m_AutoViews, &m_HasAutoViews);
         }
         m_Status = r.message;
         if (!r.ok) return;
@@ -579,7 +600,7 @@ namespace Bakugan {
     void App::Notify() {
         if (!m_Audio) return;
         if (!m_HasNotifySound) {
-            const std::string candidates[] = { "assets/notification.mp3", std::string(GetApplicationDirectory()) + "notification.mp3" };
+            const std::string candidates[] = { "notification.mp3", std::string(GetApplicationDirectory()) + "notification.mp3" };
             for (const std::string& path : candidates) {
                 if (!FileExists(path.c_str())) continue;
                 m_NotifySound = LoadSound(path.c_str());
