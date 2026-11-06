@@ -31,6 +31,8 @@ namespace Bakugan {
         SetExitKey(KEY_NULL);
         SetTargetFPS(60);
         rlImGuiSetup(true);
+        InitAudioDevice();
+        m_Audio = IsAudioDeviceReady();
         ImGui::GetIO().IniFilename = nullptr;
         m_Shader = LoadShaderFromMemory(Utils::GetVertexShader(), Utils::GetFragmentShader());
         m_ViewPositionLocation = GetShaderLocation(m_Shader, "viewPos");
@@ -41,6 +43,8 @@ namespace Bakugan {
     }
 
     App::~App() {
+        m_SuiteJob.Stop();
+        m_AutoJob.Stop();
         m_BuildJob.Stop();
         m_SweepJob.Stop();
         m_ExportJob.Stop();
@@ -48,6 +52,8 @@ namespace Bakugan {
         for (auto& [id, sm] : m_ShapeModels)
             if (sm.loaded) UnloadModel(sm.model);
         if (m_HasReference) UnloadModel(m_Reference);
+        if (m_HasNotifySound) UnloadSound(m_NotifySound);
+        if (m_Audio) CloseAudioDevice();
         m_Sdf.Unload();
         m_DesignView.Unload();
         m_OutputView.Unload();
@@ -77,7 +83,8 @@ namespace Bakugan {
     }
 
     void App::TrackHistory() {
-        if (Interacting()) return;
+        // a generator run is one step: the design from before it stays committed until it is done
+        if (Interacting() || m_AutoJob.Busy()) return;
         if (m_Committed.design == m_Design) {
             m_Committed.selection = m_Sel;
             return;
@@ -89,6 +96,7 @@ namespace Bakugan {
     }
 
     void App::Undo() {
+        if (m_AutoJob.Busy()) return;
         TrackHistory();
         if (m_UndoStack.empty() || Interacting()) return;
         m_RedoStack.push_back(Capture());
@@ -98,6 +106,7 @@ namespace Bakugan {
     }
 
     void App::Redo() {
+        if (m_AutoJob.Busy()) return;
         TrackHistory();
         if (m_RedoStack.empty() || Interacting()) return;
         m_UndoStack.push_back(Capture());
@@ -147,6 +156,7 @@ namespace Bakugan {
     // ---- files -----------------------------------------------------------------------------------------------------
 
     void App::SetDesign(const Design& d, const std::string& status) {
+        m_AutoJob.Stop();            // its preview would overwrite this
         // the history keeps the previous design, so this can be undone
         m_Design = d;
         m_Sel = Selection{};
@@ -378,6 +388,8 @@ namespace Bakugan {
             m_Status = er.message;
             if (er.ok) m_ExportedFiles = er.files;
         }
+        PollAuto();
+        PollSuite();
     }
 
     // Keeps the parts and the collision sweep in step with the design, once the user lets go of whatever they drag.
@@ -385,7 +397,9 @@ namespace Bakugan {
     // pairs of bodies whose parts and relative motion are the same. A job that went stale is stopped without waiting
     // for it (the UI never blocks on a worker); the next one starts once it has wound down.
     void App::UpdateJobs() {
-        if (Interacting()) return;
+        // while the generator runs the design changes several times a second: the views raymarch it directly, and the
+        // parts and the collision check catch up once it is done
+        if (Interacting() || m_AutoJob.Busy()) return;
         float voxel = PreviewVoxel(m_Design, m_PreviewResolution);
         bool partsStale = !m_HasParts || !SameGeometry(m_PartsFor, m_Design) || m_PartsVoxel != voxel;
         if (partsStale) {
@@ -438,6 +452,143 @@ namespace Bakugan {
         m_ExportedFiles.clear();
         m_ExportJob.Start([d, p](JobControl& c) { return ExportSTL(d, p, c); });
         m_Status = "Exporting STL parts...";
+    }
+
+    // ---- automatic design ------------------------------------------------------------------------------------------
+
+    void App::StartAuto(bool scoreOnly) {
+        if (m_AutoJob.Busy()) return;
+        if (m_SuiteJob.Busy()) { m_Status = "A test suite is running: wait for it or stop it first."; return; }
+        if (!m_HasReference) {
+            m_Status = "Load the mesh to fit as the reference mesh first (Model tab > Reference mesh).";
+            return;
+        }
+        if (scoreOnly && m_Design.shapes.empty()) { m_Status = "Nothing to score: the design is empty."; return; }
+        // the mesh as it is placed in the design view (scale, offset, rotation)
+        auto mesh = std::make_shared<const TriMesh>(Utils::ModelToTriMesh(m_Reference, ReferenceMatrix()));
+        if (mesh->indices.empty()) { m_Status = "The reference mesh has no triangles to fit."; return; }
+        AutoParams p = m_AutoParams;
+        if (scoreOnly) {
+            p.iterations = 0;
+            p.fromCurrent = true;
+        }
+        if (p.fromCurrent && m_Design.shapes.empty()) p.fromCurrent = false;
+        Design start = m_Design;
+        m_AutoLive = std::make_shared<AutoLive>();
+        std::shared_ptr<AutoLive> live = m_AutoLive;
+        m_AutoSeen = -1;
+        m_AutoScoreOnly = scoreOnly;
+        m_AutoHistory.clear();
+        m_AutoStart = GetTime();
+        m_Anim = 0;
+        // the parts and the collision check would be stale many times over: they resume when this is done
+        if (!scoreOnly) {
+            m_BuildJob.Cancel();
+            m_SweepJob.Cancel();
+        }
+        m_AutoJob.Start([mesh, start, p, live](JobControl& c) { return AutoDesign(*mesh, start, p, c, live); });
+        m_Status = scoreOnly ? "Scoring the design against " + m_ReferenceName + "..."
+                             : "Generating a design for " + m_ReferenceName + (p.fromCurrent ? " from the current one..." : "...");
+    }
+
+    void App::PollAuto() {
+        if (m_AutoLive && m_AutoJob.Busy()) {
+            std::lock_guard<std::mutex> l(m_AutoLive->mutex);
+            m_AutoHistory = m_AutoLive->history;
+            if (m_AutoLive->version != m_AutoSeen) {
+                m_AutoSeen = m_AutoLive->version;
+                m_AutoScore = m_AutoLive->score;
+                m_HasAutoScore = m_AutoScore.valid;
+                if (!m_AutoScoreOnly && m_AutoPreview) {
+                    m_Design = m_AutoLive->best;
+                    m_AutoScoreFor = m_Design;
+                    SanitizeSelection();
+                }
+            }
+        }
+        AutoResult r;
+        if (!m_AutoJob.Poll(&r)) return;
+        if (!m_AutoScoreOnly && !r.cancelled) Notify();
+        if (m_AutoLive) {
+            std::lock_guard<std::mutex> l(m_AutoLive->mutex);
+            m_AutoHistory = m_AutoLive->history;
+        }
+        m_Status = r.message;
+        if (!r.ok) return;
+        m_AutoScore = r.score;
+        m_HasAutoScore = r.score.valid;
+        if (m_AutoScoreOnly) {
+            m_AutoScoreFor = m_Design;
+            return;
+        }
+        m_Design = r.design;
+        m_AutoScoreFor = m_Design;
+        m_Sel = Selection{};
+        m_T = 0.0f;
+        m_Anim = 0;
+        m_Motion = Motion::Closing;
+        m_HasSweep = false;
+        FrameView(m_OutputView);
+        m_Status += " Space plays the fold; Ctrl+Z brings back the design from before.";
+    }
+
+    // ---- test suite ----------------------------------------------------------------------------------------------
+
+    void App::BrowseSuiteFolder() {
+        std::string start = m_SuiteFolder[0] ? std::string(m_SuiteFolder) : std::string(GetWorkingDirectory());
+        if (!DirectoryExists(start.c_str())) start = GetWorkingDirectory();
+        nfdchar_t* path = nullptr;
+        nfdresult_t r = NFD_PickFolder(start.c_str(), &path);
+        SetWindowFocused();
+        if (r == NFD_OKAY && path) {
+            snprintf(m_SuiteFolder, sizeof(m_SuiteFolder), "%s", path);
+            free(path);
+        } else if (r == NFD_ERROR) {
+            const char* e = NFD_GetError();
+            m_Status = std::string("The folder dialog failed") + (e ? std::string(": ") + e : "") + ". You can type the path instead.";
+        }
+    }
+
+    void App::StartSuite() {
+        if (m_SuiteJob.Busy() || m_AutoJob.Busy()) return;
+        std::string folder = m_SuiteFolder;
+        if (folder.empty() || !DirectoryExists(folder.c_str())) { m_Status = "Choose a folder of .obj files for the test suite."; return; }
+        size_t count = SuiteMeshes(folder).size();
+        if (count == 0) { m_Status = "There are no .obj files in " + folder + "."; return; }
+        SuiteParams p = m_SuiteParams;
+        p.folder = folder;
+        p.generate = m_AutoParams;
+        p.generate.fromCurrent = false;
+        m_SuiteLive = std::make_shared<SuiteLive>();
+        std::shared_ptr<SuiteLive> live = m_SuiteLive;
+        m_SuiteStart = GetTime();
+        m_SuiteJob.Start([p, live](JobControl& c) { return RunSuite(p, c, live); });
+        m_Status = Utils::Format("Test suite: %d meshes from %s...", (int)count, folder.c_str());
+    }
+
+    void App::PollSuite() {
+        SuiteResult r;
+        if (!m_SuiteJob.Poll(&r)) return;
+        m_Status = r.message;
+        if (r.ok) m_SuiteVideo = r.video;
+        if (!r.cancelled) Notify();
+    }
+
+    // notification.mp3 from the working directory or next to the executable, looked for again each time until found
+    // (so it can be dropped in while the editor runs). Silent without it or without an audio device.
+    void App::Notify() {
+        if (!m_Audio) return;
+        if (!m_HasNotifySound) {
+            const std::string candidates[] = { "assets/notification.mp3", std::string(GetApplicationDirectory()) + "notification.mp3" };
+            for (const std::string& path : candidates) {
+                if (!FileExists(path.c_str())) continue;
+                m_NotifySound = LoadSound(path.c_str());
+                m_HasNotifySound = IsSoundValid(m_NotifySound);
+                if (m_HasNotifySound) break;
+            }
+            if (!m_HasNotifySound) return;
+        }
+        PlaySound(m_NotifySound);
     }
 
     // ---- selection -------------------------------------------------------------------------------------------------

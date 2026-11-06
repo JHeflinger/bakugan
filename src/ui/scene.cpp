@@ -500,6 +500,7 @@ namespace Bakugan {
             }
             if (m_ShowHinges) DrawHingeHardware(xf, true);
             DrawCollisions();
+            DrawAutoSphere();
             if (m_ReferenceInOutput) DrawReference(false);
             m_OutputView.End3D();
             return;
@@ -534,8 +535,17 @@ namespace Bakugan {
         }
         if (m_ShowHinges) DrawHingeHardware(xf, true);
         DrawCollisions();
+        DrawAutoSphere();
         if (m_ReferenceInOutput) DrawReference(false);
         m_OutputView.End3D();
+    }
+
+    // The sphere the generator scored the closed pose against: faint while open, clearer as the design closes.
+    void App::DrawAutoSphere() {
+        if (!m_ShowAutoSphere || !m_HasAutoScore || m_AutoScore.radius <= 0.0f) return;
+        if (!m_AutoJob.Busy() && !(m_AutoScoreFor == m_Design)) return;
+        Color c = ColorAlpha(Color{ 120, 200, 255, 255 }, 0.15f + 0.45f * m_T);
+        DrawSphereWires(m_AutoScore.centre, m_AutoScore.radius, 12, 24, c);
     }
 
     // ---- panels ------------------------------------------------------------------------------------------------------

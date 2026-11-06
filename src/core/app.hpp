@@ -4,6 +4,8 @@
 #include "ui/raymarch.hpp"
 #include "data/build.hpp"
 #include "data/collide.hpp"
+#include "data/autodesign.hpp"
+#include "data/suite.hpp"
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -79,6 +81,12 @@ namespace Bakugan {
         void PollJobs();
         void UpdateJobs();
         void StartExport();
+        void StartAuto(bool scoreOnly);              // generate a design from the reference mesh (or just score this one)
+        void PollAuto();
+        void StartSuite();                           // the generator on every .obj in a folder, into one video
+        void PollSuite();
+        void Notify();                               // plays notification.mp3, if there is one
+        void BrowseSuiteFolder();
         bool PartsCurrent() const;
         bool SweepCurrent() const;
         const SweepStep* CurrentStep() const;
@@ -129,6 +137,7 @@ namespace Bakugan {
         void DrawCollisionPanel();
         void DrawPrintTab();
         void DrawFilesPanel();
+        void DrawGenerateTab();
         bool DrawJob(const JobControl* control, bool busy, const char* id, bool stoppable);
         std::string ItemName(int shapeId, int hingeId) const;
 
@@ -154,6 +163,7 @@ namespace Bakugan {
         void DrawHingeHardware(const std::vector<Rigid>& xf, bool output);
         void DrawCollisions();
         void DrawCollisionMarks();
+        void DrawAutoSphere();
         ShapeModel& ShapeMesh(const Shape& s);
         void PurgeShapeMeshes();
         void ClearParts();
@@ -213,6 +223,33 @@ namespace Bakugan {
         SweepParams m_SweepParams;
         ExportParams m_ExportParams;
         std::vector<std::string> m_ExportedFiles;
+
+        // automatic design (Generate tab)
+        Job<AutoResult> m_AutoJob;
+        std::shared_ptr<AutoLive> m_AutoLive;
+        AutoParams m_AutoParams;
+        bool m_AutoScoreOnly = false;
+        int m_AutoSeen = -1;                          // AutoLive::version last shown
+        bool m_AutoPreview = true;                    // show the best design so far while it runs
+        bool m_HasAutoScore = false;
+        AutoScore m_AutoScore;
+        Design m_AutoScoreFor;                        // the design m_AutoScore belongs to
+        bool m_ShowAutoSphere = true;
+        std::vector<float> m_AutoHistory;
+        double m_AutoStart = 0.0;
+
+        // test suite (Generate tab)
+        Job<SuiteResult> m_SuiteJob;
+        std::shared_ptr<SuiteLive> m_SuiteLive;
+        SuiteParams m_SuiteParams;
+        char m_SuiteFolder[1024] = "";
+        std::string m_SuiteVideo;                     // the last video written
+        double m_SuiteStart = 0.0;
+
+        // the sound for a finished generator run or test suite
+        bool m_Audio = false;
+        bool m_HasNotifySound = false;
+        Sound m_NotifySound = {};
 
         std::unordered_map<int, ShapeModel> m_ShapeModels;
         std::unordered_set<int> m_Hidden;             // shape and group ids hidden in the views (not part of the design)
