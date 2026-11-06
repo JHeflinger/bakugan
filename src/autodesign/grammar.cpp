@@ -10,8 +10,8 @@ namespace Bakugan {
         // Add a superfrustum: a very small box, in a body of its own, at a random point on the mesh, hinged to the
         // body nearest it (in the open pose) at the point of that body nearest it. Adam grows and moves it from there.
         bool AddSuperfrustum(Design& d, const RuleContext& c) {
-            if ((int)d.Bodies().size() >= c.p.maxBodies || c.sil.Surface().empty()) return false;
-            Vector3 q = c.sil.Surface()[std::uniform_int_distribution<size_t>(0, c.sil.Surface().size() - 1)(c.rng)];
+            if ((int)d.Bodies().size() >= c.p.maxBodies || c.loss.Surface().empty()) return false;
+            Vector3 q = c.loss.Surface()[std::uniform_int_distribution<size_t>(0, c.loss.Surface().size() - 1)(c.rng)];
             // the nearest body, in the open pose
             std::vector<Rigid> open = d.Transforms(0.0f, false);
             int parent = -1;
@@ -28,7 +28,7 @@ namespace Bakugan {
             Vector3 at = open[parent].ApplyInverse(q);
             // the hinge's pivot: the point on the parent's surface nearest the new shape (a few projection steps)
             Vector3 pivot = at;
-            const float e = 1e-3f * c.sil.L();
+            const float e = 1e-3f * c.loss.L();
             for (int k = 0; k < 8; k++) {
                 float dist = field.Distance(pivot);
                 Vector3 grad = { field.Distance(Vector3Add(pivot, { e, 0, 0 })) - dist, field.Distance(Vector3Add(pivot, { 0, e, 0 })) - dist,
@@ -39,7 +39,7 @@ namespace Bakugan {
 
             SuperFrustum sf;
             sf.position = at;
-            float size = 0.03f * c.sil.L();
+            float size = 0.03f * c.loss.L();
             sf.size = { size, size, size };
             sf.rounding = 0.5f;
             int body = d.groups[d.AddGroup("Body", -1)].id;

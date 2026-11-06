@@ -151,6 +151,7 @@ namespace Bakugan {
         void GenerateOptimizer();
         void GenerateRun();
         void GenerateScore();
+        void GenerateTimeline();
         void GenerateSuite();
         void DrawJob(const JobControl* control, bool busy, const char* id, const std::function<void()>& stop = {});
         std::string ItemName(int shapeId, int hingeId) const;
@@ -248,7 +249,7 @@ namespace Bakugan {
         bool m_HasAutoScore = false;
         AutoScore m_AutoScore;
         Design m_AutoScoreFor;                        // the design m_AutoScore belongs to
-        Texture2D m_AutoViews = {};                   // the scored silhouettes of the best design (Silhouettes loss)
+        Texture2D m_AutoViews = {};                   // the silhouettes scored last, against their targets
         bool m_HasAutoViews = false;
         bool m_ShowAutoSphere = true;
         std::vector<float> m_AutoHistory;

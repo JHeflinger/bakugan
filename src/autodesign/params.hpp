@@ -2,7 +2,7 @@
 // The design's differentiable parameters: what Adam optimizes.
 //
 // Every shape has position (3), rotation (a quaternion, 4), size (3), rounding, taper, bulge and dilation; every hinge
-// has pivot (3), axis (3) and its open and closed angles. Each parameter has a unit (the size of a typical step, so
+// has pivot (3), axis (3), its open and closed angles, and when in the closing motion it turns (t0..t1). Each parameter has a unit (the size of a typical step, so
 // one learning rate suits them all) and a key that names it for as long as its shape or hinge exists.
 //
 // To make another number differentiable: a row in the table for its kind in params.cpp, and a case in Ref.
@@ -25,6 +25,6 @@ namespace Bakugan {
     float* Ref(Design& d, const Param& p);
     // Sets it, kept inside its range (sizes stay positive, rounding within 0..1, ...).
     void SetParam(Design& d, const Param& p, float value, float L);
-    // After changing parameters: rotations and axes back to unit length.
+    // After changing parameters: rotations and axes back to unit length, hinges' timing windows kept in order.
     void Tidy(Design& d);
 }

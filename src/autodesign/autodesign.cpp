@@ -1,7 +1,8 @@
 // The optimizer: Adam on every differentiable parameter, and every so often a rewrite round in the manner of
 // Stochastic Rewrite Descent (Kodnongbua et al., "Design for Descent", SIGGRAPH Asia 2025):
 //
-//   1. the targets: the mesh's silhouettes, and a sphere of its volume
+//   1. the targets: the mesh's silhouettes, and a sphere of its volume (the loss also counts bodies overlapping as the
+//      design opens and closes: loss.hpp)
 //   2. the start: two boxes, a body each, hinged to fold one onto the other
 //   3. until the budget runs out:
 //        an Adam step: the loss and its gradient, every parameter moved
@@ -60,12 +61,12 @@ namespace Bakugan {
             return d;
         }
 
-        // One Adam step: the loss and its gradient at the design, then every parameter moved. Returns the loss before
-        // the step.
-        AutoScore AdamStep(State& s, Silhouettes& sil) {
-            std::vector<Param> ps = DesignParams(s.design, sil.L());
+        // One Adam step: the loss and its gradient at the design, then every parameter moved. Returns the loss of the
+        // design as it was before the step.
+        AutoScore AdamStep(State& s, Loss& loss) {
+            std::vector<Param> ps = DesignParams(s.design, loss.L());
             std::vector<float> grad;
-            AutoScore score = sil.Loss(s.design, ps, &grad);
+            AutoScore score = loss.Evaluate(s.design, ps, &grad);
             std::vector<float> x(ps.size());
             std::vector<uint64_t> keys(ps.size());
             for (size_t i = 0; i < ps.size(); i++) {
@@ -73,7 +74,7 @@ namespace Bakugan {
                 keys[i] = ps[i].Key();
             }
             s.adam.Step(keys, x, grad);
-            for (size_t i = 0; i < ps.size(); i++) SetParam(s.design, ps[i], x[i] * ps[i].unit, sil.L());
+            for (size_t i = 0; i < ps.size(); i++) SetParam(s.design, ps[i], x[i] * ps[i].unit, loss.L());
             Tidy(s.design);
             s.score = score;
             return score;
@@ -86,9 +87,9 @@ namespace Bakugan {
 
         // 1. the targets
         c.SetStage("Drawing the mesh's silhouettes");
-        Silhouettes sil(mesh, p);
+        Loss loss(mesh, p);
         std::mt19937 rng(p.seed);
-        RuleContext rules{ sil, p, rng };
+        RuleContext rules{ loss, p, rng };
 
         // 2. the start
         State cur;
@@ -123,20 +124,21 @@ namespace Bakugan {
             lastShown = t;
             live->best = best;
             live->score = bestScore;
-            sil.Picture(bestScore, &live->views, &live->viewsWidth, &live->viewsHeight);
+            loss.Picture(&live->views, &live->viewsWidth, &live->viewsHeight);
             live->version++;
         };
 
         c.SetStage("Optimizing");
         if (budget == 0) {                                  // only score it
-            AutoScore s = sil.Loss(cur.design, {}, nullptr);
+            AutoScore s = loss.Evaluate(cur.design, {}, nullptr);
             consider(cur.design, s);
         }
         while (steps < budget && !c.Cancelled()) {
             // 3. an Adam step
-            AutoScore s = AdamStep(cur, sil);
+            Design before = cur.design;
+            AutoScore s = AdamStep(cur, loss);
             steps++;
-            consider(cur.design, s);
+            consider(before, s);                             // the score is of the design before the step
             c.SetProgress((float)steps / budget);
 
             // ... and now and then a rewrite round
@@ -149,9 +151,10 @@ namespace Bakugan {
             }
             for (State& t : tries)
                 for (int k = 0; k < p.lookahead && steps < budget; k++) {
-                    AdamStep(t, sil);
+                    Design before = t.design;
+                    AdamStep(t, loss);
                     steps++;
-                    consider(t.design, t.score);
+                    consider(before, t.score);
                 }
             auto winner = std::min_element(tries.begin(), tries.end(), [](const State& a, const State& b) {
                 return a.score.total < b.score.total;
@@ -161,7 +164,7 @@ namespace Bakugan {
         }
 
         // 4. the result
-        AutoScore last = sil.Loss(cur.design, {}, nullptr);
+        AutoScore last = loss.Evaluate(cur.design, {}, nullptr);
         consider(cur.design, last);
         if (live) {
             std::lock_guard<std::mutex> l(live->mutex);
@@ -175,11 +178,12 @@ namespace Bakugan {
         res.design = best;
         res.score = bestScore;
         res.message = Utils::Format("%s %d bodies, %d hinges: silhouettes cover %.0f%% of the mesh's (+%.0f%% extra) and %.0f%% of the "
-                                    "sphere's (+%.0f%% extra), worst view %.0f%% (loss %.3f; %d steps, %d of %d rewrite rounds changed it).",
+                                    "sphere's (+%.0f%% extra), worst view %.0f%%; overlapping %.1f%% open, %.1f%% closed, %.1f%% on the way "
+                                    "(loss %.3f; %d steps, %d of %d rewrite rounds changed it).",
                                     res.cancelled ? "Stopped, kept the best so far:" : (budget == 0 ? "Scored:" : "Generated"),
                                     (int)best.Bodies().size(), (int)best.hinges.size(), bestScore.viewCover * 100.0f, bestScore.viewExtra * 100.0f,
                                     bestScore.sphereViewCover * 100.0f, bestScore.sphereViewExtra * 100.0f, bestScore.worstView * 100.0f,
-                                    bestScore.total, steps, accepted, rounds);
+                                    bestScore.clashOpen * 100.0f, bestScore.clashClosed * 100.0f, bestScore.clashMotion * 100.0f, bestScore.total, steps, accepted, rounds);
         return res;
     }
 }

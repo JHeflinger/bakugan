@@ -3,12 +3,12 @@
 //
 // A rule is a function that changes a design, or returns false when it can't apply. The optimizer draws rules by
 // weight from the table in grammar.cpp; to add one, write its function and add a row.
-#include "silhouette.hpp"
+#include "loss.hpp"
 #include <random>
 
 namespace Bakugan {
     struct RuleContext {
-        const Silhouettes& sil;      // the targets (points on the mesh, its size)
+        const Loss& loss;            // the targets (points on the mesh, its size)
         const AutoParams& p;
         std::mt19937& rng;
     };

@@ -3,7 +3,8 @@
 // closed pose looks like a sphere, compared by their silhouettes from several directions.
 //
 // The optimizer (autodesign.cpp) is Adam on every differentiable number of the design, plus a small grammar
-// (grammar.hpp) that changes the design's structure now and then, in the manner of Stochastic Rewrite Descent.
+// (grammar.hpp) that changes the design's structure now and then, in the manner of Stochastic Rewrite Descent. The
+// loss (loss.hpp) is the silhouettes, plus bodies overlapping as the design opens and closes.
 // README.md walks through it.
 #include "data/design.hpp"
 #include "data/job.hpp"
@@ -20,6 +21,10 @@ namespace Bakugan {
         int views = 6;                   // directions the silhouettes are compared from
         int viewResolution = 64;         // pixels across each view
         float minViewCoverage = 0.6f;    // every view's target must be covered at least this much (steep cost below)
+        float collisionWeight = 1.0f;    // what bodies overlapping each other cost (0: ignored)
+        int motionChecks = 8;            // poses checked for overlaps between open and closed (the two ends always are)
+        float motionCheckBias = 0.5f;    // 0: those poses spread evenly over the times some hinge moves .. 1: placed by
+                                         // how many hinges move at once
         // the optimizer
         int steps = 1500;                // gradient evaluations in all (the budget), rewrite lookaheads included
         float learningRate = 1.0f;       // Adam's step, in each parameter's own unit (see params.cpp)
@@ -33,13 +38,18 @@ namespace Bakugan {
 
     struct AutoScore {
         bool valid = false;
-        float total = 0.0f;              // the loss: (1 - bias) * fit + bias * sphere + coverage penalty
+        float total = 0.0f;              // the loss: (1 - bias) * fit + bias * sphere + coverage penalty + collision weight * collision
         float fit = 0.0f;                // open pose against the mesh: mean over views of (1 - covered) + extra
         float sphere = 0.0f;             // closed pose against the sphere, the same way
         float coveragePenalty = 0.0f;    // 10 per whole share a view is covered less than minViewCoverage
         float viewCover = 0.0f, viewExtra = 0.0f;              // means over the views: open vs mesh
         float sphereViewCover = 0.0f, sphereViewExtra = 0.0f;  // closed vs sphere
         float worstView = 0.0f;          // least covered view, of either pose
+        float collision = 0.0f;          // overlap depth: open + closed + the mean of the poses between (see loss.cpp)
+        float clashOpen = 0.0f, clashClosed = 0.0f;    // volume inside two bodies at once, as a share of the sphere's
+        float clashMotion = 0.0f;        // ... at the worst checked pose between
+        float clashMotionT = 0.0f;       // ... which is this far through the closing motion
+        std::vector<float> checkTimes;   // where in the motion (0 open .. 1 closed) the poses between were checked
         Vector3 centre = { 0, 0, 0 };    // the target sphere
         float radius = 0.0f;
     };

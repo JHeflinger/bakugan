@@ -75,6 +75,17 @@ namespace Bakugan {
             ImGui::SetItemTooltip("Share of every view's target outline the design must cover. Each view short of it costs\n"
                                   "steeply (10 per whole share missing), so no single view can be given up.");
         }
+        ImGui::SliderFloat("Collisions", &p.collisionWeight, 0.0f, 5.0f, p.collisionWeight > 0.0f ? "%.2f" : "ignored");
+        ImGui::SetItemTooltip("What bodies overlapping each other costs: in the open pose, the closed pose, and the poses\n"
+                              "checked between (together they weigh as much as one end pose)");
+        ImGui::BeginDisabled(p.collisionWeight <= 0.0f);
+        ImGui::SliderInt("Poses between", &p.motionChecks, 0, 64);
+        ImGui::SetItemTooltip("Poses checked for overlaps between open and closed. They go only where some hinge is moving,\n"
+                              "so no part of the motion can hide a collision from them.");
+        ImGui::SliderFloat("Follow busy times", &p.motionCheckBias, 0.0f, 1.0f, "%.2f");
+        ImGui::SetItemTooltip("0: the poses between are spread evenly over the times any hinge moves. 1: placed by how many\n"
+                              "hinges move at once. Between, a mix: some evenly everywhere a hinge moves, the rest where most do.");
+        ImGui::EndDisabled();
         ImGui::DragFloat("Sphere size", &p.sphereDiameter, 0.5f, 0.0f, 500.0f, p.sphereDiameter > 0.0f ? "%.1f mm across" : "auto");
         ImGui::SetItemTooltip("Diameter the closed design should have. Auto: a sphere of the mesh's volume, at its centre.");
     }
@@ -187,15 +198,44 @@ namespace Bakugan {
             ImGui::SetItemTooltip("Each view: open design vs the mesh (top), closed design vs the sphere (bottom).\n"
                                   "Dark: both cover the pixel. Red: only the target (missing). Blue: only the design (extra).");
         }
-        ImGui::TextDisabled("loss %.3f (fit %.3f, sphere %.3f, coverage %.3f)", s.total, s.fit, s.sphere, s.coveragePenalty);
-        ImGui::SetItemTooltip("Lower is better: (1 - goal) * fit + goal * sphere + coverage penalty. Fit and sphere: the\n"
-                              "mean over the views of the share of the target missed plus the share of extra pixels.");
+        ImVec4 clashColor = s.clashOpen + s.clashClosed + s.clashMotion > 0.005f ? Amber : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+        ImGui::TextColored(clashColor, "Overlapping: %.1f%% open, %.1f%% closed, %.1f%% worst between", s.clashOpen * 100.0f, s.clashClosed * 100.0f,
+                           s.clashMotion * 100.0f);
+        ImGui::SetItemTooltip("Volume inside two bodies at once, as a share of the sphere's. Worst between: at %.0f%% of the\n"
+                              "closing motion.", s.clashMotionT * 100.0f);
+        GenerateTimeline();
+        ImGui::TextDisabled("loss %.3f (fit %.3f, sphere %.3f, coverage %.3f, collisions %.3f)", s.total, s.fit, s.sphere, s.coveragePenalty, s.collision);
+        ImGui::SetItemTooltip("Lower is better: (1 - goal) * fit + goal * sphere + coverage penalty + collisions * their weight.\n"
+                              "Fit and sphere: the mean over the views of the share of the target missed plus the share of\n"
+                              "extra pixels. Collisions: overlap depth over its volume, against the sphere's volume.");
         ImGui::TextDisabled("sphere %.1f mm across", s.radius * 2.0f);
         if (m_AutoHistory.size() > 1) {
             auto [lo, hi] = std::minmax_element(m_AutoHistory.begin(), m_AutoHistory.end());
             ImGui::PlotLines("##history", m_AutoHistory.data(), (int)m_AutoHistory.size(), 0, "loss", *lo - 0.01f, fminf(*hi, *lo + 2.0f) + 0.01f,
                              ImVec2(-FLT_MIN, 60));
         }
+    }
+
+    // The closing motion as a strip: each hinge's turn as a bar, the poses checked for overlaps as ticks.
+    void App::GenerateTimeline() {
+        const std::vector<float>& checks = m_AutoScore.checkTimes;
+        if (m_Design.hinges.empty()) return;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 at = ImGui::GetCursorScreenPos();
+        float w = ImGui::GetContentRegionAvail().x, row = 5.0f, gap = 2.0f;
+        int n = (int)m_Design.hinges.size();
+        float h = n * (row + gap) + 10.0f;
+        ImGui::InvisibleButton("##timeline", ImVec2(w, h));
+        ImU32 track = ImGui::GetColorU32(ImGuiCol_FrameBg), bar = ImGui::GetColorU32(ImGuiCol_PlotHistogram), tick = ImGui::GetColorU32(ImGuiCol_Text);
+        for (int i = 0; i < n; i++) {
+            const Hinge& hg = m_Design.hinges[i];
+            float y = at.y + i * (row + gap);
+            dl->AddRectFilled(ImVec2(at.x, y), ImVec2(at.x + w, y + row), track);
+            dl->AddRectFilled(ImVec2(at.x + w * hg.t0, y), ImVec2(at.x + w * hg.t1, y + row), bar);
+        }
+        for (float t : checks) dl->AddLine(ImVec2(at.x + w * t, at.y + h - 8.0f), ImVec2(at.x + w * t, at.y + h), tick);
+        ImGui::SetItemTooltip("The closing motion, open (left) to closed (right): a bar for when each hinge turns, a tick for\n"
+                              "each pose checked for overlaps between (%d)", (int)checks.size());
     }
 
     void App::GenerateSuite() {

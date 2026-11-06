@@ -25,6 +25,8 @@ namespace Bakugan {
             { 0.01f, false, -1, 1 }, { 0.01f, false, -1, 1 }, { 0.01f, false, -1, 1 },                                       // axis
             { 0.01f, false, -2 * PI, 2 * PI },   // open angle (start)
             { 0.01f, false, -2 * PI, 2 * PI },   // closed angle (end)
+            { 0.01f, false, 0, 1 },              // when it starts turning, as the design closes (t0) ...
+            { 0.01f, false, 0, 1 },              // ... and when it stops (t1)
         };
         const int ShapeCount = sizeof(ShapeFields) / sizeof(Field), HingeCount = sizeof(HingeFields) / sizeof(Field);
 
@@ -75,6 +77,8 @@ namespace Bakugan {
             case 5: return &hg.axis.z;
             case 6: return &hg.start;
             case 7: return &hg.end;
+            case 8: return &hg.t0;
+            case 9: return &hg.t1;
         }
         return nullptr;
     }
@@ -92,6 +96,12 @@ namespace Bakugan {
             Quaternion& q = s.sf.rotation;
             q = QuaternionLength(q) > 1e-6f ? QuaternionNormalize(q) : QuaternionIdentity();
         }
-        for (Hinge& h : d.hinges) h.axis = Vector3Length(h.axis) > 1e-6f ? Vector3Normalize(h.axis) : Vector3{ 0, 1, 0 };
+        for (Hinge& h : d.hinges) {
+            h.axis = Vector3Length(h.axis) > 1e-6f ? Vector3Normalize(h.axis) : Vector3{ 0, 1, 0 };
+            // its turn takes a twentieth of the motion at least, inside it
+            float w = std::clamp(h.t1 - h.t0, 0.05f, 1.0f);
+            h.t0 = std::clamp(h.t0, 0.0f, 1.0f - w);
+            h.t1 = h.t0 + w;
+        }
     }
 }

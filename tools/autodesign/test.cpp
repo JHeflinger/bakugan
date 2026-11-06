@@ -22,6 +22,7 @@ int main(int argc, char** argv) {
     auto env = [](const char* name, auto& value) { if (const char* s = getenv(name)) value = (std::remove_reference_t<decltype(value)>)atof(s); };
     env("VIEWS", p.views); env("VRES", p.viewResolution); env("LR", p.learningRate); env("ROUND", p.stepsPerRound);
     env("REWRITES", p.rewritesPerRound); env("LOOKAHEAD", p.lookahead); env("MAXBODIES", p.maxBodies);
+    env("COLW", p.collisionWeight); env("CHECKS", p.motionChecks); env("CHECKBIAS", p.motionCheckBias);
 
     JobControl c;
     auto live = std::make_shared<AutoLive>();
@@ -40,6 +41,19 @@ int main(int argc, char** argv) {
         fclose(f);
     }
     printf("%s\n%.1f s (%.1f ms a step)\n", r.message.c_str(), secs, 1000.0 * secs / std::max(1, p.steps));
+    {
+        // the result checked for overlaps the same way whatever the run used: 32 poses between, evenly over the motion
+        AutoParams q = p;
+        q.collisionWeight = 1.0f;
+        q.motionChecks = 32;
+        q.motionCheckBias = 0.0f;
+        q.steps = 0;
+        q.fromCurrent = true;
+        JobControl c2;
+        AutoResult e = AutoDesign(mesh, r.design, q, c2, nullptr);
+        printf("checked: overlapping %.2f%% open, %.2f%% closed, worst between %.2f%% at t=%.2f\n", e.score.clashOpen * 100.0f,
+               e.score.clashClosed * 100.0f, e.score.clashMotion * 100.0f, e.score.clashMotionT);
+    }
     FILE* f = fopen((out + "_design.txt").c_str(), "w");
     fputs(r.design.Serialize().c_str(), f);
     fclose(f);

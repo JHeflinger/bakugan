@@ -145,7 +145,8 @@ namespace Bakugan {
         std::vector<std::string> ScoreWords(const AutoScore& s) {
             std::vector<std::string> w = { Utils::Format("score %.3f", s.total) };
             w.insert(w.end(), { "outline " + Pct(s.viewCover), "extra " + Pct(s.viewExtra), "sphere " + Pct(s.sphereViewCover),
-                                "worst view " + Pct(s.worstView) });
+                                "worst view " + Pct(s.worstView), Utils::Format("overlap %.1f%%", (s.clashOpen + s.clashClosed) * 50.0f),
+                                Utils::Format("moving %.1f%%", s.clashMotion * 100.0f) });
             return w;
         }
 
