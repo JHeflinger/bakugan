@@ -22,7 +22,7 @@ namespace Bakugan {
         if (mesh->indices.empty()) { m_Status = "The reference mesh has no triangles to fit."; return; }
         AutoParams p = m_AutoParams;
         if (scoreOnly) {
-            p.iterations = 0;            // only score the start: the current design
+            p.steps = 0;                 // only score the start: the current design
             p.fromCurrent = true;
         }
         if (p.fromCurrent && m_Design.shapes.empty()) p.fromCurrent = false;

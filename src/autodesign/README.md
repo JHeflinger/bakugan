@@ -1,76 +1,47 @@
-# autodesign: generating a design from a mesh
+# autodesign
 
-The editor (and the test suite) only call one function, declared in `autodesign.hpp`:
+This module generates a hinged superfrustum design from a mesh. When the design is open, its silhouettes should match the mesh's. When it is closed, they should match a sphere's.
 
-```cpp
-AutoResult AutoDesign(const TriMesh& mesh, const Design& start, const AutoParams& p, JobControl& c, std::shared_ptr<AutoLive> live);
-```
+The editor and the test suite call one function, `AutoDesign`, declared in `autodesign.hpp`.
 
-Everything else lives in `namespace Bakugan::Auto`.
-
-## How a run goes
-
-`Search::Run` in `search.cpp` is the whole algorithm, step by step. It's Stochastic Rewrite Descent (Kodnongbua, Zhang, Sharp, Schulz, *Design for Descent*, SIGGRAPH Asia 2025):
-
-1. **Measure the mesh** (`Target::Build`): sample points, an inside test, a signed distance field. Then the fixed samples every design is scored on, and the mesh's outlines (`Scorer::Prepare`).
-2. **Start** (`Search::Start`): split the mesh into hinged pieces (`Search::Seed`, `start.cpp`), or take the editor's design (`Search::FromEditor`). It's made valid and scored, and becomes the best design so far.
-3. **Rounds**, until the budget of scorings runs out:
-   - a. **Descent** (`DescentPhase` → `DescentStep`): SPSA steps on one random element's continuous parameters, with the structure fixed.
-   - b. **Rewrites** (`RewriteRound`): grammar rewrites are drawn and tried, each with a short lookahead. Every one that helps is applied at once, best first, and none of them conflict.
-   - c. If the search has wandered far from the best design, it goes back to it.
-
-   Collisions are ramped in over the first 60% of the budget.
-4. **Result**: the best design scored on the way.
-
-## The modules
+## Files
 
 | file | what it is |
 |---|---|
-| `search.hpp/.cpp` | the algorithm: the loop, descent steps, lookahead, rewrite rounds |
-| `start.cpp` | starting designs: k-means seed with a hinge tree, or the editor's design |
-| `target.hpp/.cpp` | the input mesh, measured once: samples, inside test, signed distance field |
-| `space.hpp/.cpp` | the design space's limits, and `Sanitize` / `Project` / `Finalize` |
-| `score.hpp/.cpp` | the score: every term, in the order it is measured (see the comment at the top of `score.cpp`) |
-| `silhouettes.hpp/.cpp` | the Silhouettes loss: outlines of the mesh, the design and the sphere |
-| `probe.hpp` | a design's bodies as distance fields, and the diagnostics a score hands to the grammar |
-| `params.hpp/.cpp` | the continuous half of the design space: every number a descent step may move |
-| `grammar.hpp/.cpp` | the discrete half: the rule table, and each rule's Draw / Apply pair |
-| `placement.cpp` | where the grammar puts new shapes, cuts and hinges (aimed at the score's diagnostics) |
-| `edits.hpp/.cpp` | design edits the grammar is built from (remove or merge a body, set up a hinge, ...) |
-| `progress.hpp/.cpp` | what the UI sees while a run goes: the best design, its outlines, history, recording |
-| `common.hpp/.cpp` | random numbers, geometry helpers, the thread pool |
+| `autodesign.cpp` | the optimizer, top to bottom: start design, Adam steps, rewrite rounds, result |
+| `adam.hpp` | Adam, with memory kept per parameter key, so parameters can come and go |
+| `params.hpp/.cpp` | the design's differentiable parameters: their units, ranges and keys |
+| `silhouette.hpp/.cpp` | the loss (silhouettes against targets) and its gradient |
+| `grammar.hpp/.cpp` | the rewrite rules (for now, one rule that adds a superfrustum) |
 | `suite*.cpp/hpp` | the test suite: every mesh in a folder, into one video |
+
+## The loop (`AutoDesign`)
+
+1. **Targets.** The mesh's silhouettes are drawn from `views` directions. The target sphere sits at the mesh's centre of volume and has the same volume.
+2. **Start.** The mesh's box is halved along its longest side. Each half gets a box in its own body, and the two bodies are hinged to fold onto each other.
+3. **Steps.** Until the step budget runs out:
+   - Every step is one Adam step on every parameter.
+   - Every `stepsPerRound` steps there is a rewrite round. Rewrites are drawn from the grammar. Each rewritten design, and the unchanged design, gets `lookahead` Adam steps of its own. Whichever has the lowest loss afterwards carries on, with its Adam memory.
+4. **Result.** The best design seen during the run.
+
+## The gradient
+
+Silhouettes are soft. A pixel's coverage comes from how close its ray gets to the body: 0 at a pixel outside, 1 at a pixel inside. So only pixels on a silhouette's edge depend on the parameters.
+
+For each of those pixels:
+
+- The loss's slope with respect to the pixel is known from the comparison with the target.
+- The pixel's slope with respect to its ray's nearest distance is the edge's slope.
+- That distance changes, to first order, only through the body's field at the ray's nearest point (the envelope theorem).
+
+The last part is measured by nudging one parameter either way and re-evaluating the body's distance at those points. That takes about a thousand field evaluations per parameter, instead of drawing the whole design again.
+
+`tools/autodesign/gradcheck` compares this gradient against brute-force differences of the whole loss. It agrees to within about 30% for most parameters. The rest differ because of occlusion between bodies and the rays' discrete steps, and because rotation and axis components are renormalized after every change, which the brute-force check doesn't account for.
 
 ## Extending it
 
-**A new rewrite rule:**
+**A rule** is a function `bool (Design&, const RuleContext&)` plus a row in the table in `grammar.cpp`. Change the design and return true, or return false when the rule can't apply.
 
-1. Add an entry to `Rule` (`grammar.hpp`).
-2. Add a row to the rule table in `grammar.cpp`: its name, its weight, and what it needs (cuts, features, hinges, ...).
-3. Write `DrawYourRule`, which makes every random choice and records what the rewrite owns and uses, so conflicts are found.
-4. Write `ApplyYourRule`, which makes the change and returns false when it no longer applies. It names what it created in the `Focus`, so the lookahead tunes that.
+New parameters are picked up automatically. Adam gives them fresh memory, and drops the memory of parameters that disappear.
 
-A `static_assert` checks that the table has one row per rule.
-
-Mark a rule *patient* in the table when its change is nearly neutral by itself and only pays off once the shapes it made have moved, as with SplitShape and MergeShapes. Its lookahead then takes twice the steps and doesn't stop at the first step that fails.
-
-To see how each rule fares, set the environment variable `BAKUGAN_RULE_STATS=1`. At the end of a run, each rule's tried and helped counts are printed to stderr.
-
-**A new continuous parameter:**
-
-1. Add it to `Dof` and the `Dofs` table in `params.cpp` (its part and unit).
-2. List it in `Parameters::Of`.
-3. Say how a step moves it in `Parameters::Step`.
-4. If it needs a range, clamp it in `DesignSpace::Project`.
-
-**A new score term:**
-
-1. Add a stage method to `Scorer` and call it from `Scorer::Evaluate` in its place.
-2. Add its numbers to `AutoScore` (`autodesign.hpp`) if the UI or the log should show them.
-3. Add it to `base` or `collision` in `Evaluate`. Collisions are ramped in, so only overlap-like terms belong there.
-
-**Reproducibility:** a run is deterministic for a given seed and settings. One random generator, owned by the search, is drawn from in a fixed order. The score's sample points come from their own generator, so changing the score doesn't change the search's draws.
-
-## Testing without the editor
-
-`tools/autodesign/build.sh` builds `autotest`, which runs the generator on an .obj and writes the design. It also builds `suitetest`, which runs the test suite. Neither needs the GUI.
+**A differentiable number** needs a row in its kind's table in `params.cpp` (its unit and range), and a case in `Ref`. The gradient needs nothing more: it nudges whatever `Ref` points at.

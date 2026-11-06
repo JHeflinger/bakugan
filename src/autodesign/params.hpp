@@ -1,52 +1,30 @@
 #pragma once
-// The continuous half of the design space: every number the descent may move, with the structure fixed.
-#include "space.hpp"
+// The design's differentiable parameters: what Adam optimizes.
+//
+// Every shape has position (3), rotation (a quaternion, 4), size (3), rounding, taper, bulge and dilation; every hinge
+// has pivot (3), axis (3) and its open and closed angles. Each parameter has a unit (the size of a typical step, so
+// one learning rate suits them all) and a key that names it for as long as its shape or hinge exists.
+//
+// To make another number differentiable: a row in the table for its kind in params.cpp, and a case in Ref.
+#include "data/design.hpp"
+#include <cstdint>
+#include <vector>
 
-namespace Bakugan::Auto {
-    // One kind of continuous parameter. To add one: a row in the table in params.cpp (its part and unit), where it is
-    // listed in Parameters::Of, and how a step moves it in Parameters::Step.
-    enum class Dof : unsigned char {
-        Pos, LogSize, Rot, Rounding, Taper, Bulge, Dilation,     // a shape (sizes on a log scale, rotation as a small turn)
-        Pivot, Axis, Angle, Timing,                              // a hinge
-        Blend                                                    // a group of two or more shapes
-    };
-
-    // Parameters moved together in one descent step (in few dimensions a random probe direction lines up with the
-    // gradient far more often).
-    enum class Part : signed char { All = -1, Position, Size, Rotation, Profile, Pivot, Axis, Angle, Timing, Blend };
-
+namespace Bakugan {
     struct Param {
-        Dof dof;
-        int id;                      // shape, hinge or group id
-        int axis;                    // 0..2 for the vector ones (Timing: 0 slide, 1 stretch the closing window; 2, 3
-                                     // the same for the opening window)
+        enum Kind : unsigned char { Shape, Hinge } kind;
+        int id;                  // shape or hinge id
+        int field;               // which of its numbers (a row of its table in params.cpp)
+        float unit;              // a typical step, in the number's own units (mm, radians, ...)
+        uint64_t Key() const { return ((uint64_t)kind << 56) | ((uint64_t)(uint32_t)id << 8) | (uint64_t)field; }
     };
 
-    // A part of a design: one element (a shape, a hinge or a group), and one part of its parameters or all of them.
-    // Also what a rewrite touched, so its lookahead tunes only that.
-    struct Focus {
-        int shape = -1;              // shape id
-        int shape2 = -1;             // a second shape (the other half of a split)
-        int hinge = -1;              // hinge id
-        int group = -1;              // group id (its blend)
-        Part part = Part::All;
-    };
-
-    class Parameters {
-    public:
-        explicit Parameters(const DesignSpace& s) : m_Space(s) {}
-        // One unit of a kind: a small change comparable to one unit of any other (the paper's grammar-specific
-        // scaling), relative to the mesh's size where it is a length.
-        float Unit(Dof k) const;
-        Part PartOf(Dof k) const;
-        // The parameters of a design, or of the focused element and part only.
-        std::vector<Param> Of(const Design& d, const Focus* only = nullptr) const;
-        // Moves every parameter by x[i] units, then pulls the design back into the design space.
-        void Step(Design& d, const std::vector<Param>& ps, const std::vector<float>& x) const;
-        // What the next descent step moves: a shape, a hinge or a blended group, each as likely as the next, and
-        // usually one part of its parameters, now and then (one in five) all of them.
-        Focus RandomBlock(const Design& d, Rng& rng) const;
-    private:
-        const DesignSpace& m_Space;
-    };
+    // The parameters of a design, in a fixed order. L is the mesh's size (units of lengths scale with it).
+    std::vector<Param> DesignParams(const Design& d, float L);
+    // The number a parameter stands for (nullptr when its shape or hinge is gone).
+    float* Ref(Design& d, const Param& p);
+    // Sets it, kept inside its range (sizes stay positive, rounding within 0..1, ...).
+    void SetParam(Design& d, const Param& p, float value, float L);
+    // After changing parameters: rotations and axes back to unit length.
+    void Tidy(Design& d);
 }

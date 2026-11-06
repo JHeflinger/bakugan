@@ -6,8 +6,7 @@ using namespace Bakugan;
 int main(int argc, char** argv) {
     SuiteParams p;
     p.folder = argv[1];
-    p.generate.iterations = argc > 2 ? atoi(argv[2]) : 1500;
-    p.generate.quality = 0;
+    p.generate.steps = argc > 2 ? atoi(argv[2]) : 1500;
     p.videoSize = argc > 3 ? atoi(argv[3]) : 720;
     p.searchSeconds = argc > 4 ? atof(argv[4]) : 4.0f;
     JobControl c;

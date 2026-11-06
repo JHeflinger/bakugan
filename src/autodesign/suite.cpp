@@ -1,5 +1,8 @@
 #include "suite.hpp"
-#include "common.hpp"
+#include "util/box.hpp"
+#include <atomic>
+#include <functional>
+#include <thread>
 #include "suite_draw.hpp"
 #include "util/utils.hpp"
 #include <algorithm>
@@ -103,12 +106,26 @@ namespace Bakugan {
             return m.part == Part::Search ? std::min(last, m.k * (int)e.frames.size() / std::max(1, m.of)) : last;
         }
 
+        // f(0) .. f(n - 1) on every core.
+        void ParallelFor(int n, const std::function<void(int)>& f) {
+            int workers = std::min(n, std::max(1, (int)std::thread::hardware_concurrency()));
+            std::atomic<int> next{ 0 };
+            auto work = [&] {
+                for (int i = next++; i < n; i = next++) f(i);
+            };
+            std::vector<std::thread> threads;
+            for (int k = 1; k < workers; k++) threads.emplace_back(work);
+            work();
+            for (std::thread& t : threads) t.join();
+        }
+
         // Centred, its longest side `size` mm (0: as it is).
         void Normalize(TriMesh& m, float size) {
             Vector3 lo = { FLT_MAX, FLT_MAX, FLT_MAX }, hi = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
             for (Vector3 p : m.positions) { lo = Vector3Min(lo, p); hi = Vector3Max(hi, p); }
             Vector3 c = Vector3Scale(Vector3Add(lo, hi), 0.5f);
-            float big = Auto::MaxOf(Vector3Subtract(hi, lo));
+            Vector3 e = Vector3Subtract(hi, lo);
+            float big = fmaxf(e.x, fmaxf(e.y, e.z));
             float k = size > 0.0f && big > 0.0f ? size / big : 1.0f;
             for (Vector3& p : m.positions) p = Vector3Scale(Vector3Subtract(p, c), k);
             m.box = { Vector3Scale(Vector3Subtract(lo, c), k), Vector3Scale(Vector3Subtract(hi, c), k) };
@@ -127,10 +144,8 @@ namespace Bakugan {
         // A design's score in a few words.
         std::vector<std::string> ScoreWords(const AutoScore& s) {
             std::vector<std::string> w = { Utils::Format("score %.3f", s.total) };
-            if (s.silhouettes) w.insert(w.end(), { "outline " + Pct(s.viewCover), "extra " + Pct(s.viewExtra), "sphere " + Pct(s.sphereViewCover) });
-            else w.insert(w.end(), { "cover " + Pct(s.fitCover), "outside " + Pct(s.fitOutside), "sphere " + Pct(s.sphereIoU) });
-            w.push_back(Utils::Format("overlap %.1f%%", (s.clashOpen + s.clashClosed) * 50.0f));
-            w.push_back(Utils::Format("moving %.1f%%", s.clashMotion * 100.0f));
+            w.insert(w.end(), { "outline " + Pct(s.viewCover), "extra " + Pct(s.viewExtra), "sphere " + Pct(s.sphereViewCover),
+                                "worst view " + Pct(s.worstView) });
             return w;
         }
 
@@ -366,12 +381,12 @@ namespace Bakugan {
                 continue;
             }
             e.result = r.design;
-            e.iterations = ap.iterations;
+            e.iterations = ap.steps;
             {
                 std::lock_guard<std::mutex> l(search->mutex);
                 e.frames = search->frames;
             }
-            if (e.frames.empty()) e.frames.push_back({ r.design, r.score, ap.iterations });
+            if (e.frames.empty()) e.frames.push_back({ r.design, r.score, ap.steps });
             std::ofstream(outDir / (e.name + ".txt")) << r.design.Serialize();
             entries.push_back(std::move(e));
         }
@@ -382,9 +397,8 @@ namespace Bakugan {
         const int n = (int)entries.size();
         const Layout L(p.videoSize, n);
         const int rw = L.RasterW(), rh = L.RasterH();
-        Auto::Pool pool(std::max(0, (int)std::thread::hardware_concurrency() - 1));
         phase("Framing");
-        pool.For(n, [&](int i) { Frame(entries[i], rw, rh); });
+        ParallelFor(n, [&](int i) { Frame(entries[i], rw, rh); });
 
         // 4. the video, frame by frame into ffmpeg
         Encoder encoder;
@@ -397,7 +411,7 @@ namespace Bakugan {
         phase("Rendering");
         for (size_t f = 0; f < timeline.size() && !writeFailed && !c.Cancelled(); f++) {
             const Moment& m = timeline[f];
-            pool.For(n, [&](int i) { Render(entries[i], m, rw, rh, rasters[i]); });
+            ParallelFor(n, [&](int i) { Render(entries[i], m, rw, rh, rasters[i]); });
             cv.Fill(0, 0, L.S, L.S, White);
             for (int i = 0; i < n; i++) DrawCell(cv, L, i, entries[i], rasters[i], m);
             cv.Rgb24(&bytes);
