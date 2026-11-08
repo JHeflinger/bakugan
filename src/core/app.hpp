@@ -149,6 +149,7 @@ namespace Bakugan {
         void GenerateGoal();
         void GenerateStart();
         void GenerateOptimizer();
+        void GenerateGrammar();
         void GenerateRun();
         void GenerateScore();
         void GenerateTimeline();

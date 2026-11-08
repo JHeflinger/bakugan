@@ -1,5 +1,6 @@
 #include "loss.hpp"
 #include "util/box.hpp"
+#include "adam.hpp"
 #include "data/field.hpp"
 #include <raymath.h>
 #include <algorithm>
@@ -88,7 +89,8 @@ namespace Bakugan {
             moment = Vector3Add(moment, Vector3Scale(Vector3Add(a, Vector3Add(b, c)), (float)(v / 4.0)));
         }
         bool closed = fabs(volume) > 1e-9 * m_L * m_L * m_L;
-        m_SphereCentre = closed ? Vector3Add(m_Centre, Vector3Scale(moment, (float)(1.0 / volume))) : m_Centre;
+        m_SphereStart = closed ? Vector3Add(m_Centre, Vector3Scale(moment, (float)(1.0 / volume))) : m_Centre;
+        m_SphereCentre = m_SphereStart;
         m_SphereRadius = p.sphereDiameter > 0.0f ? 0.5f * p.sphereDiameter : (closed ? (float)cbrt(3.0 * fabs(volume) / (4.0 * PI)) : 0.25f * m_L);
 
         // points on the surface (area weighted), where the grammar puts new shapes; and the collisions' sample points
@@ -116,8 +118,8 @@ namespace Bakugan {
         return { (Vector3DotProduct(q, w.u) / m_Half + 1.0f) * 0.5f * m_Res, (1.0f - Vector3DotProduct(q, w.v) / m_Half) * 0.5f * m_Res };
     }
 
-    float Loss::Disc(const View& w, int x, int y) const {
-        Vector2 c = ToPixel(w, m_SphereCentre);
+    float Loss::Disc(const View& w, int x, int y, Vector3 centre) const {
+        Vector2 c = ToPixel(w, centre);
         float dx = x + 0.5f - c.x, dy = y + 0.5f - c.y;
         return std::clamp(m_SphereRadius / (2.0f * m_Half / m_Res) - sqrtf(dx * dx + dy * dy) + 0.5f, 0.0f, 1.0f);
     }
@@ -153,6 +155,19 @@ namespace Bakugan {
             if (d < dmin) { dmin = d; tmin = t; }
             if (d < -m_Tau) break;                       // well inside: fully covered
             t += d > m_Tau ? 0.9f * d : 0.5f * m_Tau;    // small steps near the surface
+        }
+        if (fabsf(dmin) < m_Tau) {
+            // on the soft edge: the steps only bracket the nearest point, so close in on it (golden section), or the
+            // edge would shift with where the steps happen to land, i.e. with how the body's field is put together
+            const float g = 0.618034f, h = 0.5f * m_Tau;
+            float a = tmin - h, b = tmin + h;
+            for (int k = 0; k < 8; k++) {
+                float c = b - g * (b - a), e = a + g * (b - a);
+                float dc = f.Distance(Vector3Add(lo, Vector3Scale(dir, c))), de = f.Distance(Vector3Add(lo, Vector3Scale(dir, e)));
+                if (dc < dmin) { dmin = dc; tmin = c; }
+                if (de < dmin) { dmin = de; tmin = e; }
+                if (dc < de) b = e; else a = c;
+            }
         }
         *at = Vector3Add(o, Vector3Scale(w.dir, tmin));
         return dmin;
@@ -207,9 +222,11 @@ namespace Bakugan {
 
     // ---- the loss -------------------------------------------------------------------------------------------------------
 
-    AutoScore Loss::Evaluate(const Design& d, const std::vector<Param>& ps, std::vector<float>* grad) {
+    AutoScore Loss::Evaluate(const Design& d, Vector3 sphere, const std::vector<Param>& ps, std::vector<float>* grad, Vector3* sphereGrad) {
         AutoScore s;
-        s.centre = m_SphereCentre;
+        m_SphereCentre = sphere;
+        s.centre = sphere;
+        if (sphereGrad) *sphereGrad = { 0, 0, 0 };
         s.radius = m_SphereRadius;
         if (grad) grad->assign(ps.size(), 0.0f);
 
@@ -222,7 +239,11 @@ namespace Bakugan {
             b.fields.push_back(std::move(f));
             b.group.push_back(g);
         }
+        m_Extra.clear();
+        m_Overlaps.clear();
         if (b.fields.empty()) return s;
+        b.fieldOf.assign(d.groups.size(), -1);
+        for (size_t i = 0; i < b.group.size(); i++) b.fieldOf[b.group[i]] = (int)i;
         s.checkTimes = m_P.collisionWeight > 0.0f ? CheckTimes(d, m_P.motionChecks, m_P.motionCheckBias) : std::vector<float>{};
         b.times = { 0.0f, 1.0f };
         b.times.insert(b.times.end(), s.checkTimes.begin(), s.checkTimes.end());
@@ -231,11 +252,78 @@ namespace Bakugan {
         Slopes slopes(b.fields.size());
         Silhouettes(b, s, slopes);
         if (m_P.collisionWeight > 0.0f) Collisions(b, s, slopes);
+        Hinges(d, b, s);
         s.total = (1.0f - std::clamp(m_P.sphereBias, 0.0f, 1.0f)) * s.fit + std::clamp(m_P.sphereBias, 0.0f, 1.0f) * s.sphere +
-                  s.coveragePenalty + m_P.collisionWeight * s.collision;
+                  s.coveragePenalty + m_P.collisionWeight * s.collision + m_P.hingeWeight * s.hinges;
         s.valid = true;
         if (grad && !ps.empty()) Gradient(d, b, slopes, ps, *grad);
+        // the sphere's centre only moves the closed pose's target: its slope comes from that part of the loss alone,
+        // measured again with the disc shifted a quarter pixel either way (the silhouettes stay as drawn)
+        if (sphereGrad) {
+            const float h = 0.25f * 2.0f * m_Half / m_Res;
+            for (int a = 0; a < 3; a++) {
+                Vector3 e = { 0, 0, 0 };
+                (&e.x)[a] = h;
+                (&sphereGrad->x)[a] = (ClosedLoss(Vector3Add(sphere, e)) - ClosedLoss(Vector3Subtract(sphere, e))) / (2.0f * h) * SphereUnit();
+            }
+        }
         return s;
+    }
+
+    // The closed pose's share of the loss: the goal's weight on the mean sphere loss over the views, and the coverage
+    // penalty of its views (as in Silhouettes).
+    float Loss::ClosedLoss(Vector3 centre) const {
+        const int nv = (int)m_Views.size(), px = m_Res * m_Res;
+        const float bias = std::clamp(m_P.sphereBias, 0.0f, 1.0f), minCover = std::clamp(m_P.minViewCoverage, 0.0f, 1.0f);
+        if (m_Cover[1].size() != (size_t)nv * px) return 0.0f;
+        double loss = 0.0;
+        for (int v = 0; v < nv; v++) {
+            const float* D = m_Cover[1].data() + (size_t)v * px;
+            double tsum = 0.0, hit = 0.0, spill = 0.0;
+            for (int k = 0; k < px; k++) {
+                float t = Disc(m_Views[v], k % m_Res, k / m_Res, centre);
+                tsum += t;
+                hit += fminf(t, D[k]);
+                spill += fmaxf(0.0f, D[k] - t);
+            }
+            if (tsum <= 0.0) continue;
+            double cover = hit / tsum;
+            loss += bias / nv * ((1.0 - cover) + spill / tsum);
+            if (bias > 0.0f) loss += 10.0 * fmax(0.0, minCover - cover);
+        }
+        return (float)loss;
+    }
+
+    std::vector<Vector3> Loss::ViewDirections() const {
+        std::vector<Vector3> out;
+        for (const View& w : m_Views) out.push_back(w.dir);
+        return out;
+    }
+
+    Vector3 Loss::KeepSphereInFrame(Vector3 c) const {
+        float room = m_Half - m_SphereRadius;            // how far its centre may be from the frame's
+        Vector3 off = Vector3Subtract(c, m_Centre);
+        float l = Vector3Length(off);
+        if (room <= 0.0f) return m_Centre;
+        return l > room ? Vector3Add(m_Centre, Vector3Scale(off, room / l)) : c;
+    }
+
+    Vector3 Loss::FitSphere(const Design& d) {
+        Evaluate(d, m_SphereStart, {}, nullptr);         // draws the closed pose
+        Adam adam;
+        Vector3 c = m_SphereStart;
+        const float unit = SphereUnit(), h = 0.25f * 2.0f * m_Half / m_Res;
+        for (int k = 0; k < 300; k++) {
+            std::vector<float> x = { c.x / unit, c.y / unit, c.z / unit }, g(3);
+            for (int a = 0; a < 3; a++) {
+                Vector3 e = { 0, 0, 0 };
+                (&e.x)[a] = h;
+                g[a] = (ClosedLoss(Vector3Add(c, e)) - ClosedLoss(Vector3Subtract(c, e))) / (2.0f * h) * unit;
+            }
+            adam.Step({ 0, 1, 2 }, x, g);
+            c = KeepSphereInFrame({ x[0] * unit, x[1] * unit, x[2] * unit });
+        }
+        return ClosedLoss(c) <= ClosedLoss(m_SphereStart) ? c : m_SphereStart;
     }
 
     // ---- silhouettes ------------------------------------------------------------------------------------------------------
@@ -278,7 +366,7 @@ namespace Bakugan {
             double lossSum = 0.0, coverSum = 0.0, extraSum = 0.0;
             for (int v = 0; v < nv; v++) {
                 const float* D = m_Cover[pose].data() + (size_t)v * px;
-                auto target = [&](int k) { return pose == 0 ? m_Mesh[v][k] : Disc(m_Views[v], k % m_Res, k / m_Res); };
+                auto target = [&](int k) { return pose == 0 ? m_Mesh[v][k] : Disc(m_Views[v], k % m_Res, k / m_Res, m_SphereCentre); };
                 double tsum = 0.0, hit = 0.0, spill = 0.0;
                 for (int k = 0; k < px; k++) {
                     float t = target(k);
@@ -300,6 +388,11 @@ namespace Bakugan {
                     size_t kk = (size_t)v * px + k;
                     float c = D[k], t = target(k);
                     int i = who[pose][kk];
+                    if (pose == 0 && i >= 0 && c - t > 0.5f && kk % 7 == 0) {     // a sparse sample of the extra pixels
+                        const Rigid& xf = b.xf[0][b.group[i]];
+                        Quaternion inv = { -xf.rotation.x, -xf.rotation.y, -xf.rotation.z, xf.rotation.w };
+                        m_Extra.push_back({ b.group[i], xf.ApplyInverse(at[pose][kk]), Vector3RotateByQuaternion(m_Views[v].dir, inv) });
+                    }
                     if (i < 0 || c <= 0.0f || c >= 1.0f || c == t) continue;     // not on an edge, or no slope
                     float dD = c < t ? (float)((-weight - (shortOf ? 10.0f : 0.0f)) / tsum) : (float)(weight / tsum);
                     slopes[i].push_back({ pose, at[pose][kk], dD * (-1.0f / (2.0f * m_Tau)) });
@@ -316,7 +409,7 @@ namespace Bakugan {
     // In every pose, every two bodies whose boxes meet are sampled where they meet (the same unit points each time). A
     // point inside both by dd (the larger, so nearer zero, of their two distances, both negative) adds dd's depth
     // times its share of the box's volume; its slope goes to the body whose distance that is.
-    void Loss::Collisions(const Bodies& b, AutoScore& s, Slopes& slopes) const {
+    void Loss::Collisions(const Bodies& b, AutoScore& s, Slopes& slopes) {
         const double sphereVolume = 4.0 / 3.0 * PI * pow(m_SphereRadius, 3.0), norm = sphereVolume * 0.02 * m_L;
         const int poses = (int)b.times.size(), between = poses - 2;
         struct Pair {
@@ -324,6 +417,7 @@ namespace Bakugan {
             BoundingBox meet;
             double depth = 0.0, volume = 0.0;
             std::vector<std::pair<int, Slope>> slopes;
+            std::vector<Spot> spots;             // a few overlapping points, in each body's frame
         };
         std::vector<Pair> pairs;
         for (int pose = 0; pose < poses; pose++) {
@@ -355,6 +449,10 @@ namespace Bakugan {
                 pr.volume += dv;
                 // d loss / d dd = -weight · poseWeight · dv / norm
                 pr.slopes.push_back({ da > dc ? pr.a : pr.c, { pr.pose, p, (float)(-m_P.collisionWeight * poseWeight * dv / norm) } });
+                if (pr.spots.size() < 8) {
+                    pr.spots.push_back({ b.group[pr.a], qa, { 0, 0, 1 } });
+                    pr.spots.push_back({ b.group[pr.c], qc, { 0, 0, 1 } });
+                }
             }
         });
         std::vector<double> depth(poses, 0.0), volume(poses, 0.0);
@@ -362,6 +460,7 @@ namespace Bakugan {
             depth[pr.pose] += pr.depth;
             volume[pr.pose] += pr.volume;
             for (const auto& [field, slope] : pr.slopes) slopes[field].push_back(slope);
+            m_Overlaps.insert(m_Overlaps.end(), pr.spots.begin(), pr.spots.end());
         }
         double betweenSum = 0.0;
         for (int pose = 2; pose < poses; pose++) {
@@ -377,16 +476,29 @@ namespace Bakugan {
         s.clashClosed = (float)(volume[1] / sphereVolume);
     }
 
+    // ---- hinges ----------------------------------------------------------------------------------------------------------
+
+    // Each pivot against the two bodies it joins, both in the design pose (the frame pivots are given in).
+    void Loss::Hinges(const Design& d, const Bodies& b, AutoScore& s) const {
+        for (const Hinge& h : d.hinges) {
+            int pg = d.GroupIndex(h.parent), cg = d.GroupIndex(h.child);
+            int pi = pg >= 0 ? b.fieldOf[pg] : -1, ci = cg >= 0 ? b.fieldOf[cg] : -1;
+            if (pi < 0 || ci < 0) continue;
+            s.hinges += (PivotGap(b.fields[pi], h.pivot) + PivotGap(b.fields[ci], h.pivot)) / m_L;
+            s.hingeGap = fmaxf(s.hingeGap, fmaxf(b.fields[pi].Distance(h.pivot), b.fields[ci].Distance(h.pivot)));
+        }
+    }
+
     // ---- the gradient -------------------------------------------------------------------------------------------------------
 
     // d loss / d parameter = sum over the slopes of (slope · d distance / d parameter). To first order a distance only
     // changes through the body's field and pose at its fixed world point (for a silhouette's ray, where it comes
     // closest: the envelope theorem), so d distance / d parameter comes from central differences there: the parameter
     // nudged either way, the body's field (a shape's parameter) or the poses (a hinge's) rebuilt, the distance measured
-    // again. The poses' times stay as they were (the checks are placed by the design, not part of what is moved).
+    // again. The hinge term is measured again directly, for the hinges the parameter touches. The poses' times stay as
+    // they were (the checks are placed by the design, not part of what is moved).
     void Loss::Gradient(const Design& d, const Bodies& b, const Slopes& slopes, const std::vector<Param>& ps, std::vector<float>& grad) const {
-        std::vector<int> fieldOf(d.groups.size(), -1);               // group index -> field
-        for (size_t i = 0; i < b.group.size(); i++) fieldOf[b.group[i]] = (int)i;
+        const std::vector<int>& fieldOf = b.fieldOf;
         ParallelFor((int)ps.size(), [&](int j) {
             const Param& p = ps[j];
             double sum[2] = { 0.0, 0.0 };
@@ -415,6 +527,18 @@ namespace Bakugan {
                         if (!fieldMoves && !poseMoves) continue;        // this parameter doesn't touch it
                         sum[side] += sl.weight * (fieldMoves ? changed : b.fields[i]).Distance(after.ApplyInverse(sl.at));
                     }
+                // the hinge term, for the hinges this parameter touches: a pivot it moves, or a body whose field it changes
+                if (m_P.hingeWeight > 0.0f)
+                    for (const Hinge& h : e.hinges) {
+                        int pg = e.GroupIndex(h.parent), cg = e.GroupIndex(h.child);
+                        int pi = pg >= 0 ? fieldOf[pg] : -1, ci = cg >= 0 ? fieldOf[cg] : -1;
+                        if (pi < 0 || ci < 0) continue;
+                        bool pivotMoves = p.kind == Param::Hinge && p.id == h.id && p.field < 3;
+                        if (!pivotMoves && own != pi && own != ci) continue;
+                        const BodyField& pf = own == pi ? changed : b.fields[pi];
+                        const BodyField& cf = own == ci ? changed : b.fields[ci];
+                        sum[side] += m_P.hingeWeight * (PivotGap(pf, h.pivot) + PivotGap(cf, h.pivot)) / m_L;
+                    }
             }
             float step = value[0] - value[1];
             if (step > 0.0f) grad[j] = (float)((sum[0] - sum[1]) / step) * p.unit;    // per unit of the parameter
@@ -436,7 +560,7 @@ namespace Bakugan {
             for (int v = 0; v < nv; v++)
                 for (int k = 0; k < px; k++) {
                     int x = k % m_Res, y = k / m_Res;
-                    float t = pose == 0 ? m_Mesh[v][k] : Disc(m_Views[v], x, y), dd = m_Cover[pose][(size_t)v * px + k];
+                    float t = pose == 0 ? m_Mesh[v][k] : Disc(m_Views[v], x, y, m_SphereCentre), dd = m_Cover[pose][(size_t)v * px + k];
                     float ov = fminf(t, dd), ms = t - ov, ex = dd - ov, rest = 1.0f - fmaxf(t, dd);
                     unsigned char* out = &(*rgba)[((size_t)(gap + pose * (m_Res + gap) + y) * *w + gap + v * (m_Res + gap) + x) * 4];
                     for (int c = 0; c < 3; c++) out[c] = (unsigned char)std::clamp(lroundf(ov * both[c] + ms * miss[c] + ex * extra[c] + rest * 255.0f), 0L, 255L);

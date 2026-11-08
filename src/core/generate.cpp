@@ -28,6 +28,7 @@ namespace Bakugan {
         if (p.fromCurrent && m_Design.shapes.empty()) p.fromCurrent = false;
         Design start = m_Design;
         m_AutoLive = std::make_shared<AutoLive>();
+        m_AutoLive->ruleWeights = p.ruleWeights;      // the Grammar sliders change these while it runs
         std::shared_ptr<AutoLive> live = m_AutoLive;
         m_AutoSeen = -1;
         m_AutoScoreOnly = scoreOnly;

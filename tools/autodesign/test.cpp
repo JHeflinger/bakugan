@@ -1,8 +1,10 @@
 // Headless run of the generator: ./autotest mesh.obj [steps] [sphereBias] [seed] [outPrefix]
-// Env: VIEWS, VRES, LR, ROUND (steps per round), REWRITES, LOOKAHEAD, MAXBODIES.
+// Env: VIEWS, VRES, LR, ROUND (steps per round), REWRITES, LOOKAHEAD, MAXBODIES, WEIGHTS (the rules', e.g. 1,1,1,0.5,0.5,0.5,0.5,0.5).
 // Writes <outPrefix>_design.txt (open it in the editor) and <outPrefix>_views.ppm (silhouettes against targets).
 #include "autodesign/autodesign.hpp"
 #include "autodesign/suite.hpp"
+#include "data/field.hpp"
+#include <cmath>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -22,7 +24,15 @@ int main(int argc, char** argv) {
     auto env = [](const char* name, auto& value) { if (const char* s = getenv(name)) value = (std::remove_reference_t<decltype(value)>)atof(s); };
     env("VIEWS", p.views); env("VRES", p.viewResolution); env("LR", p.learningRate); env("ROUND", p.stepsPerRound);
     env("REWRITES", p.rewritesPerRound); env("LOOKAHEAD", p.lookahead); env("MAXBODIES", p.maxBodies);
+    if (getenv("FIXSPHERE")) p.moveSphere = false;
+    env("HINGEW", p.hingeWeight);
     env("COLW", p.collisionWeight); env("CHECKS", p.motionChecks); env("CHECKBIAS", p.motionCheckBias);
+    if (const char* w = getenv("WEIGHTS"))          // the grammar's weights, comma separated, in AutoRules() order
+        for (const char* q = w; *q; q++) {
+            p.ruleWeights.push_back((float)atof(q));
+            while (*q && *q != ',') q++;
+            if (!*q) break;
+        }
 
     JobControl c;
     auto live = std::make_shared<AutoLive>();
@@ -41,6 +51,19 @@ int main(int argc, char** argv) {
         fclose(f);
     }
     printf("%s\n%.1f s (%.1f ms a step)\n", r.message.c_str(), secs, 1000.0 * secs / std::max(1, p.steps));
+    {
+        // every pivot against its two bodies, in mm, whatever the run's weights
+        float worst = 0.0f, sum = 0.0f;
+        for (const Hinge& h : r.design.hinges) {
+            BodyField a = BodyField::Body(r.design, h.parent), b = BodyField::Body(r.design, h.child);
+            float g = fmaxf(fmaxf(a.Distance(h.pivot), b.Distance(h.pivot)), 0.0f);
+            worst = fmaxf(worst, g);
+            sum += g;
+        }
+        printf("pivots: farthest %.1f mm outside a body, mean %.1f mm (%d hinges)\n", worst, r.design.hinges.empty() ? 0.0f : sum / r.design.hinges.size(),
+               (int)r.design.hinges.size());
+    }
+    printf("sphere: centre %.1f %.1f %.1f, %.1f mm across\n", r.score.centre.x, r.score.centre.y, r.score.centre.z, 2.0f * r.score.radius);
     {
         // the result checked for overlaps the same way whatever the run used: 32 poses between, evenly over the motion
         AutoParams q = p;

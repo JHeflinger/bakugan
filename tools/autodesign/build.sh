@@ -6,6 +6,7 @@
 #   ./gradcheck mesh.obj      the loss's gradient against brute force differences of the whole loss
 #   ./adamtest                Adam's memory as parameters come and go
 #   ./checktimes              where the collision checks between open and closed go, for a few hinge timings
+#   ./rulecheck mesh.obj      splitting a body changes no pose; merging two keeps the open pose
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC="$HERE/../../src"
@@ -17,3 +18,4 @@ g++ $FLAGS "$HERE/suitetest.cpp" $CODE -lpthread -o "$HERE/suitetest"
 g++ $FLAGS "$HERE/gradcheck.cpp" $CODE -lpthread -o "$HERE/gradcheck"
 g++ $FLAGS "$HERE/adamtest.cpp" -o "$HERE/adamtest"
 g++ $FLAGS "$HERE/checktimes.cpp" $CODE -lpthread -o "$HERE/checktimes"
+g++ $FLAGS "$HERE/rulecheck.cpp" $CODE -lpthread -o "$HERE/rulecheck"

@@ -21,6 +21,7 @@ namespace Bakugan {
         GenerateStart();
         GenerateOptimizer();
         ImGui::EndDisabled();
+        GenerateGrammar();                   // changes take while it runs too
         GenerateRun();
         if (m_HasAutoScore) GenerateScore();
         GenerateSuite();
@@ -86,8 +87,14 @@ namespace Bakugan {
         ImGui::SetItemTooltip("0: the poses between are spread evenly over the times any hinge moves. 1: placed by how many\n"
                               "hinges move at once. Between, a mix: some evenly everywhere a hinge moves, the rest where most do.");
         ImGui::EndDisabled();
+        ImGui::SliderFloat("Hinges on bodies", &p.hingeWeight, 0.0f, 10.0f, p.hingeWeight > 0.0f ? "%.2f" : "ignored");
+        ImGui::SetItemTooltip("What a hinge's pivot being away from the two bodies it joins costs: how far it is outside\n"
+                              "each, beyond 1%% of the mesh's size, over the mesh's size. A real hinge sits where its bodies meet.");
         ImGui::DragFloat("Sphere size", &p.sphereDiameter, 0.5f, 0.0f, 500.0f, p.sphereDiameter > 0.0f ? "%.1f mm across" : "auto");
-        ImGui::SetItemTooltip("Diameter the closed design should have. Auto: a sphere of the mesh's volume, at its centre.");
+        ImGui::SetItemTooltip("Diameter the closed design should have. Auto: a sphere of the mesh's volume.");
+        ImGui::Checkbox("Sphere can move", &p.moveSphere);
+        ImGui::SetItemTooltip("The sphere starts at the mesh's centre of volume. On, the optimizer moves it too, so the closed\n"
+                              "design can be a sphere anywhere (it stays where the views can see it). Off, it stays put.");
     }
 
     void App::GenerateStart() {
@@ -113,10 +120,14 @@ namespace Bakugan {
         ImGui::SliderInt("Steps per round", &p.stepsPerRound, 5, 500);
         ImGui::SetItemTooltip("Adam steps between rewrite rounds");
         ImGui::SliderInt("Rewrites per round", &p.rewritesPerRound, 0, 12);
-        ImGui::SetItemTooltip("Grammar rewrites tried in a round (now: adding a small superfrustum on a hinge)");
+        ImGui::SetItemTooltip("Grammar rewrites tried in a round (drawn by the Grammar weights below)");
         ImGui::SliderInt("Lookahead", &p.lookahead, 1, 100);
         ImGui::SetItemTooltip("Adam steps every rewrite, and the design without one, get before they are compared:\n"
                               "the best of them carries on");
+        ImGui::SliderFloat("Rewrite margin", &p.rewriteMargin, 0.0f, 0.05f, "%.3f");
+        ImGui::SetItemTooltip("How much better (a share of the loss) a rewrite that adds something must do than leaving the design\n"
+                              "alone to be kept (ones that only win by noise are clutter), and how much worse one that removes\n"
+                              "something may do (a simpler design that does about as well is better)");
         ImGui::SliderInt("Max bodies", &p.maxBodies, 2, 16);
         int seed = (int)p.seed;
         ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
@@ -124,6 +135,35 @@ namespace Bakugan {
         ImGui::SetItemTooltip("Same seed and settings, same result");
         ImGui::SameLine();
         if (ImGui::Button("Shuffle")) p.seed = (unsigned)GetRandomValue(1, 999999);
+    }
+
+    // How often each grammar rule is drawn for a rewrite. Live: a run reads them at every rewrite round.
+    void App::GenerateGrammar() {
+        static const std::vector<AutoRuleInfo> rules = AutoRules();
+        AutoParams& p = m_AutoParams;
+        if (p.ruleWeights.size() != rules.size()) {
+            p.ruleWeights.resize(rules.size());
+            for (size_t i = 0; i < rules.size(); i++) p.ruleWeights[i] = rules[i].weight;
+        }
+        ImGui::SeparatorText("Grammar");
+        Hint("How often each rewrite is drawn (0: never). These apply while it runs, from its next rewrite round.");
+        bool changed = false;
+        for (size_t i = 0; i < rules.size(); i++) {
+            ImGui::PushID((int)i);
+            changed |= ImGui::SliderFloat(rules[i].name.c_str(), &p.ruleWeights[i], 0.0f, 3.0f, "%.2f");
+            p.ruleWeights[i] = std::max(p.ruleWeights[i], 0.0f);     // typed in (Ctrl+click) below the range
+            ImGui::SetItemTooltip(rules[i].simplifies ? "Takes something away: kept when the design does no worse (within the rewrite margin)"
+                                                      : "Adds something: kept when the design does better (by the rewrite margin)");
+            ImGui::PopID();
+        }
+        if (ImGui::Button("Default weights")) {
+            for (size_t i = 0; i < rules.size(); i++) p.ruleWeights[i] = rules[i].weight;
+            changed = true;
+        }
+        if (changed && m_AutoLive) {
+            std::lock_guard<std::mutex> l(m_AutoLive->mutex);
+            m_AutoLive->ruleWeights = p.ruleWeights;
+        }
     }
 
     // The buttons, or the progress of a run.
@@ -204,10 +244,16 @@ namespace Bakugan {
         ImGui::SetItemTooltip("Volume inside two bodies at once, as a share of the sphere's. Worst between: at %.0f%% of the\n"
                               "closing motion.", s.clashMotionT * 100.0f);
         GenerateTimeline();
-        ImGui::TextDisabled("loss %.3f (fit %.3f, sphere %.3f, coverage %.3f, collisions %.3f)", s.total, s.fit, s.sphere, s.coveragePenalty, s.collision);
-        ImGui::SetItemTooltip("Lower is better: (1 - goal) * fit + goal * sphere + coverage penalty + collisions * their weight.\n"
+        ImVec4 pivotColor = s.hingeGap > 0.02f * Vector3Distance(ReferenceBounds().min, ReferenceBounds().max) ? Amber
+                                                                                                             : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+        ImGui::TextColored(pivotColor, "Farthest pivot %.1f mm outside one of its bodies", fmaxf(s.hingeGap, 0.0f));
+        ImGui::TextDisabled("loss %.3f (fit %.3f, sphere %.3f, coverage %.3f, collisions %.3f, hinges %.3f)", s.total, s.fit, s.sphere,
+                            s.coveragePenalty, s.collision, s.hinges);
+        ImGui::SetItemTooltip("Lower is better: (1 - goal) * fit + goal * sphere + coverage penalty + collisions * their weight\n"
+                              "+ hinges * their weight.\n"
                               "Fit and sphere: the mean over the views of the share of the target missed plus the share of\n"
-                              "extra pixels. Collisions: overlap depth over its volume, against the sphere's volume.");
+                              "extra pixels. Collisions: overlap depth over its volume, against the sphere's volume.\n"
+                              "Hinges: how far pivots are outside their bodies (beyond 1%% of the mesh's size), over its size.");
         ImGui::TextDisabled("sphere %.1f mm across", s.radius * 2.0f);
         if (m_AutoHistory.size() > 1) {
             auto [lo, hi] = std::minmax_element(m_AutoHistory.begin(), m_AutoHistory.end());
