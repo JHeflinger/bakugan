@@ -18,6 +18,7 @@ namespace Bakugan {
         GenerateInput();
         ImGui::BeginDisabled(m_AutoJob.Busy());
         GenerateGoal();
+        GenerateSemantic();
         GenerateStart();
         GenerateOptimizer();
         ImGui::EndDisabled();
@@ -95,6 +96,67 @@ namespace Bakugan {
         ImGui::Checkbox("Sphere can move", &p.moveSphere);
         ImGui::SetItemTooltip("The sphere starts at the mesh's centre of volume. On, the optimizer moves it too, so the closed\n"
                               "design can be a sphere anywhere (it stays where the views can see it). Off, it stays put.");
+    }
+
+    // DINOv3 comparing the views as pictures (see autodesign/semantic.cpp): what it costs, the model and runtime, how the
+    // views are drawn, and which embeddings are compared.
+    void App::GenerateSemantic() {
+        AutoParams& p = m_AutoParams;
+        ImGui::SeparatorText("Semantic loss (DINOv3)");
+        ImGui::SliderFloat("Semantic", &p.semanticWeight, 0.0f, 5.0f, p.semanticWeight > 0.0f ? "%.2f" : "off");
+        ImGui::SetItemTooltip("What the views looking different to DINOv3 costs: each view of the open design is compared with\n"
+                              "the mesh's, each of the closed design with the sphere's (weighed by the goal, as silhouettes are)");
+        ImGui::SliderFloat("Silhouettes", &p.silhouetteWeight, 0.0f, 5.0f, p.silhouetteWeight > 0.0f ? "%.2f" : "off");
+        ImGui::SetItemTooltip("What the outline comparison (above) costs, beside it. 0: only DINOv3 judges how the design looks.");
+        if (p.semanticWeight <= 0.0f) return;
+
+        // a path, typed or browsed for
+        auto path = [&](const char* id, const char* hint, std::string& value, const char* filters, const char* tip) {
+            char buf[1024];
+            snprintf(buf, sizeof(buf), "%s", value.c_str());
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - ImGui::GetFrameHeight() * 2.2f);
+            if (ImGui::InputTextWithHint(id, hint, buf, sizeof(buf))) value = buf;
+            ImGui::SetItemTooltip("%s", tip);
+            ImGui::SameLine();
+            ImGui::PushID(id);
+            std::string chosen;
+            if (ImGui::Button("...", ImVec2(-FLT_MIN, 0)) && FileDialog(false, filters, value, &chosen)) value = chosen;
+            ImGui::PopID();
+        };
+        path("##model", "DINOv3 model (.onnx)", p.semanticModel, "onnx",
+             "The loss graph tools/autodesign/export_dinov3.py writes from DINOv3's weights. The views are drawn at the\n"
+             "size it was exported for (112 by default: 7 x 7 patches; 224 gives 14 x 14, about 4x slower).");
+        path("##ort", "ONNX Runtime library (empty: found as usual)", p.onnxRuntime, nullptr,
+             "onnxruntime.dll / libonnxruntime.so / libonnxruntime.dylib, from ONNX Runtime's releases or a pip install of\n"
+             "onnxruntime (in its capi folder). Empty: the system's usual search for that name.");
+        if (p.semanticModel.empty()) Warn("Choose the model (make it with tools/autodesign/export_dinov3.py).");
+
+        const char* looks[] = { "Silhouette", "Depth", "Shaded" };
+        int look = (int)p.semanticLook;
+        if (ImGui::Combo("Drawn as", &look, looks, 3)) p.semanticLook = (SemanticLook)look;
+        ImGui::SetItemTooltip("How the design, the mesh and the sphere are drawn for DINOv3, all alike:\n"
+                              "Silhouette: white on black. Depth: nearer is brighter.\n"
+                              "Shaded: a grey material under a key light and a fill light, on dark grey.");
+        int mode = p.patchWeight <= 0.0f ? 0 : (p.patchWeight >= 1.0f ? 1 : 2);
+        ImGui::TextUnformatted("Compare");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Global", mode == 0)) p.patchWeight = 0.0f;
+        ImGui::SetItemTooltip("Each view's global (CLS) embedding against the target's: what the whole picture is");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Patches", mode == 1)) p.patchWeight = 1.0f;
+        ImGui::SetItemTooltip("Each patch's embedding against the target's patch in the same place: what is where");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Mix", mode == 2)) p.patchWeight = 0.5f;
+        if (mode == 2) {
+            ImGui::SliderFloat("Patch share", &p.patchWeight, 0.01f, 0.99f, "%.2f");
+            ImGui::SetItemTooltip("How much the patch comparison counts against the global one");
+        }
+        ImGui::SliderInt("Shade samples", &p.semanticSamples, 0, 20000);
+        ImGui::SetItemTooltip("Covered pixels whose shading the gradient follows each step, drawn by how much each matters.\n"
+                              "More is a steadier gradient and slower; edges are always all followed. (Silhouettes have no\n"
+                              "shading to follow.)");
+        ImGui::Checkbox("Use the GPU (CUDA)", &p.semanticGpu);
+        ImGui::SetItemTooltip("Run DINOv3 with CUDA, if this ONNX Runtime has it (the onnxruntime-gpu builds); the CPU otherwise");
     }
 
     void App::GenerateStart() {
@@ -238,6 +300,13 @@ namespace Bakugan {
             ImGui::SetItemTooltip("Each view: open design vs the mesh (top), closed design vs the sphere (bottom).\n"
                                   "Dark: both cover the pixel. Red: only the target (missing). Blue: only the design (extra).");
         }
+        if (m_HasAutoSemantic) {
+            ImGui::TextDisabled("DINOv3: %.3f open, %.3f closed, worst view %.3f", s.semanticOpen, s.semanticClosed, s.worstSemantic);
+            ImGui::SetItemTooltip("Means over the views of DINOv3's loss against the targets (0: the same; 1 - cosine of the embeddings)");
+            float w = ImGui::GetContentRegionAvail().x;
+            rlImGuiImageSize(&m_AutoSemantic, (int)w, (int)(m_AutoSemantic.height * w / m_AutoSemantic.width));
+            ImGui::SetItemTooltip("What DINOv3 compares, per view: the mesh, the open design, the sphere, the closed design");
+        }
         ImVec4 clashColor = s.clashOpen + s.clashClosed + s.clashMotion > 0.005f ? Amber : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
         ImGui::TextColored(clashColor, "Overlapping: %.1f%% open, %.1f%% closed, %.1f%% worst between", s.clashOpen * 100.0f, s.clashClosed * 100.0f,
                            s.clashMotion * 100.0f);
@@ -247,10 +316,10 @@ namespace Bakugan {
         ImVec4 pivotColor = s.hingeGap > 0.02f * Vector3Distance(ReferenceBounds().min, ReferenceBounds().max) ? Amber
                                                                                                              : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
         ImGui::TextColored(pivotColor, "Farthest pivot %.1f mm outside one of its bodies", fmaxf(s.hingeGap, 0.0f));
-        ImGui::TextDisabled("loss %.3f (fit %.3f, sphere %.3f, coverage %.3f, collisions %.3f, hinges %.3f)", s.total, s.fit, s.sphere,
-                            s.coveragePenalty, s.collision, s.hinges);
-        ImGui::SetItemTooltip("Lower is better: (1 - goal) * fit + goal * sphere + coverage penalty + collisions * their weight\n"
-                              "+ hinges * their weight.\n"
+        ImGui::TextDisabled("loss %.3f (fit %.3f, sphere %.3f, coverage %.3f, semantic %.3f, collisions %.3f, hinges %.3f)", s.total, s.fit,
+                            s.sphere, s.coveragePenalty, s.semantic, s.collision, s.hinges);
+        ImGui::SetItemTooltip("Lower is better: silhouettes * ((1 - goal) * fit + goal * sphere + coverage penalty)\n"
+                              "+ semantic * its weight + collisions * their weight + hinges * their weight.\n"
                               "Fit and sphere: the mean over the views of the share of the target missed plus the share of\n"
                               "extra pixels. Collisions: overlap depth over its volume, against the sphere's volume.\n"
                               "Hinges: how far pivots are outside their bodies (beyond 1%% of the mesh's size), over its size.");

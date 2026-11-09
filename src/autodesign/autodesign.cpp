@@ -102,8 +102,12 @@ namespace Bakugan {
         if (mesh.indices.empty()) { res.message = "The mesh has no triangles."; return res; }
 
         // 1. the targets
-        c.SetStage("Drawing the mesh's silhouettes");
+        c.SetStage(p.semanticWeight > 0.0f ? "Drawing the mesh's views, loading DINOv3" : "Drawing the mesh's silhouettes");
         Loss loss(mesh, p);
+        if (p.semanticWeight > 0.0f && !loss.Semantic()) {      // asked for, and couldn't be had: say so rather than go without
+            res.message = loss.Error();
+            return res;
+        }
         std::mt19937 rng(p.seed);
         RuleContext rules{ loss, p, rng };
 
@@ -143,6 +147,7 @@ namespace Bakugan {
             live->best = best;
             live->score = bestScore;
             loss.Picture(&live->views, &live->viewsWidth, &live->viewsHeight);
+            loss.SemanticPicture(&live->semanticViews, &live->semanticWidth, &live->semanticHeight);
             live->version++;
         };
 
@@ -217,10 +222,17 @@ namespace Bakugan {
                                     (int)best.Bodies().size(), (int)best.hinges.size(), bestScore.viewCover * 100.0f, bestScore.viewExtra * 100.0f,
                                     bestScore.sphereViewCover * 100.0f, bestScore.sphereViewExtra * 100.0f, bestScore.worstView * 100.0f,
                                     bestScore.clashOpen * 100.0f, bestScore.clashClosed * 100.0f, bestScore.clashMotion * 100.0f, bestScore.total, steps, accepted, rounds);
+        if (loss.Semantic()) {
+            static const char* looks[] = { "silhouettes", "depth", "shaded" };
+            res.message += Utils::Format(" DINOv3 (%s, %s, on %s): %.3f open, %.3f closed.", looks[(int)p.semanticLook],
+                                         p.patchWeight <= 0.0f ? "global" : (p.patchWeight >= 1.0f ? "patches" : "global + patches"),
+                                         loss.SemanticDevice().c_str(), bestScore.semanticOpen, bestScore.semanticClosed);
+        }
         if (!kept.empty()) {
             res.message += " Kept:";
             for (const auto& [rule, n] : kept) res.message += Utils::Format(" %s x%d", rule.c_str(), n);
         }
+        if (!loss.Error().empty()) res.message += " " + loss.Error();
         return res;
     }
 }

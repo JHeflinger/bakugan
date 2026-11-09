@@ -53,6 +53,7 @@ namespace Bakugan {
             if (sm.loaded) UnloadModel(sm.model);
         if (m_HasReference) UnloadModel(m_Reference);
         if (m_HasAutoViews) UnloadTexture(m_AutoViews);
+        if (m_HasAutoSemantic) UnloadTexture(m_AutoSemantic);
         if (m_HasNotifySound) UnloadSound(m_NotifySound);
         if (m_Audio) CloseAudioDevice();
         m_Sdf.Unload();

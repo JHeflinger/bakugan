@@ -147,6 +147,7 @@ namespace Bakugan {
         void DrawGenerateTab();
         void GenerateInput();
         void GenerateGoal();
+        void GenerateSemantic();
         void GenerateStart();
         void GenerateOptimizer();
         void GenerateGrammar();
@@ -252,6 +253,8 @@ namespace Bakugan {
         Design m_AutoScoreFor;                        // the design m_AutoScore belongs to
         Texture2D m_AutoViews = {};                   // the silhouettes scored last, against their targets
         bool m_HasAutoViews = false;
+        Texture2D m_AutoSemantic = {};                // the semantic loss's views and their targets
+        bool m_HasAutoSemantic = false;
         bool m_ShowAutoSphere = true;
         std::vector<float> m_AutoHistory;
         double m_AutoStart = 0.0;

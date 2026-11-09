@@ -157,19 +157,6 @@ namespace Bakugan {
         }
 
         // ---- splitting and merging bodies ------------------------------------------------------------------------------
-        int CondenseContents(Design& d, int bodyId) {
-            int b = d.GroupIndex(bodyId);
-            if (b < 0) return -1;
-            std::vector<int> shapes = d.DirectShapes(bodyId), features;
-            for (int k : d.ChildGroups(bodyId)) features.push_back(d.groups[k].id);
-            int id = d.groups[d.AddGroup(d.groups[b].name, bodyId)].id;
-            Group& g = d.groups[d.GroupIndex(id)];
-            g.blend = d.groups[b].blend;
-            d.groups[b].blend = 0.0f;
-            for (int sh : shapes) d.MoveShape(sh, id);
-            for (int f : features) d.MoveGroup(d.GroupIndex(f), id);
-            return id;
-        }
 
         // A copy of a group (and everything in it) inside newParent (-1: as a body of its own). Returns its id.
         int CopyGroup(Design& d, int groupId, int newParent) {
@@ -186,6 +173,23 @@ namespace Bakugan {
             std::vector<int> children;
             for (int k : d.ChildGroups(groupId)) children.push_back(d.groups[k].id);
             for (int child : children) CopyGroup(d, child, id);
+            return id;
+        }
+
+        // Moves everything directly in a body (its shapes and features, cuts included) into one new feature of it, which
+        // takes over the body's blend. The body looks the same afterwards; it just holds that one feature. Returns the
+        // feature's id (-1: no such body).
+        int CondenseContents(Design& d, int bodyId) {
+            int b = d.GroupIndex(bodyId);
+            if (b < 0) return -1;
+            std::vector<int> shapes = d.DirectShapes(bodyId), features;
+            for (int k : d.ChildGroups(bodyId)) features.push_back(d.groups[k].id);
+            int id = d.groups[d.AddGroup(d.groups[b].name, bodyId)].id;
+            Group& g = d.groups[d.GroupIndex(id)];
+            g.blend = d.groups[b].blend;
+            d.groups[b].blend = 0.0f;
+            for (int sh : shapes) d.MoveShape(sh, id);
+            for (int f : features) d.MoveGroup(d.GroupIndex(f), id);
             return id;
         }
 
@@ -257,8 +261,6 @@ namespace Bakugan {
             d.AddShape(HalfSpaceCut(mid, Vector3Negate(n), big), b, "Split", Op::Cut);
             BodyField fa = BodyField::Body(d, a), fb = BodyField::Body(d, b);
             if (fa.Empty() || fb.Empty()) return false;
-            CondenseContents(d, a);
-            CondenseContents(d, b);
 
             // the new hinge's pivot: the point on the cut nearest both halves (a grid over the cut's face)
             Vector3 pivot = mid;
@@ -327,15 +329,7 @@ namespace Bakugan {
             bool parentCuts = d.groups[pg].blend > 0.0f;
             for (int s : d.DirectShapes(parent)) parentCuts |= d.shapes[s].op == Op::Cut;
             for (int k : d.ChildGroups(parent)) parentCuts |= d.groups[k].op == Op::Cut;
-            if (parentCuts) {
-                std::vector<int> shapes = d.DirectShapes(parent), features;
-                for (int k : d.ChildGroups(parent)) features.push_back(d.groups[k].id);
-                int own = d.groups[d.AddGroup(d.groups[pg].name, parent)].id;
-                d.groups[d.GroupIndex(own)].blend = d.groups[d.GroupIndex(parent)].blend;
-                d.groups[d.GroupIndex(parent)].blend = 0.0f;
-                for (int s : shapes) d.MoveShape(s, own);
-                for (int f : features) d.MoveGroup(d.GroupIndex(f), own);
-            }
+            if (parentCuts) CondenseContents(d, parent);
             int feature = d.groups[d.AddGroup(d.groups[d.GroupIndex(child)].name, parent)].id;
             d.groups[d.GroupIndex(feature)].blend = d.groups[d.GroupIndex(child)].blend;
             for (int s : d.DirectShapes(child)) d.MoveShape(s, feature);

@@ -1,7 +1,8 @@
 // Headless run of the generator: ./autotest mesh.obj [steps] [sphereBias] [seed] [outPrefix]
-// Env: VIEWS, VRES, LR, ROUND (steps per round), REWRITES, LOOKAHEAD, MAXBODIES, WEIGHTS (the rules', e.g. 1,1,1,0.5,0.5,0.5,0.5,0.5).
+// Env: VIEWS, VRES, LR, ROUND (steps per round), REWRITES, LOOKAHEAD, MAXBODIES, WEIGHTS (the rules', e.g. 1,1,1,0.5,0.5,0.5,0.5,0.5). Semantic loss: semantic_env.hpp.
 // Writes <outPrefix>_design.txt (open it in the editor) and <outPrefix>_views.ppm (silhouettes against targets).
 #include "autodesign/autodesign.hpp"
+#include "semantic_env.hpp"
 #include "autodesign/suite.hpp"
 #include "data/field.hpp"
 #include <cmath>
@@ -27,6 +28,7 @@ int main(int argc, char** argv) {
     if (getenv("FIXSPHERE")) p.moveSphere = false;
     env("HINGEW", p.hingeWeight);
     env("COLW", p.collisionWeight); env("CHECKS", p.motionChecks); env("CHECKBIAS", p.motionCheckBias);
+    SemanticFromEnv(p);
     if (const char* w = getenv("WEIGHTS"))          // the grammar's weights, comma separated, in AutoRules() order
         for (const char* q = w; *q; q++) {
             p.ruleWeights.push_back((float)atof(q));
@@ -49,6 +51,12 @@ int main(int argc, char** argv) {
         fprintf(f, "P6 %d %d 255\n", live->viewsWidth, live->viewsHeight);
         for (size_t k = 0; k < live->views.size(); k += 4) fwrite(&live->views[k], 1, 3, f);
         fclose(f);
+        if (!live->semanticViews.empty()) {
+            f = fopen((out + "_semantic.ppm").c_str(), "wb");
+            fprintf(f, "P6 %d %d 255\n", live->semanticWidth, live->semanticHeight);
+            for (size_t k = 0; k < live->semanticViews.size(); k += 4) fwrite(&live->semanticViews[k], 1, 3, f);
+            fclose(f);
+        }
     }
     printf("%s\n%.1f s (%.1f ms a step)\n", r.message.c_str(), secs, 1000.0 * secs / std::max(1, p.steps));
     {

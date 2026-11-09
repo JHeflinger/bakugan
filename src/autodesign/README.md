@@ -12,6 +12,8 @@ The editor and the test suite call one function, `AutoDesign`, declared in `auto
 | `adam.hpp` | Adam, with memory kept per parameter key, so parameters can come and go |
 | `params.hpp/.cpp` | the design's differentiable parameters: their units, ranges and keys |
 | `loss.hpp/.cpp` | the loss (silhouettes against targets, and collisions) and its gradient; where collisions are checked |
+| `semantic.cpp` | the semantic part of the loss: the views drawn as pictures and compared by DINOv3 |
+| `dino.hpp/.cpp` | DINOv3 through ONNX Runtime, loaded at run time (its C API header is in `src/vendor/onnxruntime`) |
 | `grammar.hpp/.cpp` | the rewrite rules: add or remove a body, a union or a cut; split a body; merge two |
 | `suite*.cpp/hpp` | the test suite: every mesh in a folder, into one video |
 
@@ -52,6 +54,38 @@ A rewrite is judged against leaving the design alone, after both have had the sa
 
 Adam optimizes cuts like any other shape. Nothing in the parameters or the gradient depends on whether a shape adds or cuts, since a body's field includes its cuts.
 
+## The semantic loss
+
+Off by default (`semanticWeight` 0). On, each view is also drawn as a grey picture and compared with the target's picture by DINOv3. The open pose is compared with the mesh, and the closed pose with the sphere, weighted by the goal like the silhouettes.
+
+**Setting it up.**
+1. Export the model once: `tools/autodesign/export_dinov3.py` (it needs PyTorch and `transformers`, and the DINOv3 weights from Hugging Face, which are gated: accept the license on the model page and log in first). It writes one ONNX graph that takes a view and its target and gives back their loss, plus the loss's gradient for every pixel of both. The views are drawn at the size it was exported for: 112 pixels by default (7 × 7 patches), and `--size 224` gives 14 × 14 at about four times the cost.
+2. Get ONNX Runtime 1.16 or newer as a shared library: `onnxruntime.dll`, `libonnxruntime.so` or `libonnxruntime.dylib`, from its GitHub releases or from a pip install of `onnxruntime` (in its `capi` folder). The editor loads it only when the semantic loss is on, so nothing about the build changes. The GPU builds of ONNX Runtime can run it with CUDA (`semanticGpu`).
+3. In the Generate tab's Semantic loss section, set a weight and pick the two files.
+
+If either file can't be loaded, the run stops and says why, rather than carry on without the loss you asked for.
+
+**What's compared.** `semanticLook` sets how every picture is drawn, the design's and the targets' alike:
+- **Silhouette:** white on black.
+- **Depth:** nearer is brighter.
+- **Shaded:** a light grey material under a key light from the viewer's upper left and a dimmer fill from the right, on dark grey.
+
+`patchWeight` picks the embeddings: 0 compares each view's global (CLS) embedding with the target's, 1 compares the patch embeddings place by place (the two pictures share a camera), and anything between mixes the two. The loss per view is 1 − cosine similarity.
+
+**How the pictures are drawn.**
+- **The design.** Every body a pixel's ray reaches is a layer. Its coverage comes from how near the ray comes, softened over a pixel as for silhouettes. Its shade comes from where the ray enters it (or, past its edge, where it comes closest). Layers composite front to back. Normals are measured across a pixel, which blurs creases (where unions and cuts meet) just enough that their shading moves smoothly as they do.
+- **The mesh.** Depth buffered at 3 × 3 samples a pixel, with smooth vertex normals (vertices welded by position).
+- **The sphere.** Drawn analytically, the same way as the design.
+
+**Its gradient.** DINOv3 gives the loss's slope for every pixel. A pixel's value depends on each layer's coverage and shade:
+- *Coverage* changes only on edges, exactly as for silhouettes: a slope against the body's distance at the ray's nearest point.
+- *Shade* changes as the surface moves under the ray. Per parameter, the body is nudged, the shaded point slides along its ray back onto the surface (one Newton step), and it's shaded again. That costs about seven field evaluations per point per parameter, so each step follows `semanticSamples` shaded points drawn by how much they matter, weighted to keep the sum unbiased. Edges are always all followed.
+- *The sphere's centre* gets its slope from DINOv3's gradient for the target picture, times how the sphere's picture changes as it moves a quarter pixel each way.
+
+Against brute force differences of the whole loss (`gradcheck` with `SEM=…`; DINOv3 with random weights, since the real ones can't be downloaded here), the gradient as a whole points the same way: cosine 0.997 drawn as silhouettes, 0.995 as depth, and 0.89 shaded (0.91 with the test's two bodies apart), over its 52 parameters. Shading changes faster with the parameters than coverage does, so brute force there needs small steps (`H=0.25`) to agree with itself. The one thing it doesn't follow is a shaded picture switching from one body's surface to another's where two bodies pass through each other. The collision term keeps that rare.
+
+**Cost.** DINOv3 runs once per view per pose per evaluation (12 runs with 6 views), forward and backward. ViT-S/16 at 112 × 112 took about 130 ms a view on the 2-core machine this was written on, i.e. about 1.6 s a step. Expect a fraction of that on a desktop CPU, and much less with CUDA. Fewer views, or a lower step budget, are the other knobs. `FitSphere` (scoring only) still places the sphere by silhouettes alone.
+
 ## Collisions
 
 Bodies are checked for overlaps in the open pose, the closed pose, and `motionChecks` poses between them (`CheckTimes` in `loss.cpp`).
@@ -70,7 +104,7 @@ Its gradient is measured directly, by nudging each parameter that moves a pivot 
 
 ## The gradient
 
-The loss depends on the design only through the bodies' distances at certain points: where the rays of edge pixels come closest to a body, and the samples inside overlaps.
+(The semantic loss's gradient is described above.) The rest of the loss depends on the design only through the bodies' distances at certain points: where the rays of edge pixels come closest to a body, and the samples inside overlaps.
 
 Silhouettes are soft. A pixel's coverage comes from how close its ray gets to the body: 0 at a pixel outside, 1 at a pixel inside. So only pixels on a silhouette's edge depend on the parameters. The ray is sphere traced; on an edge pixel the steps only bracket its nearest point, so a short golden-section search closes in on it. Otherwise the edge would shift with where the steps happen to land, which depends on how the body's field is put together (a split body would score differently from the same shape whole).
 

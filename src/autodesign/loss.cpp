@@ -1,4 +1,5 @@
 #include "loss.hpp"
+#include "dino.hpp"
 #include "util/box.hpp"
 #include "adam.hpp"
 #include "data/field.hpp"
@@ -111,7 +112,10 @@ namespace Bakugan {
             m_Surface.push_back(Vector3Add(a, Vector3Add(Vector3Scale(Vector3Subtract(b, a), u), Vector3Scale(Vector3Subtract(c, a), v))));
         }
         for (int i = 0; i < 128; i++) m_PairUnit.push_back({ u01(rng), u01(rng), u01(rng) });
+        if (p.semanticWeight > 0.0f) SetUpSemantic(mesh);
     }
+
+    Loss::~Loss() = default;
 
     Vector2 Loss::ToPixel(const View& w, Vector3 p) const {
         Vector3 q = Vector3Subtract(p, m_Centre);
@@ -126,11 +130,9 @@ namespace Bakugan {
 
     // ---- drawing the design ---------------------------------------------------------------------------------------------
 
-    // One pixel's ray against one body (moved by xf), sphere traced through its field inside its box. Returns the
-    // nearest the ray gets to the body (negative: how deep into it), and where (world).
-    float Loss::Trace(const BodyField& f, const BoundingBox& box, const Rigid& xf, const View& w, int x, int y, Vector3* at) const {
+    float Loss::Trace(const BodyField& f, const BoundingBox& box, const Rigid& xf, const View& w, float sx, float sy, float tau,
+                      Vector3* at, Vector3* hit) const {
         const float far = 4.0f * m_Half + Vector3Distance(box.min, box.max);
-        float sx = ((x + 0.5f) / m_Res * 2.0f - 1.0f) * m_Half, sy = (1.0f - (y + 0.5f) / m_Res * 2.0f) * m_Half;
         Vector3 o = Vector3Add(Vector3Subtract(m_Centre, Vector3Scale(w.dir, far)), Vector3Add(Vector3Scale(w.u, sx), Vector3Scale(w.v, sy)));
         // the ray in the body's own frame
         Quaternion inv = { -xf.rotation.x, -xf.rotation.y, -xf.rotation.z, xf.rotation.w };
@@ -138,7 +140,7 @@ namespace Bakugan {
         // its stretch inside the box (slabs)
         float tn = 0.0f, tf = 2.0f * far;
         for (int a = 0; a < 3; a++) {
-            float oa = (&lo.x)[a], da = (&dir.x)[a], l = (&box.min.x)[a] - m_Tau, h = (&box.max.x)[a] + m_Tau;
+            float oa = (&lo.x)[a], da = (&dir.x)[a], l = (&box.min.x)[a] - tau, h = (&box.max.x)[a] + tau;
             if (fabsf(da) < 1e-9f) {
                 if (oa < l || oa > h) return FLT_MAX;
                 continue;
@@ -149,17 +151,18 @@ namespace Bakugan {
             tf = fminf(tf, t1);
             if (tn > tf) return FLT_MAX;
         }
-        float t = tn, dmin = FLT_MAX, tmin = tn;
+        float t = tn, dmin = FLT_MAX, tmin = tn, outside = -1.0f, inside = -1.0f;   // outside: the last t outside
         for (int k = 0; k < 64 && t <= tf; k++) {
             float d = f.Distance(Vector3Add(lo, Vector3Scale(dir, t)));
             if (d < dmin) { dmin = d; tmin = t; }
-            if (d < -m_Tau) break;                       // well inside: fully covered
-            t += d > m_Tau ? 0.9f * d : 0.5f * m_Tau;    // small steps near the surface
+            if (inside < 0.0f) (d >= 0.0f ? outside : inside) = t;
+            if (d < -tau) break;                       // well inside: fully covered
+            t += d > tau ? 0.9f * d : 0.5f * tau;    // small steps near the surface
         }
-        if (fabsf(dmin) < m_Tau) {
+        if (fabsf(dmin) < tau) {
             // on the soft edge: the steps only bracket the nearest point, so close in on it (golden section), or the
             // edge would shift with where the steps happen to land, i.e. with how the body's field is put together
-            const float g = 0.618034f, h = 0.5f * m_Tau;
+            const float g = 0.618034f, h = 0.5f * tau;
             float a = tmin - h, b = tmin + h;
             for (int k = 0; k < 8; k++) {
                 float c = b - g * (b - a), e = a + g * (b - a);
@@ -170,6 +173,15 @@ namespace Bakugan {
             }
         }
         *at = Vector3Add(o, Vector3Scale(w.dir, tmin));
+        if (hit && dmin < 0.0f && inside >= 0.0f) {
+            // where it enters: between the last step outside and the first inside (bisection)
+            float a = outside >= 0.0f ? outside : inside - 0.5f * tau, c = inside;
+            for (int k = 0; k < 10; k++) {
+                float m = 0.5f * (a + c);
+                (f.Distance(Vector3Add(lo, Vector3Scale(dir, m))) < 0.0f ? c : a) = m;
+            }
+            *hit = Vector3Add(o, Vector3Scale(w.dir, c));
+        }
         return dmin;
     }
 
@@ -250,22 +262,28 @@ namespace Bakugan {
         for (float t : b.times) b.xf.push_back(d.Transforms(t, true));
 
         Slopes slopes(b.fields.size());
+        Shades shades(b.fields.size());
         Silhouettes(b, s, slopes);
+        if (m_Dino) Semantics(b, s, slopes, shades);
         if (m_P.collisionWeight > 0.0f) Collisions(b, s, slopes);
         Hinges(d, b, s);
-        s.total = (1.0f - std::clamp(m_P.sphereBias, 0.0f, 1.0f)) * s.fit + std::clamp(m_P.sphereBias, 0.0f, 1.0f) * s.sphere +
-                  s.coveragePenalty + m_P.collisionWeight * s.collision + m_P.hingeWeight * s.hinges;
+        const float silhouette = std::max(0.0f, m_P.silhouetteWeight);
+        s.total = silhouette * ((1.0f - std::clamp(m_P.sphereBias, 0.0f, 1.0f)) * s.fit + std::clamp(m_P.sphereBias, 0.0f, 1.0f) * s.sphere +
+                                s.coveragePenalty) +
+                  (m_Dino ? m_P.semanticWeight * s.semantic : 0.0f) + m_P.collisionWeight * s.collision + m_P.hingeWeight * s.hinges;
         s.valid = true;
-        if (grad && !ps.empty()) Gradient(d, b, slopes, ps, *grad);
+        if (grad && !ps.empty()) Gradient(d, b, slopes, shades, ps, *grad);
         // the sphere's centre only moves the closed pose's target: its slope comes from that part of the loss alone,
-        // measured again with the disc shifted a quarter pixel either way (the silhouettes stay as drawn)
+        // measured again with the disc shifted a quarter pixel either way (the silhouettes stay as drawn); the
+        // semantic loss adds its own (from DINOv3's slope against the sphere's picture)
         if (sphereGrad) {
             const float h = 0.25f * 2.0f * m_Half / m_Res;
             for (int a = 0; a < 3; a++) {
                 Vector3 e = { 0, 0, 0 };
                 (&e.x)[a] = h;
-                (&sphereGrad->x)[a] = (ClosedLoss(Vector3Add(sphere, e)) - ClosedLoss(Vector3Subtract(sphere, e))) / (2.0f * h) * SphereUnit();
+                (&sphereGrad->x)[a] = silhouette * (ClosedLoss(Vector3Add(sphere, e)) - ClosedLoss(Vector3Subtract(sphere, e))) / (2.0f * h) * SphereUnit();
             }
+            if (m_Dino) *sphereGrad = Vector3Add(*sphereGrad, Vector3Scale(m_SemSphereGrad, SphereUnit()));
         }
         return s;
     }
@@ -347,7 +365,7 @@ namespace Bakugan {
                 size_t k = (size_t)v * px + (size_t)y * m_Res + x;
                 for (size_t i = 0; i < b.fields.size(); i++) {
                     Vector3 p;
-                    float dmin = Trace(b.fields[i], b.box[i], b.xf[pose][b.group[i]], m_Views[v], x, y, &p);
+                    float dmin = Trace(b.fields[i], b.box[i], b.xf[pose][b.group[i]], m_Views[v], FrameX(x, m_Res), FrameY(y, m_Res), m_Tau, &p);
                     float c = std::clamp(0.5f - dmin / (2.0f * m_Tau), 0.0f, 1.0f);
                     if (c > m_Cover[pose][k]) {
                         m_Cover[pose][k] = c;
@@ -359,6 +377,7 @@ namespace Bakugan {
         });
 
         const float bias = std::clamp(m_P.sphereBias, 0.0f, 1.0f), minCover = std::clamp(m_P.minViewCoverage, 0.0f, 1.0f);
+        const float silhouette = std::max(0.0f, m_P.silhouetteWeight);
         s.worstView = 1.0f;
         for (int pose = 0; pose < 2; pose++) {
             const float weight = (pose == 0 ? 1.0f - bias : bias) / nv;
@@ -395,7 +414,7 @@ namespace Bakugan {
                     }
                     if (i < 0 || c <= 0.0f || c >= 1.0f || c == t) continue;     // not on an edge, or no slope
                     float dD = c < t ? (float)((-weight - (shortOf ? 10.0f : 0.0f)) / tsum) : (float)(weight / tsum);
-                    slopes[i].push_back({ pose, at[pose][kk], dD * (-1.0f / (2.0f * m_Tau)) });
+                    if (silhouette > 0.0f) slopes[i].push_back({ pose, at[pose][kk], silhouette * dD * (-1.0f / (2.0f * m_Tau)) });
                 }
             }
             (pose == 0 ? s.fit : s.sphere) = (float)(lossSum / nv);
@@ -497,7 +516,8 @@ namespace Bakugan {
     // nudged either way, the body's field (a shape's parameter) or the poses (a hinge's) rebuilt, the distance measured
     // again. The hinge term is measured again directly, for the hinges the parameter touches. The poses' times stay as
     // they were (the checks are placed by the design, not part of what is moved).
-    void Loss::Gradient(const Design& d, const Bodies& b, const Slopes& slopes, const std::vector<Param>& ps, std::vector<float>& grad) const {
+    void Loss::Gradient(const Design& d, const Bodies& b, const Slopes& slopes, const Shades& shades, const std::vector<Param>& ps,
+                        std::vector<float>& grad) const {
         const std::vector<int>& fieldOf = b.fieldOf;
         ParallelFor((int)ps.size(), [&](int j) {
             const Param& p = ps[j];
@@ -526,6 +546,15 @@ namespace Bakugan {
                         bool fieldMoves = (int)i == own, poseMoves = memcmp(&before, &after, sizeof(Rigid)) != 0;
                         if (!fieldMoves && !poseMoves) continue;        // this parameter doesn't touch it
                         sum[side] += sl.weight * (fieldMoves ? changed : b.fields[i]).Distance(after.ApplyInverse(sl.at));
+                    }
+                // the semantic pixels' shades: the surface point slid along its ray, and shaded again
+                for (size_t i = 0; i < b.fields.size(); i++)
+                    for (const Shade& sh : shades[i]) {
+                        const Rigid& before = b.xf[sh.pose][b.group[i]];
+                        const Rigid& after = xf[sh.pose][b.group[i]];
+                        bool fieldMoves = (int)i == own, poseMoves = memcmp(&before, &after, sizeof(Rigid)) != 0;
+                        if (!fieldMoves && !poseMoves) continue;
+                        sum[side] += sh.weight * ShadeAt(fieldMoves ? changed : b.fields[i], after, sh);
                     }
                 // the hinge term, for the hinges this parameter touches: a pivot it moves, or a body whose field it changes
                 if (m_P.hingeWeight > 0.0f)

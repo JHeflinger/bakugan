@@ -15,6 +15,11 @@
 // Hinges. A hinge's pivot should be on (or in) both bodies it joins: how far it is outside each, beyond 1% of the
 // mesh's size, adds up over the hinges, relative to the mesh's size.
 //
+// Semantics (when semanticWeight > 0; semantic.cpp). The same views, drawn as pictures (silhouette, depth, or shaded
+// grey: SemanticLook) at the size the DINOv3 model was exported for, each compared with the mesh's (open) or the
+// sphere's (closed) picture by DINOv3's embeddings (global, patch, or a mix). DINOv3 gives d loss / d pixel; a pixel
+// depends on the design through its soft edges (as silhouettes do) and through the shade of the surface its ray hits.
+//
 // The first two parts depend on the design only through the bodies' distances at a set of points: the silhouettes' at the
 // points where edge pixels' rays come closest to the body, the collisions' at the points sampled inside overlaps.
 // So the gradient is the loss's slope against each such distance (known from the loss), times how the distance
@@ -23,6 +28,8 @@
 #include "params.hpp"
 #include "data/field.hpp"
 #include <cmath>
+#include <memory>
+#include <string>
 
 namespace Bakugan {
     // Where in the closing motion (0 open .. 1 closed) the poses between are checked for collisions: only where at
@@ -30,9 +37,17 @@ namespace Bakugan {
     // says how much). n of them, at evenly spaced quantiles, so they move smoothly as the hinges' timing changes.
     std::vector<float> CheckTimes(const Design& d, int n, float bias);
 
+    class Dino;
+
     class Loss {
     public:
         Loss(const TriMesh& mesh, const AutoParams& p);
+        ~Loss();
+
+        // Why the semantic loss couldn't be set up (empty: it's fine, or not asked for); without it the loss is the rest.
+        const std::string& Error() const { return m_Error; }
+        bool Semantic() const { return m_Dino != nullptr; }
+        std::string SemanticDevice() const;              // where DINOv3 runs ("CPU", "CUDA", or why not CUDA)
 
         // The loss of a design against the sphere centred at `sphere`. With grad: also d loss / d parameter for each of
         // ps, per unit of the parameter; with sphereGrad, d loss / d the sphere's centre, per SphereUnit().
@@ -51,6 +66,8 @@ namespace Bakugan {
 
         // The silhouettes scored last against their targets, as an RGBA picture (open pose above, closed below).
         void Picture(std::vector<unsigned char>* rgba, int* w, int* h) const;
+        // The semantic loss's last views: rows of the mesh's, the open design's, the sphere's, the closed design's.
+        void SemanticPicture(std::vector<unsigned char>* rgba, int* w, int* h) const;
 
         float L() const { return m_L; }
         const std::vector<Vector3>& Surface() const { return m_Surface; }   // points on the mesh
@@ -83,13 +100,37 @@ namespace Bakugan {
             float weight;                        // d loss / d distance
         };
         using Slopes = std::vector<std::vector<Slope>>;   // per field
+        // A surface point a semantic pixel's shade comes from, and the loss's slope against that shade. Moved with
+        // the body, the point slides along the pixel's ray to stay on the surface (to first order), and is shaded anew.
+        struct Shade {
+            int pose, view;
+            Vector3 at;                          // world: where the ray hits the body (or, on an edge, comes closest)
+            float along;                         // d distance / d t along the ray there (< 0: it enters); 0: an edge
+            float weight;                        // d loss / d shade
+        };
+        using Shades = std::vector<std::vector<Shade>>;   // per field
 
         void Silhouettes(const Bodies& b, AutoScore& s, Slopes& slopes);
         void Collisions(const Bodies& b, AutoScore& s, Slopes& slopes);
         void Hinges(const Design& d, const Bodies& b, AutoScore& s) const;
         float PivotGap(const BodyField& f, Vector3 pivot) const { return fmaxf(0.0f, f.Distance(pivot) - 0.01f * m_L); }
-        void Gradient(const Design& d, const Bodies& b, const Slopes& slopes, const std::vector<Param>& ps, std::vector<float>& grad) const;
-        float Trace(const BodyField& f, const BoundingBox& box, const Rigid& xf, const View& w, int x, int y, Vector3* at) const;
+        void Gradient(const Design& d, const Bodies& b, const Slopes& slopes, const Shades& shades, const std::vector<Param>& ps,
+                      std::vector<float>& grad) const;
+        // A ray through the frame at (sx, sy) (from its centre, in mm) against one body (moved by xf), sphere traced
+        // through its field inside its box; tau: the pixel size. Returns the nearest it gets (negative: how deep), and
+        // where (world); with hit, also where it first enters the body (world; only when it does: the return is < 0).
+        float Trace(const BodyField& f, const BoundingBox& box, const Rigid& xf, const View& w, float sx, float sy, float tau,
+                    Vector3* at, Vector3* hit = nullptr) const;
+        float FrameX(int x, int res) const { return ((x + 0.5f) / res * 2.0f - 1.0f) * m_Half; }
+        float FrameY(int y, int res) const { return (1.0f - (y + 0.5f) / res * 2.0f) * m_Half; }
+        // semantic.cpp
+        void SetUpSemantic(const TriMesh& mesh);
+        void Semantics(const Bodies& b, AutoScore& s, Slopes& slopes, Shades& shades);
+        float Look(const View& w, Vector3 p, Vector3 n) const;     // a surface point's shade (world point, normal)
+        float Background() const;
+        Vector3 Normal(const BodyField& f, Vector3 local) const;    // the field's (local) normal
+        float ShadeAt(const BodyField& f, const Rigid& xf, const Shade& sh) const;
+        void SphereLook(const View& w, Vector3 centre, float* out) const;
         Vector2 ToPixel(const View& w, Vector3 p) const;
         float Disc(const View& w, int x, int y, Vector3 centre) const;     // the sphere's silhouette
         float ClosedLoss(Vector3 centre) const;          // the closed pose's part of the loss, from the last silhouettes
@@ -109,5 +150,13 @@ namespace Bakugan {
         std::vector<Vector3> m_PairUnit;  // fixed points in [0, 1]^3, mapped into where two bodies' boxes meet
         std::vector<float> m_Cover[2];    // the last silhouettes (open, closed): views × pixels
         std::vector<Spot> m_Extra, m_Overlaps;
+        // the semantic loss
+        std::string m_Error;
+        std::unique_ptr<Dino> m_Dino;
+        int m_SemRes = 0;                 // its views' size (the model's)
+        float m_SemTau = 1.0f;            // its pixel, in mm
+        std::vector<std::vector<float>> m_MeshLook;   // the mesh's picture per view
+        std::vector<float> m_SemDrawn[2], m_SemTarget[2];   // the last pictures (open, closed): views × pixels
+        Vector3 m_SemSphereGrad = { 0, 0, 0 };        // its d loss / d the sphere's centre (per mm), from the last evaluation
     };
 }

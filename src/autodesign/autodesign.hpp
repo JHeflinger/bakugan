@@ -14,6 +14,14 @@
 #include <vector>
 
 namespace Bakugan {
+    // How the semantic loss draws its views (the design's, the mesh's and the sphere's alike), grey on dark:
+    enum class SemanticLook {
+        Silhouette,                      // white where covered
+        Depth,                           // nearer is brighter
+        Shaded,                          // a grey material under a key and a fill light (from the viewer's upper left
+                                         // and right), on a dark grey background
+    };
+
     struct AutoParams {
         // what is wanted
         float sphereBias = 0.35f;        // 0: only the open pose matching the mesh counts .. 1: only the closed pose's roundness
@@ -28,6 +36,15 @@ namespace Bakugan {
         int motionChecks = 8;            // poses checked for overlaps between open and closed (the two ends always are)
         float motionCheckBias = 0.5f;    // 0: those poses spread evenly over the times some hinge moves .. 1: placed by
                                          // how many hinges move at once
+        float silhouetteWeight = 1.0f;   // the silhouette comparison's share of the loss (0: only the semantic one)
+        // the semantic loss: the views drawn and compared by DINOv3's embeddings (see dino.hpp, semantic.cpp)
+        float semanticWeight = 0.0f;     // its share of the loss (0: off)
+        std::string semanticModel;       // the .onnx tools/autodesign/export_dinov3.py writes (it sets the views' size)
+        std::string onnxRuntime;         // the ONNX Runtime library (empty: the platform's default name, found as usual)
+        bool semanticGpu = false;        // run DINOv3 with CUDA, if this ONNX Runtime has it
+        SemanticLook semanticLook = SemanticLook::Shaded;
+        float patchWeight = 0.0f;        // 0: compare the global (CLS) embeddings .. 1: the patch embeddings, place by place
+        int semanticSamples = 4000;      // shaded pixels sampled for the gradient each step (their rest is the edges)
         // the optimizer
         int steps = 1500;                // gradient evaluations in all (the budget), rewrite lookaheads included
         float learningRate = 1.0f;       // Adam's step, in each parameter's own unit (see params.cpp)
@@ -43,7 +60,8 @@ namespace Bakugan {
 
     struct AutoScore {
         bool valid = false;
-        float total = 0.0f;              // the loss: (1 - bias) * fit + bias * sphere + coverage penalty
+        float total = 0.0f;              // the loss: silhouette weight * ((1 - bias) * fit + bias * sphere + coverage penalty)
+                                         //           + semantic weight * semantic
                                          //           + collision weight * collision + hinge weight * hinges
         float fit = 0.0f;                // open pose against the mesh: mean over views of (1 - covered) + extra
         float sphere = 0.0f;             // closed pose against the sphere, the same way
@@ -59,6 +77,10 @@ namespace Bakugan {
         float hinges = 0.0f;             // pivots away from their bodies: the sum of how far, beyond 1% of the mesh's
                                          // size, each pivot is outside each of its two bodies, over the mesh's size
         float hingeGap = 0.0f;           // the farthest a pivot is outside one of its bodies (mm)
+        float semantic = 0.0f;           // DINOv3: (1 - bias) * semanticOpen + bias * semanticClosed
+        float semanticOpen = 0.0f;       // mean over the views of the open pose's loss against the mesh
+        float semanticClosed = 0.0f;     // ... the closed pose's against the sphere
+        float worstSemantic = 0.0f;      // the worst single view's, of either pose
         Vector3 centre = { 0, 0, 0 };    // the target sphere (where it was when this was scored)
         float radius = 0.0f;
     };
@@ -80,6 +102,8 @@ namespace Bakugan {
         std::vector<float> history;      // loss over the run
         std::vector<unsigned char> views;    // RGBA picture of the best design's silhouettes against their targets
         int viewsWidth = 0, viewsHeight = 0;
+        std::vector<unsigned char> semanticViews;    // RGBA: the semantic loss's views and their targets (when it's on)
+        int semanticWidth = 0, semanticHeight = 0;
         std::vector<float> ruleWeights;  // the UI may change these while it runs: each rewrite round reads them (empty: the params')
         int recordFrames = 0;            // set before starting: this many evenly spaced snapshots go into `frames`
         std::vector<AutoFrame> frames;

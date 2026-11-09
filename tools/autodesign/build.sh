@@ -7,6 +7,9 @@
 #   ./adamtest                Adam's memory as parameters come and go
 #   ./checktimes              where the collision checks between open and closed go, for a few hinge timings
 #   ./rulecheck mesh.obj      splitting a body changes no pose; merging two keeps the open pose
+# The semantic loss (DINOv3) is on in autotest and gradcheck with SEM=model.onnx ORT=path/to/libonnxruntime (see
+# semantic_env.hpp); export_dinov3.py makes the model. Linking needs nothing more: ONNX Runtime is loaded at run time
+# (on glibc older than 2.34, add -ldl).
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC="$HERE/../../src"

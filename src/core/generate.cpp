@@ -47,21 +47,29 @@ namespace Bakugan {
 
     // The scored silhouettes of the best design, as a texture for the Generate tab (on this thread: it has the GL
     // context). A new size makes a new texture.
-    static void UploadViews(const AutoLive& live, Texture2D* tex, bool* has) {
-        int w = live.viewsWidth, h = live.viewsHeight;
-        if (w <= 0 || h <= 0 || live.views.size() != (size_t)w * h * 4) return;
+    static void UploadViews(const std::vector<unsigned char>& rgba, int w, int h, Texture2D* tex, bool* has) {
+        if (rgba.empty() && *has) {                     // none this time (e.g. the semantic loss is off now)
+            UnloadTexture(*tex);
+            *has = false;
+        }
+        if (w <= 0 || h <= 0 || rgba.size() != (size_t)w * h * 4) return;
         if (*has && (tex->width != w || tex->height != h)) {
             UnloadTexture(*tex);
             *has = false;
         }
         if (!*has) {
-            Image img = { (void*)live.views.data(), w, h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
+            Image img = { (void*)rgba.data(), w, h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
             *tex = LoadTextureFromImage(img);
             SetTextureFilter(*tex, TEXTURE_FILTER_POINT);
             *has = IsTextureValid(*tex);
         } else {
-            UpdateTexture(*tex, live.views.data());
+            UpdateTexture(*tex, rgba.data());
         }
+    }
+
+    static void UploadViews(const AutoLive& live, Texture2D* views, bool* hasViews, Texture2D* semantic, bool* hasSemantic) {
+        UploadViews(live.views, live.viewsWidth, live.viewsHeight, views, hasViews);
+        UploadViews(live.semanticViews, live.semanticWidth, live.semanticHeight, semantic, hasSemantic);
     }
 
     void App::PollAuto() {
@@ -73,7 +81,7 @@ namespace Bakugan {
                 m_AutoSeen = m_AutoLive->version;
                 m_AutoScore = m_AutoLive->score;
                 m_HasAutoScore = m_AutoScore.valid;
-                UploadViews(*m_AutoLive, &m_AutoViews, &m_HasAutoViews);
+                UploadViews(*m_AutoLive, &m_AutoViews, &m_HasAutoViews, &m_AutoSemantic, &m_HasAutoSemantic);
                 if (!m_AutoScoreOnly && m_AutoPreview) {
                     m_Design = m_AutoLive->best;
                     m_AutoScoreFor = m_Design;
@@ -88,7 +96,7 @@ namespace Bakugan {
         if (m_AutoLive) {
             std::lock_guard<std::mutex> l(m_AutoLive->mutex);
             m_AutoHistory = m_AutoLive->history;
-            UploadViews(*m_AutoLive, &m_AutoViews, &m_HasAutoViews);
+            UploadViews(*m_AutoLive, &m_AutoViews, &m_HasAutoViews, &m_AutoSemantic, &m_HasAutoSemantic);
         }
         m_Status = r.message;
         if (!r.ok) return;
@@ -114,6 +122,8 @@ namespace Bakugan {
         m_AutoHistory.clear();
         if (m_HasAutoViews) UnloadTexture(m_AutoViews);
         m_HasAutoViews = false;
+        if (m_HasAutoSemantic) UnloadTexture(m_AutoSemantic);
+        m_HasAutoSemantic = false;
     }
 
     // ---- the test suite -------------------------------------------------------------------------------------------------
