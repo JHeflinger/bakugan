@@ -28,7 +28,10 @@ namespace Bakugan {
         // what is wanted
         float sphereDiameter = 0.0f;     // mm; 0: a sphere of the mesh's volume (it sits at the mesh's centre of volume)
         bool moveTarget = true;          // the mesh it's compared with may be moved, to wherever suits the design best
-        bool scaleTarget = true;         // ... and scaled (0.3x .. 3.3x, about its centre of volume)
+        bool scaleTarget = true;         // the mesh is scaled (about its centre of volume) to the sphere's volume, so the
+                                         // sphere's material fills it exactly; off, it's compared at its own size. The scale
+                                         // isn't optimized: a free one let the optimizer shrink the mesh (to ~0.6x) so the
+                                         // sphere covered it easily, with ~4x the material it should have
         int views = 6;                   // directions the silhouettes are compared from
         int viewResolution = 64;         // pixels across each view
         float minViewCoverage = 0.6f;    // every view's target must be covered at least this much (steep cost below)
@@ -40,6 +43,12 @@ namespace Bakugan {
         float motionCheckBias = 0.5f;    // 0: those poses spread evenly over the times some hinge moves .. 1: placed by
                                          // how many hinges move at once
         float silhouetteWeight = 1.0f;   // the silhouette comparison's share of the loss (0: only the semantic one)
+        // in 3D (shape.cpp, transport.cpp): the open design against the placed mesh
+        float chamferWeight = 0.0f;      // the Chamfer distance between their surfaces, both ways (0: off)
+        float sdfWeight = 0.0f;          // their signed distances agreeing at points in and around the mesh (0: off)
+        int shapeSamples = 3000;         // the mesh's points for those two (a third on its surface)
+        float transportWeight = 0.0f;    // optimal transport: how far the sphere's material travels to fill the mesh (0: off)
+        int transportPoints = 1024;      // points of material, and points filling the mesh, for it
         // the semantic loss: the views drawn and compared by DINOv3's embeddings (see dino.hpp, semantic.cpp)
         float semanticWeight = 0.0f;     // its share of the loss (0: off)
         std::string semanticModel;       // the .onnx tools/autodesign/export_dinov3.py writes (it sets the views' size)
@@ -65,7 +74,7 @@ namespace Bakugan {
         bool valid = false;
         float total = 0.0f;              // the loss: silhouette weight * (fit + coverage penalty) + semantic weight * semantic
                                          //           + collision weight * collision + hinge weight * hinges
-                                         //           + surface weight * surface
+                                         //           + surface weight * surface + chamfer, sdf, transport weights * theirs
         float fit = 0.0f;                // open pose against the placed mesh: mean over views of (1 - covered) + extra
         float coveragePenalty = 0.0f;    // 10 per whole share a view is covered less than minViewCoverage
         float viewCover = 0.0f, viewExtra = 0.0f;              // means over the views
@@ -81,6 +90,13 @@ namespace Bakugan {
         float surface = 0.0f;            // hollows into the sphere's surface: over points just under it, the mean of
                                          // d / (d + 1% of the mesh's size), d how deep inside a hollow it is
         float surfaceCarved = 0.0f;      // the share of those points inside a hollow
+        float chamfer = 0.0f;            // mesh -> design + design -> mesh, each a mean distance over 0.1 of the mesh's size
+        float sdf = 0.0f;                // the signed distances' disagreement, likewise
+        float meshGap = 0.0f;            // mean distance from the mesh's surface to the design's (mm)
+        float designGap = 0.0f;          // ... from the design's surface to the mesh's (mm)
+        float transport = 0.0f;          // optimal transport's cost (squared distances, over (0.1 L)^2)
+        float transportMove = 0.0f;      // how far the material travels, root mean square (mm)
+        float transportUnfilled = 0.0f;  // the share of the placed mesh's volume the material doesn't reach
         float semantic = 0.0f;           // DINOv3: mean over the views of the open pose's loss against the placed mesh
         float worstSemantic = 0.0f;      // the worst single view's
         Placement target;                // where the mesh was placed when this was scored

@@ -1,5 +1,5 @@
 // Headless run of the generator: ./autotest mesh.obj [steps] [seed] [outPrefix]
-// Env: VIEWS, VRES, LR, ROUND (steps per round), REWRITES, LOOKAHEAD, MARGIN, MAXPIECES, WEIGHTS (the rules', e.g. 1,0.5),
+// Env: MAXSECONDS (stop after, keeping the best), SNAPSHOT (seconds between progress files), SURFW, MAXHOLLOWS, OTW (transport weight), OTN (its points), SDFW, CHAMW, SHAPEN (3D terms; 0: off), VIEWS, VRES, LR, ROUND (steps per round), REWRITES, LOOKAHEAD, MARGIN, MAXPIECES, WEIGHTS (the rules', e.g. 1,0.5),
 // FIXTARGET (the mesh stays put), NOSCALE (it may move but not scale), HINGEW, COLW, CHECKS, CHECKBIAS.
 // Semantic loss: semantic_env.hpp.
 // Writes <outPrefix>_design.txt (open it in the editor) and <outPrefix>_views.ppm (silhouettes against targets).
@@ -8,6 +8,7 @@
 #include "semantic_env.hpp"
 #include "autodesign/suite.hpp"
 #include "data/field.hpp"
+#include <atomic>
 #include <cmath>
 #include <chrono>
 #include <cstdio>
@@ -30,7 +31,8 @@ int main(int argc, char** argv) {
     env("REWRITES", p.rewritesPerRound); env("LOOKAHEAD", p.lookahead); env("MAXPIECES", p.maxPieces); env("MARGIN", p.rewriteMargin);
     if (getenv("FIXTARGET")) p.moveTarget = p.scaleTarget = false;
     if (getenv("NOSCALE")) p.scaleTarget = false;
-    env("HINGEW", p.hingeWeight);
+    env("HINGEW", p.hingeWeight); env("SURFW", p.surfaceWeight); env("MAXHOLLOWS", p.maxHollows);
+    env("OTW", p.transportWeight); env("OTN", p.transportPoints); env("SDFW", p.sdfWeight); env("CHAMW", p.chamferWeight); env("SHAPEN", p.shapeSamples);
     env("COLW", p.collisionWeight); env("CHECKS", p.motionChecks); env("CHECKBIAS", p.motionCheckBias);
     SemanticFromEnv(p);
     if (const char* w = getenv("WEIGHTS"))          // the grammar's weights, comma separated, in AutoRules() order
@@ -43,7 +45,39 @@ int main(int argc, char** argv) {
     JobControl c;
     auto live = std::make_shared<AutoLive>();
     auto t0 = std::chrono::steady_clock::now();
+    // for long runs: MAXSECONDS stops it (keeping the best so far) after that long; SNAPSHOT=seconds writes the best
+    // design so far, its views and a progress line that often (<outPrefix>_progress_design.txt, _progress_views.ppm,
+    // _progress.log), so a run cut short still leaves something to open
+    double maxSeconds = getenv("MAXSECONDS") ? atof(getenv("MAXSECONDS")) : 0.0, snapshot = getenv("SNAPSHOT") ? atof(getenv("SNAPSHOT")) : 0.0;
+    std::atomic<bool> finished{ false };
+    std::thread watcher([&] {
+        auto lastSnap = std::chrono::steady_clock::now();
+        while (!finished) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (maxSeconds > 0.0 && el > maxSeconds) c.Cancel();
+            if (snapshot <= 0.0 || std::chrono::duration<double>(std::chrono::steady_clock::now() - lastSnap).count() < snapshot) continue;
+            lastSnap = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> l(live->mutex);
+            if (live->best.groups.empty()) continue;
+            if (FILE* f = fopen((out + "_progress_design.txt").c_str(), "w")) { fputs(live->best.Serialize().c_str(), f); fclose(f); }
+            if (FILE* f = fopen((out + "_progress_views.ppm").c_str(), "wb")) {
+                fprintf(f, "P6 %d %d 255\n", live->viewsWidth, live->viewsHeight);
+                for (size_t k = 0; k < live->views.size(); k += 4) fwrite(&live->views[k], 1, 3, f);
+                fclose(f);
+            }
+            if (FILE* f = fopen((out + "_progress.log").c_str(), "a")) {
+                const AutoScore& sc = live->score;
+                fprintf(f, "%6.0f min  step %d/%d  pieces %d  loss %.4f  covered %.0f%% (+%.0f%%)  transport %.1f mm  kept %d of %d rewrite rounds\n",
+                        el / 60.0, live->iteration, live->iterations, (int)live->bestCarving.pieces.size(), sc.total, sc.viewCover * 100.0f,
+                        sc.viewExtra * 100.0f, sc.transportMove, live->accepted, live->rounds);
+                fclose(f);
+            }
+        }
+    });
     AutoResult r = AutoDesign(mesh, Design{}, p, c, live);
+    finished = true;
+    watcher.join();
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     {
         std::lock_guard<std::mutex> l(live->mutex);
@@ -77,6 +111,16 @@ int main(int argc, char** argv) {
     }
     const Placement& t = r.score.target;
     printf("mesh: moved %.1f %.1f %.1f mm, scaled %.3fx; sphere %.1f mm across\n", t.offset.x, t.offset.y, t.offset.z, t.scale, 2.0f * r.score.radius);
+    {
+        // the result measured in 3D the same way whatever the run used: transport, and the surfaces' gaps
+        AutoParams q = p;
+        q.transportWeight = q.sdfWeight = q.chamferWeight = 1.0f;
+        q.semanticWeight = 0.0f;
+        Loss check(mesh, q);
+        AutoScore e = check.Evaluate(r.carving, r.score.target);
+        printf("3D: material travels %.2f mm (rms) to fill the mesh, %.0f%% of it unfilled; mesh surface %.2f mm from the design, design %.2f mm "
+               "from the mesh; sdf %.3f\n", e.transportMove, e.transportUnfilled * 100.0f, e.meshGap, e.designGap, e.sdf);
+    }
     {
         // closed, the pieces should be the sphere exactly: points in none of them inside it, in one outside, in two
         const Carving& k = r.carving;

@@ -78,6 +78,7 @@ namespace Bakugan {
         }
         bool closed = fabs(volume) > 1e-9 * m_L * m_L * m_L;
         m_MeshCentre = closed ? Vector3Add(m_Centre, Vector3Scale(moment, (float)(1.0 / volume))) : m_Centre;
+        m_MeshVolume = closed ? (float)fabs(volume) : 0.0f;
         m_SphereCentre = m_MeshCentre;
         m_SphereRadius = p.sphereDiameter > 0.0f ? 0.5f * p.sphereDiameter : (closed ? (float)cbrt(3.0 * fabs(volume) / (4.0 * PI)) : 0.25f * m_L);
         m_MeshReach = 0.0f;
@@ -106,6 +107,8 @@ namespace Bakugan {
             float y = 1.0f - (i + 0.5f) / 512.0f, r = sqrtf(fmaxf(0.0f, 1.0f - y * y)), phi = i * 2.39996323f;
             m_SurfaceDirs.push_back({ r * cosf(phi), y, r * sinf(phi) });
         }
+        if (p.chamferWeight > 0.0f || p.sdfWeight > 0.0f) SetUpShape(mesh);
+        if (p.transportWeight > 0.0f) SetUpTransport(mesh);
         if (p.semanticWeight > 0.0f) SetUpSemantic(mesh);
         m_Target = TargetSilhouettes(m_Placed);
         if (m_Dino) m_SemTarget = SemanticTargets(m_Placed);
@@ -288,8 +291,14 @@ namespace Bakugan {
         AutoScore s = Score(d, b, target, &slopes, &shades);
         s.surface = SurfaceTerm(c, &s.surfaceCarved);
         s.total += m_P.surfaceWeight * s.surface;
+        Anchors anchors;
+        Vector3 otOffset = { 0, 0, 0 };
+        float otLogScale = 0.0f;
+        if (m_P.transportWeight > 0.0f && s.valid)
+            s.total += Transport(c, b, target, s, grad ? &anchors : nullptr, grad ? &otOffset : nullptr, grad ? &otLogScale : nullptr);
         if (!grad || ps.empty() || !s.valid) return s;
-        Gradient(c, target, bodyOf, b, slopes, shades, ps, *grad);
+        Gradient(c, target, bodyOf, b, slopes, shades, anchors, ps, *grad);
+        const bool shape = m_P.chamferWeight > 0.0f || m_P.sdfWeight > 0.0f;
 
         // the placement: the targets drawn again with it nudged two units either way, against the design as drawn
         const float silhouette = std::max(0.0f, m_P.silhouetteWeight);
@@ -303,6 +312,7 @@ namespace Bakugan {
                 Set(cc, t, ps[j], Get(c, target, ps[j]) + (side == 0 ? 2.0f : -2.0f) * ps[j].unit, m_L);   // (2 units: the silhouettes wiggle finer)
                 value[side] = Get(cc, t, ps[j]);
                 if (silhouette > 0.0f) loss[side] += silhouette * FitLoss(TargetSilhouettes(t));
+                if (shape) loss[side] += Shape(b, t, nullptr, nullptr);     // the mesh's points moved with it
                 if (m_Dino && m_SemGradTarget.size() == m_SemDrawn.size()) {
                     std::vector<std::vector<float>> pictures = SemanticTargets(t);
                     const size_t px = (size_t)m_SemRes * m_SemRes;
@@ -312,6 +322,8 @@ namespace Bakugan {
             }
             float step = value[0] - value[1];
             if (step > 0.0f) (*grad)[j] = (float)((loss[0] - loss[1]) / step) * ps[j].unit;
+            // transport's, exactly (each mesh point's slope, through the offset or the log scale)
+            (*grad)[j] += (ps[j].field < 3 ? (&otOffset.x)[ps[j].field] : otLogScale) * ps[j].unit;
         }
         return s;
     }
@@ -354,8 +366,13 @@ namespace Bakugan {
         if (m_Dino) Semantics(b, s, slopes, shades);
         if (m_P.collisionWeight > 0.0f) Collisions(b, s, slopes);
         Hinges(d, b, s);
+        float shape = 0.0f;
+        if (m_P.chamferWeight > 0.0f || m_P.sdfWeight > 0.0f) {
+            SampleDesignSurface(b);
+            shape = Shape(b, target, &s, &slopes);
+        }
         s.total = std::max(0.0f, m_P.silhouetteWeight) * (s.fit + s.coveragePenalty) + (m_Dino ? m_P.semanticWeight * s.semantic : 0.0f) +
-                  m_P.collisionWeight * s.collision + m_P.hingeWeight * s.hinges;
+                  m_P.collisionWeight * s.collision + m_P.hingeWeight * s.hinges + shape;
         s.valid = true;
         if (slopesOut) *slopesOut = std::move(slopes);
         if (shadesOut) *shadesOut = std::move(shades);
@@ -578,7 +595,7 @@ namespace Bakugan {
     // joints the parameter touches. The poses' times stay as they were (the checks are placed by the design, not part
     // of what is moved).
     void Loss::Gradient(const Carving& c, const Placement& target, const std::vector<int>& bodyOf, const Bodies& b, const Slopes& slopes,
-                        const Shades& shades, const std::vector<Param>& ps, std::vector<float>& grad) {
+                        const Shades& shades, const Anchors& anchors, const std::vector<Param>& ps, std::vector<float>& grad) {
         ParallelFor((int)ps.size(), [&](int j) {
             const Param& p = ps[j];
             if (p.kind == Param::Target) return;            // the placement's: see Evaluate
@@ -620,6 +637,16 @@ namespace Bakugan {
                         bool poseMoves = memcmp(&before, &after, sizeof(Rigid)) != 0;
                         if (changedOf[i] < 0 && !poseMoves) continue;
                         sum[side] += sh.weight * ShadeAt(field(i), after, sh);
+                    }
+                }
+                // the sphere's material (transport): moved by its piece's open pose, handed between pieces by a cutter
+                for (const Anchor& a : anchors) {
+                    const Rigid& before = b.xf[0][b.group[a.field]];
+                    const Rigid& after = xf[0][b.group[a.field]];
+                    if (a.massSlope == 0.0f) {
+                        if (memcmp(&before, &after, sizeof(Rigid)) != 0) sum[side] += Vector3DotProduct(a.grad, after.Apply(a.local));
+                    } else if (changedOf[a.field] >= 0) {
+                        sum[side] += a.massSlope * field(a.field).Distance(a.local);
                     }
                 }
                 // the surface term, for a hollow's parameter

@@ -1,4 +1,4 @@
-// Checks the grammar's two rules:
+// Checks the grammar's rules that cut (add a cut, aim a cut, split a piece) and remove a cut:
 //   ./rulecheck mesh.obj
 // Cuts are added to the sphere one after another (each joint then opened some, as Adam might), and after each:
 //   - adding a cut changes nothing (the open pose's distance field at points around it, and the loss)
@@ -60,6 +60,7 @@ int main(int argc, char** argv) {
     if (!LoadObj(argv[1], &mesh, &err)) { printf("can't load %s: %s\n", argv[1], err.c_str()); return 1; }
     AutoParams p;
     p.maxPieces = 12;
+    p.transportWeight = 1.0f;                // (so "aim a cut" has transport's material to aim with)
     Loss loss(mesh, p);
     std::mt19937 rng(7);
     RuleContext ctx{ loss, p, rng };
@@ -67,12 +68,16 @@ int main(int argc, char** argv) {
     std::vector<Vector3> pts;
     std::uniform_real_distribution<float> u(-1.0f, 1.0f);
     for (int k = 0; k < 40000; k++) pts.push_back(Vector3Add(c.centre, Vector3Scale({ u(rng), u(rng), u(rng) }, 2.5f * c.radius)));
-    const Rule *add = Find("add a cut"), *remove = Find("remove a cut");
+    const Rule* adders[] = { Find("add a cut"), Find("aim a cut"), Find("split a piece") };
+    const Rule* remove = Find("remove a cut");
 
-    for (int k = 0; k < 7; k++) {
+    for (int k = 0; k < 9; k++) {
+        const Rule* add = adders[k % 3];
         float before = loss.Evaluate(c, Placement{}).total;
         std::vector<float> open = Pose(c, 0.0f, pts);
-        if (!add->apply(c, ctx)) { printf("add: didn't apply\n"); continue; }
+        bool applied = false;
+        for (int tries = 0; tries < 20 && !applied; tries++) applied = add->apply(c, ctx);
+        if (!applied) { printf("%s: didn't apply\n", add->name); continue; }
         float after = loss.Evaluate(c, Placement{}).total;
         std::vector<float> open2 = Pose(c, 0.0f, pts);
         float worst = 0.0f;
@@ -83,7 +88,7 @@ int main(int argc, char** argv) {
         }
         int none, outside, two;
         Closed(c, pts, &none, &outside, &two);
-        printf("add -> %zu pieces: loss %.4f -> %.4f, open pose changed %.4f mm (%d points in/out); closed: %d / %d / %d\n", c.pieces.size(), before,
+        printf("%-13s -> %zu pieces: loss %.4f -> %.4f, open pose changed %.4f mm (%d points in/out); closed: %d / %d / %d\n", add->name, c.pieces.size(), before,
                after, worst, flips, none, outside, two);
         c.joints.back().open = std::uniform_real_distribution<float>(-1.5f, 1.5f)(rng);     // as Adam might open it
     }

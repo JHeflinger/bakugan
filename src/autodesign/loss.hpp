@@ -26,6 +26,13 @@
 // surface, the mean of d / (d + 1% of the mesh's size), d how deep the point is inside a hollow. About the share of the
 // surface carved away, going up smoothly as hollows reach it.
 //
+// Shape in 3D (shape.cpp; chamferWeight, sdfWeight). The open design against the placed mesh in 3D: the Chamfer
+// distance between their surfaces (both ways), and their signed distances at points in and around the mesh.
+//
+// Transport (transport.cpp; transportWeight). Optimal transport between the sphere's material, opened (points through
+// the sphere, each moving with its piece), and points filling the placed mesh: how far the material has to travel.
+// It pulls a piece toward where it's needed even from far away.
+//
 // The silhouettes and collisions depend on the carving only through the pieces' distances at a set of points: the
 // silhouettes' at the points where edge pixels' rays come closest to a piece, the collisions' at the points sampled
 // inside overlaps. So the gradient is the loss's slope against each such distance (known from the loss), times how the
@@ -45,6 +52,7 @@ namespace Bakugan {
     std::vector<float> CheckTimes(const Design& d, int n, float bias);
 
     class Dino;
+    class TriangleTree;                  // shape.cpp
 
     class Loss {
     public:
@@ -59,6 +67,8 @@ namespace Bakugan {
         // The sphere a carving starts as: at the mesh's centre of volume, with its volume (or sphereDiameter).
         Vector3 SphereCentre() const { return m_SphereCentre; }
         float SphereRadius() const { return m_SphereRadius; }
+        // The mesh's scale at which it has the sphere's volume (1 when the sphere is sized from the mesh).
+        float VolumeScale() const { return m_MeshVolume > 0.0f ? cbrtf(4.0f / 3.0f * PI * powf(m_SphereRadius, 3.0f) / m_MeshVolume) : 1.0f; }
 
         // The loss of a carving, against the mesh placed by `target`. With grad: also d loss / d each of ps (the
         // carving's and the target's parameters), per unit of the parameter.
@@ -75,6 +85,13 @@ namespace Bakugan {
             Vector3 at, dir;
         };
         const std::vector<Spot>& ExtraSpots() const { return m_Extra; }
+        // The sphere's material as transport saw it last (when it's on): a point (closed frame), its piece (index),
+        // where the open pose put it and where the plan sends it (world). For aiming new cuts.
+        struct Grain {
+            int piece;
+            Vector3 local, at, to;
+        };
+        const std::vector<Grain>& Grains() const { return m_Grains; }
 
         // The silhouettes scored last against their targets, as an RGBA picture.
         void Picture(std::vector<unsigned char>* rgba, int* w, int* h) const;
@@ -112,6 +129,21 @@ namespace Bakugan {
             float weight;                        // d loss / d shade
         };
         using Shades = std::vector<std::vector<Shade>>;   // per field
+        // A point of the sphere's material (in the closed pose's frame, which the pieces' fields are in) and the loss's
+        // slopes against it: against where its piece's open pose puts it (grad, world), and against its piece's
+        // distance there (massSlope: the cutters hand material from piece to piece). See transport.cpp.
+        struct Anchor {
+            int field;
+            Vector3 local;
+            Vector3 grad;
+            float massSlope;
+        };
+        using Anchors = std::vector<Anchor>;
+        // A point of the design's surface, open: its piece, where it is, and the piece's outward normal there.
+        struct DesignPoint {
+            int field;
+            Vector3 at, normal;
+        };
 
         AutoScore Score(const Design& d, Bodies& b, const Placement& target, Slopes* slopes, Shades* shades);
         void Silhouettes(const Bodies& b, AutoScore& s, Slopes& slopes);
@@ -121,7 +153,7 @@ namespace Bakugan {
         float PivotGap(const BodyField& f, Vector3 pivot) const { return fmaxf(0.0f, f.Distance(pivot) - 0.01f * m_L); }
         float SurfaceTerm(const Carving& c, float* carved = nullptr) const;
         void Gradient(const Carving& c, const Placement& target, const std::vector<int>& bodyOf, const Bodies& b, const Slopes& slopes,
-                      const Shades& shades, const std::vector<Param>& ps, std::vector<float>& grad);
+                      const Shades& shades, const Anchors& anchors, const std::vector<Param>& ps, std::vector<float>& grad);
         // A ray through the frame at (sx, sy) (from its centre, in mm) against one body (moved by xf), sphere traced
         // through its field inside its box; tau: the pixel size. Returns the nearest it gets (negative: how deep), and
         // where (world); with hit, also where it first enters the body (world; only when it does: the return is < 0).
@@ -142,6 +174,15 @@ namespace Bakugan {
         float Background() const;
         Vector3 Normal(const BodyField& f, Vector3 local) const;    // the field's (local) normal
         float ShadeAt(const BodyField& f, const Rigid& xf, const Shade& sh) const;
+        // shape.cpp
+        void SetUpShape(const TriMesh& mesh);
+        void SampleDesignSurface(const Bodies& b);
+        float Shape(const Bodies& b, const Placement& t, AutoScore* s, Slopes* slopes) const;   // its weighted share of the loss
+        float DesignDistance(const Bodies& b, int pose, Vector3 p, int* who, int skip = -1) const;   // the nearest piece's distance
+        // transport.cpp: its weighted share of the loss; with anchors, the material's slopes; and the placement's slopes
+        void SetUpTransport(const TriMesh& mesh);
+        float Transport(const Carving& c, const Bodies& b, const Placement& t, AutoScore& s, Anchors* anchors, Vector3* gradOffset,
+                        float* gradLogScale);
     private:
         AutoParams m_P;
         float m_L = 1.0f;
@@ -152,6 +193,7 @@ namespace Bakugan {
         std::vector<View> m_Views;
         Vector3 m_MeshCentre = { 0, 0, 0 };          // its centre of volume: placements scale about it
         float m_MeshReach = 1.0f;                     // the farthest the mesh gets from it
+        float m_MeshVolume = 0.0f;                    // its volume (0: it isn't closed)
         int m_Fine = 256;                             // the fine drawing's size
         std::vector<std::vector<float>> m_MeshFine;  // the mesh where it is, per view: covered (0/1) at m_Fine
         Placement m_Placed;                           // the placement the targets are drawn for
@@ -162,6 +204,19 @@ namespace Bakugan {
         std::vector<Vector3> m_SurfaceDirs;   // points spread evenly over the sphere (unit directions), for its surface
         std::vector<Spot> m_Extra;
         std::vector<float> m_Cover;       // the last silhouettes (open): views × pixels
+        // the 3D shape (shape.cpp)
+        std::shared_ptr<TriangleTree> m_Tree;          // the mesh's triangles, for the nearest point of it
+        std::vector<Vector3> m_ShapeSurface;           // points on the mesh, where it is ...
+        std::vector<Vector3> m_ShapeVolume;            // ... in and around it ...
+        std::vector<float> m_ShapeTarget;              // ... and its signed distance at each of those
+        std::vector<Vector3> m_DesignUnit;             // fixed points in a unit box, pulled onto each piece's surface
+        std::vector<DesignPoint> m_DesignSurface;      // the last evaluated design's surface points
+        // transport (transport.cpp)
+        std::vector<Vector3> m_BallUnit;               // points through the unit ball: the sphere's material
+        std::vector<Vector3> m_MeshFill;               // points filling the mesh, where it is
+        std::vector<float> m_TransportG;               // Sinkhorn's mesh potentials, from the last evaluation (a warm start)
+        bool m_TransportWarm = false;
+        std::vector<Grain> m_Grains;                   // the material as the last evaluation saw it
         // the semantic loss
         std::string m_Error;
         std::unique_ptr<Dino> m_Dino;

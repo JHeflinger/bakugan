@@ -85,13 +85,34 @@ namespace Bakugan {
         ImGui::SliderFloat("Keep the surface", &p.surfaceWeight, 0.0f, 10.0f, p.surfaceWeight > 0.0f ? "%.2f" : "ignored");
         ImGui::SetItemTooltip("What hollows carving into the sphere's surface cost (about the share of the surface carved away).\n"
                               "Hollows take material out from inside the sphere; this keeps its outside whole, closed.");
+        ImGui::SeparatorText("In 3D");
+        ImGui::SliderFloat("Transport", &p.transportWeight, 0.0f, 5.0f, p.transportWeight > 0.0f ? "%.2f" : "off");
+        ImGui::SetItemTooltip("Optimal transport: how far the sphere's material has to travel, opened, to fill the mesh.\n"
+                              "Every bit of material is paired with a bit of the mesh it should fill, however far away, so a\n"
+                              "piece opened to the wrong place is pulled to where it's needed.");
+        ImGui::BeginDisabled(p.transportWeight <= 0.0f);
+        ImGui::SliderInt("Transport points", &p.transportPoints, 256, 4096);
+        ImGui::SetItemTooltip("Points of the sphere's material, and points filling the mesh: more is finer and slower (its\n"
+                              "cost grows with the square)");
+        ImGui::EndDisabled();
+        ImGui::SliderFloat("3D SDF", &p.sdfWeight, 0.0f, 5.0f, p.sdfWeight > 0.0f ? "%.2f" : "off");
+        ImGui::SetItemTooltip("The open design's signed distance against the mesh's, at points in and around the mesh: inside\n"
+                              "where the mesh is, outside where it isn't. Sees dents and hollows outlines miss.");
+        ImGui::SliderFloat("Chamfer", &p.chamferWeight, 0.0f, 5.0f, p.chamferWeight > 0.0f ? "%.2f" : "off");
+        ImGui::SetItemTooltip("The Chamfer distance: how far the mesh's surface is from the design's, and the design's from the\n"
+                              "mesh's. Carved pieces can't follow fine surface detail, so it's best light, beside the others.");
+        ImGui::BeginDisabled(p.sdfWeight <= 0.0f && p.chamferWeight <= 0.0f);
+        ImGui::SliderInt("3D points", &p.shapeSamples, 300, 20000);
+        ImGui::SetItemTooltip("The mesh's points for the SDF and Chamfer terms (a third on its surface)");
+        ImGui::EndDisabled();
         ImGui::Checkbox("Mesh can move", &p.moveTarget);
         ImGui::SetItemTooltip("The mesh the open design is compared with may be moved, to wherever the design fits it best\n"
                               "(it stays where the views can see all of it). Off, it stays where it is.");
         ImGui::SameLine();
-        ImGui::Checkbox("Mesh can scale", &p.scaleTarget);
-        ImGui::SetItemTooltip("... and scaled about its centre of volume (0.3x .. 3.3x). The reference mesh shows the\n"
-                              "placement found, with the design it was found for.");
+        ImGui::Checkbox("Match volumes", &p.scaleTarget);
+        ImGui::SetItemTooltip("The mesh is scaled to the sphere's volume, so the sphere's material fills it exactly (with the\n"
+                              "sphere sized from the mesh, that's its own size; set a sphere size to make the design bigger or\n"
+                              "smaller). Off, it's compared at its own size. The reference mesh shows the placement found.");
     }
 
     // DINOv3 comparing the views as pictures (see autodesign/semantic.cpp): what it costs, the model and runtime, how the
@@ -313,10 +334,21 @@ namespace Bakugan {
         ImGui::TextColored(s.surfaceCarved > 0.02f ? Amber : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled), "Sphere surface carved: %.1f%%",
                            s.surfaceCarved * 100.0f);
         ImGui::SetItemTooltip("The share of the sphere's surface hollows reach (closed, it shows there)");
-        ImGui::TextDisabled("loss %.3f (fit %.3f, coverage %.3f, semantic %.3f, collisions %.3f, hinges %.3f, surface %.3f)", s.total, s.fit,
-                            s.coveragePenalty, s.semantic, s.collision, s.hinges, s.surface);
+        if (m_AutoParams.transportWeight > 0.0f) {
+            ImGui::TextDisabled("Transport: the material travels %.1f mm (rms); %.0f%% of the mesh unfilled", s.transportMove,
+                                s.transportUnfilled * 100.0f);
+            ImGui::SetItemTooltip("How far, root mean square, the open design's material is from the part of the mesh it's paired with");
+        }
+        if (m_AutoParams.sdfWeight > 0.0f || m_AutoParams.chamferWeight > 0.0f) {
+            ImGui::TextDisabled("3D: mesh %.1f mm from the design, design %.1f mm from the mesh (on average)", s.meshGap, s.designGap);
+            ImGui::SetItemTooltip("Mean distance from the mesh's surface to the open design's, and back");
+        }
+        ImGui::TextDisabled("loss %.3f (fit %.3f, coverage %.3f, semantic %.3f, collisions %.3f, hinges %.3f, surface %.3f, transport %.3f, "
+                            "sdf %.3f, chamfer %.3f)", s.total, s.fit, s.coveragePenalty, s.semantic, s.collision, s.hinges, s.surface,
+                            s.transport, s.sdf, s.chamfer);
         ImGui::SetItemTooltip("Lower is better: silhouettes * (fit + coverage penalty) + semantic * its weight\n"
-                              "+ collisions * their weight + hinges * their weight + surface * its weight.\n"
+                              "+ collisions * their weight + hinges * their weight + surface * its weight\n"
+                              "+ transport, sdf and chamfer * theirs.\n"
                               "Fit: the mean over the views of the share of the mesh missed plus the share of extra pixels.\n"
                               "Collisions: overlap depth over its volume, against the sphere's volume.\n"
                               "Hinges: how far pivots are outside their pieces (beyond 1%% of the mesh's size), over its size.");

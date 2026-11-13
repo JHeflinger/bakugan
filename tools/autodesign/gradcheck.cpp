@@ -17,6 +17,9 @@ int main(int argc, char** argv) {
     AutoParams p;
     SemanticFromEnv(p);
     if (const char* m = getenv("MINCOVER")) p.minViewCoverage = (float)atof(m);   // 0: no coverage penalty (its kink)
+    auto envf = [](const char* n, float& v) { if (const char* s = getenv(n)) v = (float)atof(s); };
+    envf("OTW", p.transportWeight); envf("SDFW", p.sdfWeight); envf("CHAMW", p.chamferWeight);
+    if (getenv("ONLY3D")) p.silhouetteWeight = p.collisionWeight = p.hingeWeight = p.surfaceWeight = 0.0f;   // the 3D terms' gradient alone
     if (getenv("ONLYSEM")) p.silhouetteWeight = p.collisionWeight = p.hingeWeight = 0.0f;     // the semantic gradient alone
     Loss loss(mesh, p);
     if (!loss.Error().empty()) { printf("%s\n", loss.Error().c_str()); return 1; }

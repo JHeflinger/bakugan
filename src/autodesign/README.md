@@ -12,6 +12,8 @@ The editor and the test suite call one function, `AutoDesign`, declared in `auto
 | `carving.hpp/.cpp` | what's designed: the sphere, its cutters, pieces and joints; building it into a `Design`; its parameters |
 | `adam.hpp` | Adam, with memory kept per parameter key, so parameters can come and go |
 | `loss.hpp/.cpp` | the loss (the open pose against the placed mesh, collisions, pivots) and its gradient; where collisions are checked |
+| `transport.cpp` | the transport part of the loss: optimal transport between the sphere's material, opened, and the placed mesh |
+| `shape.cpp` | the 3D shape part of the loss: the Chamfer distance and signed distances against the placed mesh |
 | `semantic.cpp` | the semantic part of the loss: the views drawn as pictures and compared by DINOv3 |
 | `dino.hpp/.cpp` | DINOv3 through ONNX Runtime, loaded at run time (its C API header is in `src/vendor/onnxruntime`) |
 | `grammar.hpp/.cpp` | the rewrite rules: add or remove a cut (and its hinge), add or remove a hollow |
@@ -34,7 +36,8 @@ Pieces are joined by **joints**, one per cut. A joint turns its child piece abou
 ## The loop (`AutoDesign`)
 
 1. **Target.** The mesh, drawn finely from `views` directions. The sphere sits at the mesh's centre of volume and has its volume (or `sphereDiameter`).
-   - The mesh may be moved and scaled about its centre of volume (`moveTarget`, `scaleTarget`): its offset and log scale are four more Adam parameters. It's kept where the views see all of it, and between 0.3× and 3.3×.
+   - The mesh may be moved (`moveTarget`): its offset is three more Adam parameters. It's kept where the views see all of it.
+   - Its scale is set, not optimized (`scaleTarget`, "Match volumes"): the size at which it has the sphere's volume, so the sphere's material fills it exactly. With the sphere sized from the mesh that's 1×; with `sphereDiameter` set, the mesh is resized to suit it. (Free, the scale shrank to about 0.6× on every mesh tried: a small mesh is easy to cover, and the sphere then held about 4.6× the material the mesh had room for.) Off, the mesh is compared at its own size.
    - Their gradient comes from the targets drawn again (resampled from the fine drawing) with each nudged two units either way, against the design as drawn.
 2. **Start.** The sphere, whole: one piece.
 3. **Steps.** Until the step budget runs out:
@@ -66,6 +69,26 @@ Only the open pose and the motion are scored. Closed, the pieces are the sphere.
 - **Surface**: hollows reaching the sphere's surface, weighted by `surfaceWeight`. Over 1024 points spread just under the surface, the mean of d / (d + 1% of the mesh's size), d how deep the point is inside a hollow: about the share of the surface carved away, rising smoothly as a hollow reaches it (so it has a gradient). Its gradient is measured directly, by nudging the hollows' parameters.
 
 total = `silhouetteWeight` · (fit + coverage penalty) + `semanticWeight` · semantic + `collisionWeight` · collision + `hingeWeight` · hinges + `surfaceWeight` · surface.
+
+## The 3D terms
+
+All off by default. They compare the open design with the placed mesh in 3D, not as outlines from a few views.
+
+**Transport** (`transportWeight`, `transportPoints`; `transport.cpp`). The carving can't grow or shrink, only rearrange the sphere's material, so the question is where that material goes. Silhouettes, the SDF and the Chamfer distance only see mistakes near the mesh: a piece opened to the wrong place, far from where it's needed, gets no pull from them. Optimal transport (the earth mover's distance) pairs every bit of material with a bit of the mesh it should fill, however far away, and pulls it there.
+- *The material*: fixed points spread evenly through the sphere, in its frame. Each belongs to the piece it's inside (a point in a hollow: to none) and moves rigidly with that piece's open pose, so there's nothing to sample again.
+- *The mesh*: fixed points filling it (winding number over ½), moved with the placement.
+- *The masses*, in shares of the sphere's volume: a material point weighs its share of the sphere, a mesh point its share of the placed mesh's volume (over the sphere's). The transport is unbalanced: mass left unmatched costs ρ = (the mesh's size)² a unit, so moving material is always cheaper than dropping it and only a real difference in amount goes unmatched. A mesh with less room than the sphere's material can't take all of it, and material taken by hollows leaves part of the mesh unfilled (`transportUnfilled`): both cost.
+- *The cost*: entropic unbalanced optimal transport with squared distances (Sinkhorn in the log domain, ε = (5% of the mesh's size)², warm started from the last evaluation), over (10% of the mesh's size)². With ρ that large, plain Sinkhorn settles the balance between the two sides (a constant shared by both potentials) only ε/ρ of the way a round, so after every half-round the best such shift is made exactly (translation invariant Sinkhorn, Séjourné et al. 2022). Without it the mass terms' slopes came out half what they should.
+- *Its gradient*, with the plan held fixed. A material point's slope is 2r(x − T), r the mass it sends and T where; the joints move it (`Anchor.grad`). A mesh point's is 2c(y − S) likewise, which gives the placement's slope exactly (through the scale its mass changes too). A cutter hands material from one piece to another along its face, and a hollow takes it away: mass added at x changes the cost by φ(x) = ρ(1 − e^(−f(x)/ρ)) − ε(e^(−f(x)/ρ) − B), f(x) the dual potential there, and near a piece's surface its share of a point is taken as ½ − D/(2τ), τ = 2% of the mesh's size (`Anchor.massSlope`).
+- Against brute force (`ONLY3D=1 OTW=1 gradcheck` on `assets/zard.obj`): cosine 0.992 over all 64 parameters, 0.92 over the carving's own. The joints' and the placement's (scale included) agree to a few parts in a thousand. The cutters' are rougher, because brute force there is itself a step function (points change piece one at a time).
+- *Cost*: about 5× the silhouettes' a step at 1024 points (34 ms against 7 ms); it grows with the square of `transportPoints`.
+
+**SDF** (`sdfWeight`) and **Chamfer** (`chamferWeight`) (`shape.cpp`, the mesh's points: `shapeSamples`).
+- *SDF*: points in and around the mesh, whose signed distance T to it is known. The design's D should match it within 5% of the mesh's size of its surface; deeper inside, D only has to be that far inside too, and farther out, that far outside. So it tells inside from outside and says which way to move.
+- *Chamfer*: points on the mesh's surface each cost the design's |D| there, and points on the design's surface (fixed points in each piece's box pulled onto it by Newton steps, where no other piece covers them) each cost the distance to the mesh (a box tree over its triangles). Carved pieces can't follow fine surface detail, so it's best light.
+- Both depend on the design only through the pieces' distances at world points. A design-surface point's slope is −(∂u/∂x · n) against its piece's distance there: raising the distance by e moves the surface back by e along its normal n. Against brute force: cosine 0.97 (SDF), 0.95 (Chamfer).
+
+`autotest` takes them as `OTW`, `OTN`, `SDFW`, `CHAMW`, `SHAPEN`, and measures every result with all three, whatever the run used.
 
 ## The semantic loss
 

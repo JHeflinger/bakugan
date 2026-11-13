@@ -37,7 +37,7 @@ namespace Bakugan {
         // carving as it was before.
         AutoScore AdamStep(State& s, Loss& loss, const AutoParams& p) {
             std::vector<Param> ps = CarvingParams(s.carving, loss.L());
-            std::vector<Param> tp = TargetParams(p.moveTarget, p.scaleTarget, loss.L());
+            std::vector<Param> tp = TargetParams(p.moveTarget, false, loss.L());   // (the scale is set, not optimized)
             ps.insert(ps.end(), tp.begin(), tp.end());
             std::vector<float> grad;
             AutoScore score = loss.Evaluate(s.carving, s.target, ps, &grad);
@@ -94,6 +94,9 @@ namespace Bakugan {
         // 2. the start: the sphere, whole
         State cur;
         cur.carving = Carving::Sphere(loss.SphereCentre(), loss.SphereRadius());
+        // the mesh at the sphere's volume, so the sphere's material fills it exactly (not a parameter: free, it shrank)
+        cur.target.scale = p.scaleTarget ? loss.VolumeScale() : 1.0f;
+        cur.target = loss.KeepTargetInFrame(cur.target);
         cur.adam.lr = p.learningRate;
         Carving best;
         AutoScore bestScore;
