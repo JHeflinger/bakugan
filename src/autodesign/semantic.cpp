@@ -1,5 +1,6 @@
-// The semantic part of the loss (see loss.hpp): the design drawn from each view, compared with the mesh's and the
-// sphere's pictures by DINOv3, and the gradient that comes back through the pixels.
+// The semantic part of the loss (see loss.hpp): the open design drawn from each view, compared with the placed mesh's
+// pictures by DINOv3, and the gradient that comes back through the pixels (and, through the mesh's pictures, to its
+// placement: Loss::Evaluate).
 //
 // A pixel's value: each body its ray reaches (within a pixel's softness) is a layer, with a coverage c (from the ray's
 // nearest distance, as for silhouettes) and a shade s (of the surface where the ray enters it, or on an edge, where it
@@ -85,9 +86,13 @@ namespace Bakugan {
             for (int k = 0; k < 3; k++) normal[vertexOf[mesh.indices[t + k]]] = Vector3Add(normal[vertexOf[mesh.indices[t + k]]], n);
         }
 
-        // each view: triangles depth buffered at 3x3 samples a pixel, each sample shaded, averaged
+        // each view, finely (3 samples a pixel across), where the mesh is: triangles depth buffered, each sample's depth
+        // (from the mesh's centre) and shade kept, for placements to resample (SemanticTargets)
         const int ss = 3, big = S * ss;
-        m_MeshLook.assign(nv, std::vector<float>((size_t)S * S, 0.0f));
+        m_SemFine = big;
+        m_SemHit.assign(nv, std::vector<float>((size_t)big * big, 0.0f));
+        m_SemDepth = m_SemHit;
+        m_SemShade = m_SemHit;
         ParallelFor(nv, [&](int v) {
             const View& w = m_Views[v];
             std::vector<float> depth((size_t)big * big, FLT_MAX);
@@ -121,21 +126,55 @@ namespace Bakugan {
                         norm[k] = Vector3Add(Vector3Scale(N[0], b0), Vector3Add(Vector3Scale(N[1], b1), Vector3Scale(N[2], b2)));
                     }
             }
-            const float bg = Background();
             for (int y = 0; y < big; y++)
                 for (int x = 0; x < big; x++) {
                     size_t k = (size_t)y * big + x;
-                    float value = bg;
-                    if (depth[k] < FLT_MAX) {
-                        float sx = ((x + 0.5f) / big * 2.0f - 1.0f) * m_Half, sy = (1.0f - (y + 0.5f) / big * 2.0f) * m_Half;
-                        Vector3 p = Vector3Add(m_Centre, Vector3Add(Vector3Add(Vector3Scale(w.u, sx), Vector3Scale(w.v, sy)), Vector3Scale(w.dir, depth[k])));
-                        Vector3 n = Vector3Normalize(norm[k]);
-                        if (Vector3DotProduct(n, w.dir) > 0.0f) n = Vector3Negate(n);    // the side facing the view
-                        value = Look(w, p, n);
-                    }
-                    m_MeshLook[v][(size_t)(y / ss) * S + x / ss] += value / (ss * ss);
+                    if (depth[k] == FLT_MAX) continue;
+                    float sx = ((x + 0.5f) / big * 2.0f - 1.0f) * m_Half, sy = (1.0f - (y + 0.5f) / big * 2.0f) * m_Half;
+                    Vector3 p = Vector3Add(m_Centre, Vector3Add(Vector3Add(Vector3Scale(w.u, sx), Vector3Scale(w.v, sy)), Vector3Scale(w.dir, depth[k])));
+                    Vector3 n = Vector3Normalize(norm[k]);
+                    if (Vector3DotProduct(n, w.dir) > 0.0f) n = Vector3Negate(n);    // the side facing the view
+                    m_SemHit[v][k] = 1.0f;
+                    m_SemDepth[v][k] = Vector3DotProduct(Vector3Subtract(p, m_MeshCentre), w.dir);
+                    m_SemShade[v][k] = Look(w, p, n);           // (shaded and silhouette looks don't change as it's placed)
                 }
         });
+    }
+
+    // The placed mesh's pictures: its fine drawing resampled where the placement puts it (bilinear, 2 x 2 a pixel).
+    std::vector<std::vector<float>> Loss::SemanticTargets(const Placement& t) const {
+        const int S = m_SemRes, nv = (int)m_Views.size(), n = m_SemFine;
+        const float bg = Background();
+        auto bilinear = [&](const std::vector<float>& m, float fx, float fy) {
+            fx -= 0.5f;
+            fy -= 0.5f;
+            int x0 = (int)floorf(fx), y0 = (int)floorf(fy);
+            float ax = fx - x0, ay = fy - y0;
+            auto at = [&](int x, int y) { return x < 0 || y < 0 || x >= n || y >= n ? 0.0f : m[(size_t)y * n + x]; };
+            return (1 - ay) * ((1 - ax) * at(x0, y0) + ax * at(x0 + 1, y0)) + ay * ((1 - ax) * at(x0, y0 + 1) + ax * at(x0 + 1, y0 + 1));
+        };
+        std::vector<std::vector<float>> out(nv, std::vector<float>((size_t)S * S, bg));
+        for (int v = 0; v < nv; v++) {
+            const View& w = m_Views[v];
+            const float shift = Vector3DotProduct(Vector3Subtract(Vector3Add(m_MeshCentre, t.offset), m_Centre), w.dir);
+            for (int y = 0; y < S; y++)
+                for (int x = 0; x < S; x++) {
+                    float sum = 0.0f;
+                    for (int k = 0; k < 4; k++) {
+                        float sx = ((x + 0.25f + 0.5f * (k & 1)) / S * 2.0f - 1.0f) * m_Half, sy = (1.0f - (y + 0.25f + 0.5f * (k >> 1)) / S * 2.0f) * m_Half;
+                        Vector2 b = Unplace(w, sx, sy, t);
+                        float fx = (b.x / m_Half + 1.0f) * 0.5f * n, fy = (1.0f - b.y / m_Half) * 0.5f * n;
+                        float cover = bilinear(m_SemHit[v], fx, fy), shade = bg;
+                        if (cover > 1e-6f) {
+                            if (m_P.semanticLook == SemanticLook::Depth) shade = DepthLook(shift + t.scale * bilinear(m_SemDepth[v], fx, fy) / cover);
+                            else shade = bilinear(m_SemShade[v], fx, fy) / cover;
+                        }
+                        sum += cover * shade + (1.0f - cover) * bg;
+                    }
+                    out[v][(size_t)y * S + x] = 0.25f * sum;
+                }
+        }
+        return out;
     }
 
     std::string Loss::SemanticDevice() const { return m_Dino ? m_Dino->Device() : ""; }
@@ -148,8 +187,8 @@ namespace Bakugan {
         switch (m_P.semanticLook) {
         case SemanticLook::Silhouette:
             return 1.0f;
-        case SemanticLook::Depth:                         // the frame's near side bright, its far side dim
-            return std::clamp(0.5f - Vector3DotProduct(Vector3Subtract(p, m_Centre), w.dir) / (2.4f * m_Half), 0.05f, 1.0f);
+        case SemanticLook::Depth:
+            return DepthLook(Vector3DotProduct(Vector3Subtract(p, m_Centre), w.dir));
         case SemanticLook::Shaded:
         default: {
             // a key light from the viewer's upper left and a dimmer fill from the right, on a light grey material
@@ -165,6 +204,9 @@ namespace Bakugan {
 
     // Measured across a pixel, which blurs creases (where unions and cuts meet) over about that much: a crease's shading
     // then moves smoothly as it does, instead of jumping from pixel to pixel, which no gradient would follow.
+    // The frame's near side bright, its far side dim.
+    float Loss::DepthLook(float depth) const { return std::clamp(0.5f - depth / (2.4f * m_Half), 0.05f, 1.0f); }
+
     Vector3 Loss::Normal(const BodyField& f, Vector3 p) const {
         const float h = m_SemTau;
         Vector3 g = { f.Distance({ p.x + h, p.y, p.z }) - f.Distance({ p.x - h, p.y, p.z }),
@@ -188,160 +230,108 @@ namespace Bakugan {
         return Look(w, xf.Apply(p), n);
     }
 
-    // The sphere's picture, the way the bodies are drawn: the soft edge from how near each ray comes to it, the shade of
-    // where the ray enters it (or comes closest, past its edge).
-    void Loss::SphereLook(const View& w, Vector3 centre, float* out) const {
-        const int S = m_SemRes;
-        const float R = m_SphereRadius, bg = Background();
-        Vector3 c = Vector3Subtract(centre, m_Centre);
-        float cx = Vector3DotProduct(c, w.u), cy = Vector3DotProduct(c, w.v);
-        for (int y = 0; y < S; y++)
-            for (int x = 0; x < S; x++) {
-                float dx = FrameX(x, S) - cx, dy = FrameY(y, S) - cy, r = sqrtf(dx * dx + dy * dy);
-                float cover = std::clamp(0.5f - (r - R) / (2.0f * m_SemTau), 0.0f, 1.0f);
-                float value = bg;
-                if (cover > 0.0f) {
-                    Vector3 side = Vector3Add(Vector3Scale(w.u, dx), Vector3Scale(w.v, dy)), q, n;
-                    if (r < R) {
-                        n = Vector3Add(Vector3Scale(side, 1.0f / R), Vector3Scale(w.dir, -sqrtf(fmaxf(0.0f, R * R - r * r)) / R));
-                        q = Vector3Add(centre, Vector3Scale(n, R));
-                    } else {
-                        n = Vector3Scale(side, 1.0f / fmaxf(r, 1e-9f));
-                        q = Vector3Add(centre, Vector3Scale(n, R));
-                    }
-                    value = cover * Look(w, q, n) + (1.0f - cover) * bg;
-                }
-                out[(size_t)y * S + x] = value;
-            }
-    }
-
     // ---- the loss ---------------------------------------------------------------------------------------------------------
 
     void Loss::Semantics(const Bodies& b, AutoScore& s, Slopes& slopes, Shades& shades) {
         const int S = m_SemRes, nv = (int)m_Views.size(), px = S * S;
-        const float bias = std::clamp(m_P.sphereBias, 0.0f, 1.0f), bg = Background(), tau = m_SemTau;
-        const float poseWeight[2] = { m_P.semanticWeight * (1.0f - bias) / nv, m_P.semanticWeight * bias / nv };
-        m_SemSphereGrad = { 0, 0, 0 };
-        std::vector<Layer> layers;
-        std::vector<unsigned char> count;
+        const float bg = Background(), tau = m_SemTau, weight = m_P.semanticWeight / nv;
+        const int pose = 0;                                     // the open pose
+        std::vector<Layer> layers((size_t)nv * px * MaxLayers, Layer{});
+        std::vector<unsigned char> count((size_t)nv * px, 0);
         struct Candidate {
             int field;
             Shade shade;
         };
         std::vector<Candidate> candidates;
-        std::vector<float> gRender(px), gTarget(px), plus(px), minus(px);
+        std::vector<float> gRender(px), gTarget(px);
         s.worstSemantic = 0.0f;
+        m_SemDrawn.assign((size_t)nv * px, bg);
+        m_SemGradTarget.assign((size_t)nv * px, 0.0f);
 
-        for (int pose = 0; pose < 2; pose++) {
-            m_SemDrawn[pose].clear();
-            m_SemTarget[pose].clear();
-            if (poseWeight[pose] <= 0.0f) continue;              // this pose doesn't count: not drawn
-            m_SemDrawn[pose].assign((size_t)nv * px, bg);
-            m_SemTarget[pose].assign((size_t)nv * px, bg);
-            layers.assign((size_t)nv * px * MaxLayers, Layer{});
-            count.assign((size_t)nv * px, 0);
-
-            // drawing: every row of every view
-            ParallelFor(nv * S, [&](int task) {
-                int v = task / S, y = task % S;
-                const View& w = m_Views[v];
-                for (int x = 0; x < S; x++) {
-                    size_t k = (size_t)v * px + (size_t)y * S + x;
-                    Layer* L = &layers[k * MaxLayers];
-                    int n = 0;
-                    for (size_t i = 0; i < b.fields.size(); i++) {
-                        const Rigid& xf = b.xf[pose][b.group[i]];
-                        Vector3 at, hit = { NAN, NAN, NAN };
-                        float dmin = Trace(b.fields[i], b.box[i], xf, w, FrameX(x, S), FrameY(y, S), tau, &at, &hit);
-                        float c = std::clamp(0.5f - dmin / (2.0f * tau), 0.0f, 1.0f);
-                        if (c <= 0.0f) continue;
-                        bool enters = !std::isnan(hit.x);
-                        Layer l;
-                        l.field = (int)i;
-                        l.c = c;
-                        l.at = at;
-                        l.q = enters ? hit : at;
-                        Vector3 ql = xf.ApplyInverse(l.q), nl = Normal(b.fields[i], ql), nw = Vector3RotateByQuaternion(nl, xf.rotation);
-                        if (enters) {       // the distance's slope along the ray, measured (fields needn't be exact distances)
-                            Vector3 dl = Vector3Scale(Vector3RotateByQuaternion(w.dir, Conjugate(xf.rotation)), 0.25f * tau);
-                            l.along = fminf((b.fields[i].Distance(Vector3Add(ql, dl)) - b.fields[i].Distance(Vector3Subtract(ql, dl))) / (0.5f * tau), -1e-3f);
-                        } else
-                            l.along = 0.0f;
-                        l.s = Look(w, l.q, nw);
-                        l.depth = Vector3DotProduct(Vector3Subtract(l.q, m_Centre), w.dir);
-                        // nearest first; past MaxLayers the farthest is dropped
-                        if (n < MaxLayers) L[n++] = l;
-                        else if (l.depth < L[n - 1].depth) L[n - 1] = l;
-                        else continue;
-                        for (int j = n - 1; j > 0 && L[j].depth < L[j - 1].depth; j--) std::swap(L[j], L[j - 1]);
-                    }
-                    count[k] = (unsigned char)n;
-                    float T = 1.0f, value = 0.0f;
-                    for (int j = 0; j < n; j++) {
-                        value += T * L[j].c * L[j].s;
-                        T *= 1.0f - L[j].c;
-                    }
-                    m_SemDrawn[pose][k] = value + T * bg;
+        // drawing: every row of every view
+        ParallelFor(nv * S, [&](int task) {
+            int v = task / S, y = task % S;
+            const View& w = m_Views[v];
+            for (int x = 0; x < S; x++) {
+                size_t k = (size_t)v * px + (size_t)y * S + x;
+                Layer* L = &layers[k * MaxLayers];
+                int n = 0;
+                for (size_t i = 0; i < b.fields.size(); i++) {
+                    const Rigid& xf = b.xf[pose][b.group[i]];
+                    Vector3 at, hit = { NAN, NAN, NAN };
+                    float dmin = Trace(b.fields[i], b.box[i], xf, w, FrameX(x, S), FrameY(y, S), tau, &at, &hit);
+                    float c = std::clamp(0.5f - dmin / (2.0f * tau), 0.0f, 1.0f);
+                    if (c <= 0.0f) continue;
+                    bool enters = !std::isnan(hit.x);
+                    Layer l;
+                    l.field = (int)i;
+                    l.c = c;
+                    l.at = at;
+                    l.q = enters ? hit : at;
+                    Vector3 ql = xf.ApplyInverse(l.q), nl = Normal(b.fields[i], ql), nw = Vector3RotateByQuaternion(nl, xf.rotation);
+                    if (enters) {       // the distance's slope along the ray, measured (fields needn't be exact distances)
+                        Vector3 dl = Vector3Scale(Vector3RotateByQuaternion(w.dir, Conjugate(xf.rotation)), 0.25f * tau);
+                        l.along = fminf((b.fields[i].Distance(Vector3Add(ql, dl)) - b.fields[i].Distance(Vector3Subtract(ql, dl))) / (0.5f * tau), -1e-3f);
+                    } else
+                        l.along = 0.0f;
+                    l.s = Look(w, l.q, nw);
+                    l.depth = Vector3DotProduct(Vector3Subtract(l.q, m_Centre), w.dir);
+                    // nearest first; past MaxLayers the farthest is dropped
+                    if (n < MaxLayers) L[n++] = l;
+                    else if (l.depth < L[n - 1].depth) L[n - 1] = l;
+                    else continue;
+                    for (int j = n - 1; j > 0 && L[j].depth < L[j - 1].depth; j--) std::swap(L[j], L[j - 1]);
                 }
-            });
-
-            // each view against its target, by DINOv3; its slopes back through the pixels
-            double sum = 0.0;
-            for (int v = 0; v < nv; v++) {
-                float* target = m_SemTarget[pose].data() + (size_t)v * px;
-                if (pose == 0) std::copy(m_MeshLook[v].begin(), m_MeshLook[v].end(), target);
-                else SphereLook(m_Views[v], m_SphereCentre, target);
-                float loss = 0.0f;
-                if (!m_Dino->Run(m_SemDrawn[pose].data() + (size_t)v * px, target, std::clamp(m_P.patchWeight, 0.0f, 1.0f), &loss,
-                                 gRender.data(), pose == 1 ? gTarget.data() : nullptr)) {
-                    m_Error = m_Dino->Error();
-                    continue;
+                count[k] = (unsigned char)n;
+                float T = 1.0f, value = 0.0f;
+                for (int j = 0; j < n; j++) {
+                    value += T * L[j].c * L[j].s;
+                    T *= 1.0f - L[j].c;
                 }
-                sum += loss;
-                s.worstSemantic = fmaxf(s.worstSemantic, loss);
+                m_SemDrawn[k] = value + T * bg;
+            }
+        });
 
-                for (int p = 0; p < px; p++) {
-                    float g = poseWeight[pose] * gRender[p];
-                    if (g == 0.0f) continue;
-                    size_t k = (size_t)v * px + p;
-                    const Layer* L = &layers[k * MaxLayers];
-                    int n = count[k];
-                    // behind[j]: what shows behind layer j; front[j]: how much of layer j shows
-                    float behind[MaxLayers], front[MaxLayers];
-                    float B = bg;
-                    for (int j = n - 1; j >= 0; j--) {
-                        behind[j] = B;
-                        B = L[j].c * L[j].s + (1.0f - L[j].c) * B;
-                    }
-                    float T = 1.0f;
-                    for (int j = 0; j < n; j++) {
-                        front[j] = T;
-                        T *= 1.0f - L[j].c;
-                    }
-                    for (int j = 0; j < n; j++) {
-                        if (L[j].c < 1.0f)          // the soft edge: d c / d distance = -1 / (2 tau)
-                            slopes[L[j].field].push_back({ pose, L[j].at, g * front[j] * (L[j].s - behind[j]) * (-1.0f / (2.0f * tau)) });
-                        if (m_P.semanticLook != SemanticLook::Silhouette)
-                            candidates.push_back({ L[j].field, { pose, v, L[j].q, L[j].along, g * front[j] * L[j].c } });
-                    }
+        // each view against the placed mesh's picture, by DINOv3; its slopes back through the pixels
+        double sum = 0.0;
+        for (int v = 0; v < nv; v++) {
+            float loss = 0.0f;
+            if (!m_Dino->Run(m_SemDrawn.data() + (size_t)v * px, m_SemTarget[v].data(), std::clamp(m_P.patchWeight, 0.0f, 1.0f), &loss,
+                             gRender.data(), gTarget.data())) {
+                m_Error = m_Dino->Error();
+                continue;
+            }
+            sum += loss;
+            s.worstSemantic = fmaxf(s.worstSemantic, loss);
+            for (int p = 0; p < px; p++) m_SemGradTarget[(size_t)v * px + p] = weight * gTarget[p];   // for the placement's slope
+
+            for (int p = 0; p < px; p++) {
+                float g = weight * gRender[p];
+                if (g == 0.0f) continue;
+                size_t k = (size_t)v * px + p;
+                const Layer* L = &layers[k * MaxLayers];
+                int n = count[k];
+                // behind[j]: what shows behind layer j; front[j]: how much of layer j shows
+                float behind[MaxLayers], front[MaxLayers];
+                float B = bg;
+                for (int j = n - 1; j >= 0; j--) {
+                    behind[j] = B;
+                    B = L[j].c * L[j].s + (1.0f - L[j].c) * B;
                 }
-                // the sphere: its picture moves with its centre (a quarter pixel either way)
-                if (pose == 1) {
-                    const float h = 0.25f * tau;
-                    for (int a = 0; a < 3; a++) {
-                        Vector3 e = { 0, 0, 0 };
-                        (&e.x)[a] = h;
-                        SphereLook(m_Views[v], Vector3Add(m_SphereCentre, e), plus.data());
-                        SphereLook(m_Views[v], Vector3Subtract(m_SphereCentre, e), minus.data());
-                        double d = 0.0;
-                        for (int p = 0; p < px; p++) d += gTarget[p] * (plus[p] - minus[p]);
-                        (&m_SemSphereGrad.x)[a] += poseWeight[pose] * (float)(d / (2.0 * h));
-                    }
+                float T = 1.0f;
+                for (int j = 0; j < n; j++) {
+                    front[j] = T;
+                    T *= 1.0f - L[j].c;
+                }
+                for (int j = 0; j < n; j++) {
+                    if (L[j].c < 1.0f)          // the soft edge: d c / d distance = -1 / (2 tau)
+                        slopes[L[j].field].push_back({ pose, L[j].at, g * front[j] * (L[j].s - behind[j]) * (-1.0f / (2.0f * tau)) });
+                    if (m_P.semanticLook != SemanticLook::Silhouette)
+                        candidates.push_back({ L[j].field, { pose, v, L[j].q, L[j].along, g * front[j] * L[j].c } });
                 }
             }
-            (pose == 0 ? s.semanticOpen : s.semanticClosed) = (float)(sum / nv);
         }
-        s.semantic = (1.0f - bias) * s.semanticOpen + bias * s.semanticClosed;
+        s.semantic = (float)(sum / nv);
 
         // the shades the gradient measures: all of them if few, else semanticSamples drawn by |slope| (each then
         // stands for total |slope| / samples, with its own sign)
@@ -369,24 +359,18 @@ namespace Bakugan {
 
     void Loss::SemanticPicture(std::vector<unsigned char>* rgba, int* w, int* h) const {
         const int nv = (int)m_Views.size(), S = m_SemRes, px = S * S, gap = 3;
-        const std::vector<float>* rows[4] = { &m_SemTarget[0], &m_SemDrawn[0], &m_SemTarget[1], &m_SemDrawn[1] };
-        int shown = 0;
-        for (const auto* r : rows) shown += r->size() == (size_t)nv * px;
-        if (!m_Dino || shown == 0) { *w = *h = 0; rgba->clear(); return; }
+        if (!m_Dino || m_SemDrawn.size() != (size_t)nv * px || m_SemTarget.size() != (size_t)nv) { *w = *h = 0; rgba->clear(); return; }
         *w = nv * S + (nv + 1) * gap;
-        *h = shown * S + (shown + 1) * gap;
+        *h = 2 * S + 3 * gap;
         rgba->assign((size_t)*w * *h * 4, 255);
         for (size_t k = 0; k < rgba->size(); k += 4) { (*rgba)[k] = 222; (*rgba)[k + 1] = 225; (*rgba)[k + 2] = 232; }
-        int row = 0;
-        for (const auto* r : rows) {
-            if (r->size() != (size_t)nv * px) continue;
+        for (int row = 0; row < 2; row++)
             for (int v = 0; v < nv; v++)
                 for (int k = 0; k < px; k++) {
-                    unsigned char g = (unsigned char)std::clamp(lroundf((*r)[(size_t)v * px + k] * 255.0f), 0L, 255L);
+                    float value = row == 0 ? m_SemTarget[v][k] : m_SemDrawn[(size_t)v * px + k];
+                    unsigned char g = (unsigned char)std::clamp(lroundf(value * 255.0f), 0L, 255L);
                     unsigned char* out = &(*rgba)[((size_t)(gap + row * (S + gap) + k / S) * *w + gap + v * (S + gap) + k % S) * 4];
                     out[0] = out[1] = out[2] = g;
                 }
-            row++;
-        }
     }
 }

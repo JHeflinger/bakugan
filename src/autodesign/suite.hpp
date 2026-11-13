@@ -9,7 +9,7 @@ namespace Bakugan {
     // Test suite: runs the generator on every .obj in a folder and renders one square video of all of them side by
     // side, each in its own labelled box: the best design over the whole search, then the result closing and opening.
     struct SuiteParams {
-        AutoParams generate;         // the generator settings (fromCurrent is ignored: every mesh starts from scratch)
+        AutoParams generate;         // the generator settings (every mesh starts from a sphere)
         std::string folder;          // where the .obj files are; results go to <folder>/autodesign_suite/
         float meshSize = 80.0f;      // mm: each mesh is centred and scaled so its longest side is this (0: as is)
         int videoSize = 1080;        // pixels, square

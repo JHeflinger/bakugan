@@ -159,6 +159,13 @@ namespace Bakugan {
         bool solid = m_ReferenceMode != ReferenceMode::Ghost;
         if (solid != solidPass) return;
         m_Reference.transform = ReferenceMatrix();
+        // with a generated design showing, the mesh where the generator placed it to compare (moved and scaled)
+        if (m_HasAutoScore && m_AutoScoreFor == m_Design && !m_AutoScoreOnly) {
+            const Placement& t = m_AutoScore.target;
+            Matrix place = MatrixMultiply(MatrixMultiply(MatrixTranslate(-t.centre.x, -t.centre.y, -t.centre.z), MatrixScale(t.scale, t.scale, t.scale)),
+                                          MatrixTranslate(t.centre.x + t.offset.x, t.centre.y + t.offset.y, t.centre.z + t.offset.z));
+            m_Reference.transform = MatrixMultiply(m_Reference.transform, place);
+        }
         rlDrawRenderBatchActive();
         // imported meshes often wind some (or all) faces the wrong way: draw both sides so the nearest surface wins
         rlDisableBackfaceCulling();
@@ -535,7 +542,7 @@ namespace Bakugan {
         m_OutputView.End3D();
     }
 
-    // The sphere the generator scored the closed pose against: faint while open, clearer as the design closes.
+    // The sphere the generator carved: faint while open, clearer as the design closes (it closes into it exactly).
     void App::DrawAutoSphere() {
         if (!m_ShowAutoSphere || !m_HasAutoScore || m_AutoScore.radius <= 0.0f) return;
         if (!m_AutoJob.Busy() && !(m_AutoScoreFor == m_Design)) return;

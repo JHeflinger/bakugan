@@ -56,17 +56,8 @@ namespace Bakugan {
     void App::GenerateGoal() {
         AutoParams& p = m_AutoParams;
         ImGui::SeparatorText("Goal");
-        float w = ImGui::GetContentRegionAvail().x;
-        ImGui::TextDisabled("match the mesh");
-        ImGui::SameLine(w - ImGui::CalcTextSize("close into a sphere").x);
-        ImGui::TextDisabled("close into a sphere");
-        char fmt[64];
-        int sphere = (int)lroundf(p.sphereBias * 100.0f);
-        snprintf(fmt, sizeof(fmt), "fit %d%%%%  |  sphere %d%%%%", 100 - sphere, sphere);
-        ImGui::SetNextItemWidth(-FLT_MIN);
-        ImGui::SliderFloat("##bias", &p.sphereBias, 0.0f, 1.0f, fmt);
-        ImGui::SetItemTooltip("How much each half of the score counts: how well the open design matches the mesh,\n"
-                              "against how round the closed design is");
+        Hint("A sphere is cut into pieces and hinged, so that open it looks like the mesh. Closed, the pieces are the sphere "
+             "again, always: only the open pose and the motion are scored.");
         {
             ImGui::SliderInt("Views", &p.views, 1, 16);
             ImGui::SetItemTooltip("Directions the outlines are compared from, spread over a half sphere (from the other\n"
@@ -78,8 +69,8 @@ namespace Bakugan {
                                   "steeply (10 per whole share missing), so no single view can be given up.");
         }
         ImGui::SliderFloat("Collisions", &p.collisionWeight, 0.0f, 5.0f, p.collisionWeight > 0.0f ? "%.2f" : "ignored");
-        ImGui::SetItemTooltip("What bodies overlapping each other costs: in the open pose, the closed pose, and the poses\n"
-                              "checked between (together they weigh as much as one end pose)");
+        ImGui::SetItemTooltip("What pieces overlapping each other costs: in the open pose, and the poses checked between\n"
+                              "(together they weigh as much as the open pose). Closed, the pieces fill the sphere side by side.");
         ImGui::BeginDisabled(p.collisionWeight <= 0.0f);
         ImGui::SliderInt("Poses between", &p.motionChecks, 0, 64);
         ImGui::SetItemTooltip("Poses checked for overlaps between open and closed. They go only where some hinge is moving,\n"
@@ -88,14 +79,19 @@ namespace Bakugan {
         ImGui::SetItemTooltip("0: the poses between are spread evenly over the times any hinge moves. 1: placed by how many\n"
                               "hinges move at once. Between, a mix: some evenly everywhere a hinge moves, the rest where most do.");
         ImGui::EndDisabled();
-        ImGui::SliderFloat("Hinges on bodies", &p.hingeWeight, 0.0f, 10.0f, p.hingeWeight > 0.0f ? "%.2f" : "ignored");
-        ImGui::SetItemTooltip("What a hinge's pivot being away from the two bodies it joins costs: how far it is outside\n"
-                              "each, beyond 1%% of the mesh's size, over the mesh's size. A real hinge sits where its bodies meet.");
-        ImGui::DragFloat("Sphere size", &p.sphereDiameter, 0.5f, 0.0f, 500.0f, p.sphereDiameter > 0.0f ? "%.1f mm across" : "auto");
-        ImGui::SetItemTooltip("Diameter the closed design should have. Auto: a sphere of the mesh's volume.");
-        ImGui::Checkbox("Sphere can move", &p.moveSphere);
-        ImGui::SetItemTooltip("The sphere starts at the mesh's centre of volume. On, the optimizer moves it too, so the closed\n"
-                              "design can be a sphere anywhere (it stays where the views can see it). Off, it stays put.");
+        ImGui::SliderFloat("Hinges on pieces", &p.hingeWeight, 0.0f, 10.0f, p.hingeWeight > 0.0f ? "%.2f" : "ignored");
+        ImGui::SetItemTooltip("What a joint's pivot being away from the two pieces it joins costs: how far it is outside\n"
+                              "each, beyond 1%% of the mesh's size, over the mesh's size. A real hinge sits where its pieces meet.");
+        ImGui::SliderFloat("Keep the surface", &p.surfaceWeight, 0.0f, 10.0f, p.surfaceWeight > 0.0f ? "%.2f" : "ignored");
+        ImGui::SetItemTooltip("What hollows carving into the sphere's surface cost (about the share of the surface carved away).\n"
+                              "Hollows take material out from inside the sphere; this keeps its outside whole, closed.");
+        ImGui::Checkbox("Mesh can move", &p.moveTarget);
+        ImGui::SetItemTooltip("The mesh the open design is compared with may be moved, to wherever the design fits it best\n"
+                              "(it stays where the views can see all of it). Off, it stays where it is.");
+        ImGui::SameLine();
+        ImGui::Checkbox("Mesh can scale", &p.scaleTarget);
+        ImGui::SetItemTooltip("... and scaled about its centre of volume (0.3x .. 3.3x). The reference mesh shows the\n"
+                              "placement found, with the design it was found for.");
     }
 
     // DINOv3 comparing the views as pictures (see autodesign/semantic.cpp): what it costs, the model and runtime, how the
@@ -105,7 +101,7 @@ namespace Bakugan {
         ImGui::SeparatorText("Semantic loss (DINOv3)");
         ImGui::SliderFloat("Semantic", &p.semanticWeight, 0.0f, 5.0f, p.semanticWeight > 0.0f ? "%.2f" : "off");
         ImGui::SetItemTooltip("What the views looking different to DINOv3 costs: each view of the open design is compared with\n"
-                              "the mesh's, each of the closed design with the sphere's (weighed by the goal, as silhouettes are)");
+                              "the placed mesh's");
         ImGui::SliderFloat("Silhouettes", &p.silhouetteWeight, 0.0f, 5.0f, p.silhouetteWeight > 0.0f ? "%.2f" : "off");
         ImGui::SetItemTooltip("What the outline comparison (above) costs, beside it. 0: only DINOv3 judges how the design looks.");
         if (p.semanticWeight <= 0.0f) return;
@@ -134,7 +130,7 @@ namespace Bakugan {
         const char* looks[] = { "Silhouette", "Depth", "Shaded" };
         int look = (int)p.semanticLook;
         if (ImGui::Combo("Drawn as", &look, looks, 3)) p.semanticLook = (SemanticLook)look;
-        ImGui::SetItemTooltip("How the design, the mesh and the sphere are drawn for DINOv3, all alike:\n"
+        ImGui::SetItemTooltip("How the design and the mesh are drawn for DINOv3, both alike:\n"
                               "Silhouette: white on black. Depth: nearer is brighter.\n"
                               "Shaded: a grey material under a key light and a fill light, on dark grey.");
         int mode = p.patchWeight <= 0.0f ? 0 : (p.patchWeight >= 1.0f ? 1 : 2);
@@ -162,13 +158,9 @@ namespace Bakugan {
     void App::GenerateStart() {
         AutoParams& p = m_AutoParams;
         ImGui::SeparatorText("Start from");
-        if (ImGui::RadioButton("Two hinged boxes", !p.fromCurrent)) p.fromCurrent = false;
-        ImGui::SetItemTooltip("The mesh's box halved along its longest side: a box in each half, a body each, hinged to fold");
-        ImGui::SameLine();
-        ImGui::BeginDisabled(m_Design.shapes.empty());
-        if (ImGui::RadioButton("The current design", p.fromCurrent)) p.fromCurrent = true;
-        ImGui::SetItemTooltip("Refine what is in the editor");
-        ImGui::EndDisabled();
+        ImGui::DragFloat("Sphere size", &p.sphereDiameter, 0.5f, 0.0f, 500.0f, p.sphereDiameter > 0.0f ? "%.1f mm across" : "auto");
+        ImGui::SetItemTooltip("The sphere that's carved, at the mesh's centre of volume. Auto: the mesh's volume (the open\n"
+                              "design then has the mesh's volume too: pieces only move).");
     }
 
     void App::GenerateOptimizer() {
@@ -190,7 +182,10 @@ namespace Bakugan {
         ImGui::SetItemTooltip("How much better (a share of the loss) a rewrite that adds something must do than leaving the design\n"
                               "alone to be kept (ones that only win by noise are clutter), and how much worse one that removes\n"
                               "something may do (a simpler design that does about as well is better)");
-        ImGui::SliderInt("Max bodies", &p.maxBodies, 2, 16);
+        ImGui::SliderInt("Max pieces", &p.maxPieces, 2, 512);
+        ImGui::SetItemTooltip("Adding a cut makes one more piece: no more than this");
+        ImGui::SliderInt("Max hollows", &p.maxHollows, 0, 512);
+        ImGui::SetItemTooltip("Hollows: material taken out of the sphere (from every piece) without making a piece");
         int seed = (int)p.seed;
         ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
         if (ImGui::InputInt("Seed", &seed)) p.seed = (unsigned)std::max(seed, 0);
@@ -234,16 +229,16 @@ namespace Bakugan {
         ImGui::SetItemTooltip("Put the best design so far in the editor while the search runs");
         ImGui::SameLine();
         ImGui::Checkbox("Show sphere", &m_ShowAutoSphere);
-        ImGui::SetItemTooltip("The sphere the closed design is scored against, in the output view");
+        ImGui::SetItemTooltip("The sphere that's carved, in the output view (the design closes into it)");
         if (!m_AutoJob.Busy()) {
             ImGui::BeginDisabled(!m_HasReference || m_SuiteJob.Busy());
             if (ImGui::Button("Generate", ImVec2(HalfWidth(), 30))) StartAuto(false);
-            ImGui::SetItemTooltip(m_AutoParams.fromCurrent ? "Refine the current design (Ctrl+Z brings it back)"
-                                                           : "Replace the design with a generated one (Ctrl+Z brings it back)");
+            ImGui::SetItemTooltip("Replace the design with a carved sphere (Ctrl+Z brings it back)");
             ImGui::SameLine();
             ImGui::BeginDisabled(m_Design.shapes.empty());
             if (ImGui::Button("Score this design", ImVec2(-FLT_MIN, 30))) StartAuto(true);
-            ImGui::SetItemTooltip("Measure the current design with the same score, without changing it");
+            ImGui::SetItemTooltip("Measure the current design with the same score (its open pose against the mesh where it is),\n"
+                                  "without changing it");
             ImGui::EndDisabled();
             ImGui::EndDisabled();
             return;
@@ -277,9 +272,9 @@ namespace Bakugan {
             ImGui::TableSetupColumn("covered");
             ImGui::TableSetupColumn("extra");
             ImGui::TableHeadersRow();
-            const char* rows[] = { "Open vs mesh", "Closed vs sphere" };
-            float values[2][2] = { { s.viewCover, s.viewExtra }, { s.sphereViewCover, s.sphereViewExtra } };
-            for (int r = 0; r < 2; r++) {
+            const char* rows[] = { "Open vs mesh" };
+            float values[1][2] = { { s.viewCover, s.viewExtra } };
+            for (int r = 0; r < 1; r++) {
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted(rows[r]);
@@ -297,33 +292,35 @@ namespace Bakugan {
         if (m_HasAutoViews) {
             float w = ImGui::GetContentRegionAvail().x;
             rlImGuiImageSize(&m_AutoViews, (int)w, (int)(m_AutoViews.height * w / m_AutoViews.width));
-            ImGui::SetItemTooltip("Each view: open design vs the mesh (top), closed design vs the sphere (bottom).\n"
-                                  "Dark: both cover the pixel. Red: only the target (missing). Blue: only the design (extra).");
+            ImGui::SetItemTooltip("Each view: the open design against the mesh where it's placed.\n"
+                                  "Dark: both cover the pixel. Red: only the mesh (missing). Blue: only the design (extra).");
         }
         if (m_HasAutoSemantic) {
-            ImGui::TextDisabled("DINOv3: %.3f open, %.3f closed, worst view %.3f", s.semanticOpen, s.semanticClosed, s.worstSemantic);
-            ImGui::SetItemTooltip("Means over the views of DINOv3's loss against the targets (0: the same; 1 - cosine of the embeddings)");
+            ImGui::TextDisabled("DINOv3: %.3f, worst view %.3f", s.semantic, s.worstSemantic);
+            ImGui::SetItemTooltip("The mean over the views of DINOv3's loss against the placed mesh (0: the same; 1 - cosine of the embeddings)");
             float w = ImGui::GetContentRegionAvail().x;
             rlImGuiImageSize(&m_AutoSemantic, (int)w, (int)(m_AutoSemantic.height * w / m_AutoSemantic.width));
-            ImGui::SetItemTooltip("What DINOv3 compares, per view: the mesh, the open design, the sphere, the closed design");
+            ImGui::SetItemTooltip("What DINOv3 compares, per view: the placed mesh (top), the open design (bottom)");
         }
-        ImVec4 clashColor = s.clashOpen + s.clashClosed + s.clashMotion > 0.005f ? Amber : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
-        ImGui::TextColored(clashColor, "Overlapping: %.1f%% open, %.1f%% closed, %.1f%% worst between", s.clashOpen * 100.0f, s.clashClosed * 100.0f,
-                           s.clashMotion * 100.0f);
-        ImGui::SetItemTooltip("Volume inside two bodies at once, as a share of the sphere's. Worst between: at %.0f%% of the\n"
-                              "closing motion.", s.clashMotionT * 100.0f);
+        ImVec4 clashColor = s.clashOpen + s.clashMotion > 0.005f ? Amber : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+        ImGui::TextColored(clashColor, "Overlapping: %.1f%% open, %.1f%% worst between", s.clashOpen * 100.0f, s.clashMotion * 100.0f);
+        ImGui::SetItemTooltip("Volume inside two pieces at once, as a share of the sphere's. Worst between: at %.0f%% of the\n"
+                              "closing motion. (Closed, carved pieces never overlap.)", s.clashMotionT * 100.0f);
         GenerateTimeline();
         ImVec4 pivotColor = s.hingeGap > 0.02f * Vector3Distance(ReferenceBounds().min, ReferenceBounds().max) ? Amber
                                                                                                              : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
-        ImGui::TextColored(pivotColor, "Farthest pivot %.1f mm outside one of its bodies", fmaxf(s.hingeGap, 0.0f));
-        ImGui::TextDisabled("loss %.3f (fit %.3f, sphere %.3f, coverage %.3f, semantic %.3f, collisions %.3f, hinges %.3f)", s.total, s.fit,
-                            s.sphere, s.coveragePenalty, s.semantic, s.collision, s.hinges);
-        ImGui::SetItemTooltip("Lower is better: silhouettes * ((1 - goal) * fit + goal * sphere + coverage penalty)\n"
-                              "+ semantic * its weight + collisions * their weight + hinges * their weight.\n"
-                              "Fit and sphere: the mean over the views of the share of the target missed plus the share of\n"
-                              "extra pixels. Collisions: overlap depth over its volume, against the sphere's volume.\n"
-                              "Hinges: how far pivots are outside their bodies (beyond 1%% of the mesh's size), over its size.");
-        ImGui::TextDisabled("sphere %.1f mm across", s.radius * 2.0f);
+        ImGui::TextColored(pivotColor, "Farthest pivot %.1f mm outside one of its pieces", fmaxf(s.hingeGap, 0.0f));
+        ImGui::TextColored(s.surfaceCarved > 0.02f ? Amber : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled), "Sphere surface carved: %.1f%%",
+                           s.surfaceCarved * 100.0f);
+        ImGui::SetItemTooltip("The share of the sphere's surface hollows reach (closed, it shows there)");
+        ImGui::TextDisabled("loss %.3f (fit %.3f, coverage %.3f, semantic %.3f, collisions %.3f, hinges %.3f, surface %.3f)", s.total, s.fit,
+                            s.coveragePenalty, s.semantic, s.collision, s.hinges, s.surface);
+        ImGui::SetItemTooltip("Lower is better: silhouettes * (fit + coverage penalty) + semantic * its weight\n"
+                              "+ collisions * their weight + hinges * their weight + surface * its weight.\n"
+                              "Fit: the mean over the views of the share of the mesh missed plus the share of extra pixels.\n"
+                              "Collisions: overlap depth over its volume, against the sphere's volume.\n"
+                              "Hinges: how far pivots are outside their pieces (beyond 1%% of the mesh's size), over its size.");
+        ImGui::TextDisabled("sphere %.1f mm across; mesh moved %.1f mm, scaled %.2fx", s.radius * 2.0f, Vector3Length(s.target.offset), s.target.scale);
         if (m_AutoHistory.size() > 1) {
             auto [lo, hi] = std::minmax_element(m_AutoHistory.begin(), m_AutoHistory.end());
             ImGui::PlotLines("##history", m_AutoHistory.data(), (int)m_AutoHistory.size(), 0, "loss", *lo - 0.01f, fminf(*hi, *lo + 2.0f) + 0.01f,

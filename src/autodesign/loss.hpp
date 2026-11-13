@@ -1,31 +1,38 @@
 #pragma once
-// The loss, and its gradient. Two parts:
+// The loss of a carving (carving.hpp), and its gradient. The closed pose is the sphere whatever the parameters, so only
+// the open pose (and the motion between) is scored:
 //
-// Silhouettes. From each of several directions, the open pose's silhouette is compared with the mesh's and the closed
-// pose's with a disc the size of the sphere. The sphere's centre is free (the optimizer moves it, see Evaluate): the
-// closed design can be a sphere anywhere, as long as it is one. Per view, with T the target's pixel coverage and D the design's:
+// Silhouettes. From each of several directions, the open pose's silhouette is compared with the mesh's, the mesh placed
+// by a Placement (an offset and a scale about its centre of volume, which Adam moves too). Per view, with T the
+// target's pixel coverage and D the design's:
 //   covered = sum(min(T, D)) / sum(T)        extra = sum(max(0, D - T)) / sum(T)
 //   loss    = (1 - covered) + extra,         plus 10 per whole share a view is covered less than minViewCoverage
-// fit and sphere are the means over the views; the total weighs them by the goal (sphereBias).
-//
-// Collisions. Bodies overlapping each other in the open pose, the closed pose, and motionChecks poses between, placed
-// where hinges are moving (CheckTimes). Per pose: the depth of the overlap integrated over its volume, relative to
-// the sphere's volume times 2% of the mesh's size; the total adds open + closed + the mean of the poses between.
-//
-// Hinges. A hinge's pivot should be on (or in) both bodies it joins: how far it is outside each, beyond 1% of the
-// mesh's size, adds up over the hinges, relative to the mesh's size.
+// fit is the mean over the views.
 //
 // Semantics (when semanticWeight > 0; semantic.cpp). The same views, drawn as pictures (silhouette, depth, or shaded
-// grey: SemanticLook) at the size the DINOv3 model was exported for, each compared with the mesh's (open) or the
-// sphere's (closed) picture by DINOv3's embeddings (global, patch, or a mix). DINOv3 gives d loss / d pixel; a pixel
-// depends on the design through its soft edges (as silhouettes do) and through the shade of the surface its ray hits.
+// grey: SemanticLook) at the size the DINOv3 model was exported for, each compared with the placed mesh's picture by
+// DINOv3's embeddings (global, patch, or a mix). DINOv3 gives d loss / d pixel; a pixel depends on the design through
+// its soft edges (as silhouettes do) and through the shade of the surface its ray hits.
 //
-// The first two parts depend on the design only through the bodies' distances at a set of points: the silhouettes' at the
-// points where edge pixels' rays come closest to the body, the collisions' at the points sampled inside overlaps.
-// So the gradient is the loss's slope against each such distance (known from the loss), times how the distance
-// there changes with each parameter (see Gradient in the .cpp).
+// Collisions. Pieces overlapping each other in the open pose and motionChecks poses between, placed where joints are
+// moving (CheckTimes). Per pose: the depth of the overlap integrated over its volume, relative to the sphere's volume
+// times 2% of the mesh's size; the total adds the open pose's and the mean of the poses between. (Closed, the pieces
+// fill the sphere side by side: nothing to check.)
+//
+// Hinges. A joint's pivot should be on (or in) both pieces it joins: how far it is outside each, beyond 1% of the
+// mesh's size, adds up over the joints, relative to the mesh's size.
+//
+// Surface. Hollows should take material from inside the sphere, not its surface: over a thousand points just under the
+// surface, the mean of d / (d + 1% of the mesh's size), d how deep the point is inside a hollow. About the share of the
+// surface carved away, going up smoothly as hollows reach it.
+//
+// The silhouettes and collisions depend on the carving only through the pieces' distances at a set of points: the
+// silhouettes' at the points where edge pixels' rays come closest to a piece, the collisions' at the points sampled
+// inside overlaps. So the gradient is the loss's slope against each such distance (known from the loss), times how the
+// distance there changes with each parameter (see Gradient in the .cpp). The placement only moves the targets: its
+// slope comes from the targets drawn again with it nudged.
 #include "autodesign.hpp"
-#include "params.hpp"
+#include "carving.hpp"
 #include "data/field.hpp"
 #include <cmath>
 #include <memory>
@@ -49,47 +56,43 @@ namespace Bakugan {
         bool Semantic() const { return m_Dino != nullptr; }
         std::string SemanticDevice() const;              // where DINOv3 runs ("CPU", "CUDA", or why not CUDA)
 
-        // The loss of a design against the sphere centred at `sphere`. With grad: also d loss / d parameter for each of
-        // ps, per unit of the parameter; with sphereGrad, d loss / d the sphere's centre, per SphereUnit().
-        AutoScore Evaluate(const Design& d, Vector3 sphere, const std::vector<Param>& ps, std::vector<float>* grad,
-                           Vector3* sphereGrad = nullptr);
+        // The sphere a carving starts as: at the mesh's centre of volume, with its volume (or sphereDiameter).
+        Vector3 SphereCentre() const { return m_SphereCentre; }
+        float SphereRadius() const { return m_SphereRadius; }
 
-        // The sphere: where it starts (the mesh's centre of volume), how far it may go (it stays inside the frame the
-        // views show, or its silhouettes would be cut off), and the size of a typical step of its centre.
-        Vector3 SphereStart() const { return m_SphereStart; }
-        std::vector<Vector3> ViewDirections() const;     // the way each view looks
-        Vector3 KeepSphereInFrame(Vector3 c) const;
-        float SphereUnit() const { return 0.005f * m_L; }
-        // The best place for the sphere around a design that stays as it is (Adam on its centre alone; for scoring a
-        // finished design, whose sphere wasn't optimized with it).
-        Vector3 FitSphere(const Design& d);
+        // The loss of a carving, against the mesh placed by `target`. With grad: also d loss / d each of ps (the
+        // carving's and the target's parameters), per unit of the parameter.
+        AutoScore Evaluate(const Carving& c, const Placement& target, const std::vector<Param>& ps = {}, std::vector<float>* grad = nullptr);
+        // Any design's (no gradient): its open pose against the mesh, its motion, its hinges.
+        AutoScore Evaluate(const Design& d, const Placement& target);
+        // The placement kept where the views see all of the mesh, and its scale within 0.3x .. 3.3x.
+        Placement KeepTargetInFrame(Placement t) const;
 
-        // The silhouettes scored last against their targets, as an RGBA picture (open pose above, closed below).
+        // Where the last carving scored showed outside the placed mesh: a piece (index) and the point of it there, in
+        // the closed pose's frame, and the view's direction there (in that frame too). For aiming new hollows.
+        struct Spot {
+            int piece;
+            Vector3 at, dir;
+        };
+        const std::vector<Spot>& ExtraSpots() const { return m_Extra; }
+
+        // The silhouettes scored last against their targets, as an RGBA picture.
         void Picture(std::vector<unsigned char>* rgba, int* w, int* h) const;
-        // The semantic loss's last views: rows of the mesh's, the open design's, the sphere's, the closed design's.
+        // The semantic loss's last views: a row of the placed mesh's, a row of the open design's.
         void SemanticPicture(std::vector<unsigned char>* rgba, int* w, int* h) const;
 
         float L() const { return m_L; }
-        const std::vector<Vector3>& Surface() const { return m_Surface; }   // points on the mesh
-
-        // Where the last evaluated design was wrong, for the grammar to aim at: a body (group index), a point in its
-        // design pose frame, and (Extra) the direction its view looked along, in that frame.
-        struct Spot {
-            int group;
-            Vector3 at, dir;
-        };
-        const std::vector<Spot>& ExtraSpots() const { return m_Extra; }        // open pose: design pixels where the mesh has none
-        const std::vector<Spot>& OverlapSpots() const { return m_Overlaps; }   // inside two bodies, in any checked pose
+        std::vector<Vector3> ViewDirections() const;     // the way each view looks
     private:
         struct View {
             Vector3 dir, u, v;           // looking along dir; u right and v up in the picture
         };
-        // A design's bodies in every pose it is scored in.
+        // A design's bodies (a carving's pieces) in every pose it is scored in.
         struct Bodies {
             std::vector<BodyField> fields;
             std::vector<int> group;              // each field's body (group index)
             std::vector<BoundingBox> box;        // design pose
-            std::vector<float> times;            // the poses: 0 (open), 1 (closed), then the checks between
+            std::vector<float> times;            // the poses: 0 (open), then the checks between
             std::vector<std::vector<Rigid>> xf;  // per pose, per group index
             std::vector<int> fieldOf;            // per group index: its field (-1: none)
         };
@@ -110,12 +113,15 @@ namespace Bakugan {
         };
         using Shades = std::vector<std::vector<Shade>>;   // per field
 
+        AutoScore Score(const Design& d, Bodies& b, const Placement& target, Slopes* slopes, Shades* shades);
         void Silhouettes(const Bodies& b, AutoScore& s, Slopes& slopes);
+        float FitLoss(const std::vector<std::vector<float>>& target) const;   // the silhouettes' part, against these targets
         void Collisions(const Bodies& b, AutoScore& s, Slopes& slopes);
         void Hinges(const Design& d, const Bodies& b, AutoScore& s) const;
         float PivotGap(const BodyField& f, Vector3 pivot) const { return fmaxf(0.0f, f.Distance(pivot) - 0.01f * m_L); }
-        void Gradient(const Design& d, const Bodies& b, const Slopes& slopes, const Shades& shades, const std::vector<Param>& ps,
-                      std::vector<float>& grad) const;
+        float SurfaceTerm(const Carving& c, float* carved = nullptr) const;
+        void Gradient(const Carving& c, const Placement& target, const std::vector<int>& bodyOf, const Bodies& b, const Slopes& slopes,
+                      const Shades& shades, const std::vector<Param>& ps, std::vector<float>& grad);
         // A ray through the frame at (sx, sy) (from its centre, in mm) against one body (moved by xf), sphere traced
         // through its field inside its box; tau: the pixel size. Returns the nearest it gets (negative: how deep), and
         // where (world); with hit, also where it first enters the body (world; only when it does: the return is < 0).
@@ -123,17 +129,19 @@ namespace Bakugan {
                     Vector3* at, Vector3* hit = nullptr) const;
         float FrameX(int x, int res) const { return ((x + 0.5f) / res * 2.0f - 1.0f) * m_Half; }
         float FrameY(int y, int res) const { return (1.0f - (y + 0.5f) / res * 2.0f) * m_Half; }
+        // The placed mesh's silhouettes (res = m_Res), from a fine drawing of the mesh where it is (bilinear, 2x2 a pixel).
+        std::vector<std::vector<float>> TargetSilhouettes(const Placement& t) const;
+        // A point of the frame (sx, sy) of view w, where it was before the mesh was placed by t.
+        Vector2 Unplace(const View& w, float sx, float sy, const Placement& t) const;
         // semantic.cpp
         void SetUpSemantic(const TriMesh& mesh);
         void Semantics(const Bodies& b, AutoScore& s, Slopes& slopes, Shades& shades);
+        std::vector<std::vector<float>> SemanticTargets(const Placement& t) const;
         float Look(const View& w, Vector3 p, Vector3 n) const;     // a surface point's shade (world point, normal)
+        float DepthLook(float depth) const;                         // the depth look at a depth along the view (from the frame's centre)
         float Background() const;
         Vector3 Normal(const BodyField& f, Vector3 local) const;    // the field's (local) normal
         float ShadeAt(const BodyField& f, const Rigid& xf, const Shade& sh) const;
-        void SphereLook(const View& w, Vector3 centre, float* out) const;
-        Vector2 ToPixel(const View& w, Vector3 p) const;
-        float Disc(const View& w, int x, int y, Vector3 centre) const;     // the sphere's silhouette
-        float ClosedLoss(Vector3 centre) const;          // the closed pose's part of the loss, from the last silhouettes
     private:
         AutoParams m_P;
         float m_L = 1.0f;
@@ -142,21 +150,27 @@ namespace Bakugan {
         int m_Res = 64;
         float m_Tau = 1.0f;              // a pixel, in mm: how soft silhouettes are
         std::vector<View> m_Views;
-        std::vector<std::vector<float>> m_Mesh;     // the mesh's silhouette per view
-        Vector3 m_SphereStart = { 0, 0, 0 };
-        Vector3 m_SphereCentre = { 0, 0, 0 };             // of the design scored last
+        Vector3 m_MeshCentre = { 0, 0, 0 };          // its centre of volume: placements scale about it
+        float m_MeshReach = 1.0f;                     // the farthest the mesh gets from it
+        int m_Fine = 256;                             // the fine drawing's size
+        std::vector<std::vector<float>> m_MeshFine;  // the mesh where it is, per view: covered (0/1) at m_Fine
+        Placement m_Placed;                           // the placement the targets are drawn for
+        std::vector<std::vector<float>> m_Target;    // the placed mesh's silhouette per view
+        Vector3 m_SphereCentre = { 0, 0, 0 };
         float m_SphereRadius = 0.0f;
-        std::vector<Vector3> m_Surface;
         std::vector<Vector3> m_PairUnit;  // fixed points in [0, 1]^3, mapped into where two bodies' boxes meet
-        std::vector<float> m_Cover[2];    // the last silhouettes (open, closed): views × pixels
-        std::vector<Spot> m_Extra, m_Overlaps;
+        std::vector<Vector3> m_SurfaceDirs;   // points spread evenly over the sphere (unit directions), for its surface
+        std::vector<Spot> m_Extra;
+        std::vector<float> m_Cover;       // the last silhouettes (open): views × pixels
         // the semantic loss
         std::string m_Error;
         std::unique_ptr<Dino> m_Dino;
         int m_SemRes = 0;                 // its views' size (the model's)
         float m_SemTau = 1.0f;            // its pixel, in mm
-        std::vector<std::vector<float>> m_MeshLook;   // the mesh's picture per view
-        std::vector<float> m_SemDrawn[2], m_SemTarget[2];   // the last pictures (open, closed): views × pixels
-        Vector3 m_SemSphereGrad = { 0, 0, 0 };        // its d loss / d the sphere's centre (per mm), from the last evaluation
+        int m_SemFine = 0;                // the mesh's fine drawing for it: m_SemFine across
+        std::vector<std::vector<float>> m_SemHit, m_SemDepth, m_SemShade;   // per view: covered, × depth from its centre, × shade
+        std::vector<std::vector<float>> m_SemTarget;  // the placed mesh's picture per view (for m_Placed)
+        std::vector<float> m_SemDrawn;    // the last pictures (open): views × pixels
+        std::vector<float> m_SemGradTarget;  // and the loss's slope against each target pixel
     };
 }

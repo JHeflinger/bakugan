@@ -1,7 +1,6 @@
 #include "loss.hpp"
 #include "dino.hpp"
 #include "util/box.hpp"
-#include "adam.hpp"
 #include "data/field.hpp"
 #include <raymath.h>
 #include <algorithm>
@@ -11,6 +10,7 @@
 #include <cstring>
 #include <functional>
 #include <random>
+#include <string>
 #include <thread>
 
 namespace Bakugan {
@@ -43,14 +43,14 @@ namespace Bakugan {
         }
     }
 
-    // ---- setting up: views, the mesh's silhouettes, the sphere --------------------------------------------------------
+    // ---- setting up: the frame and views, the mesh, the sphere ----------------------------------------------------------
 
     Loss::Loss(const TriMesh& mesh, const AutoParams& p) : m_P(p) {
         Vector3 lo = { FLT_MAX, FLT_MAX, FLT_MAX }, hi = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
         for (unsigned i : mesh.indices) { lo = Vector3Min(lo, mesh.positions[i]); hi = Vector3Max(hi, mesh.positions[i]); }
         m_L = fmaxf(Vector3Distance(lo, hi), 1e-3f);
         m_Centre = Vector3Scale(Vector3Add(lo, hi), 0.5f);
-        m_Half = 0.6f * m_L;                     // the mesh, and anything near it, stays in the frame
+        m_Half = 0.7f * m_L;                     // the mesh, and room to move and grow it a little, stays in the frame
         m_Res = std::clamp(p.viewResolution, 16, 256);
         m_Tau = 2.0f * m_Half / m_Res;           // one pixel: silhouettes fade over two pixels, for smoother gradients
 
@@ -66,20 +66,7 @@ namespace Bakugan {
             m_Views.push_back(w);
         }
 
-        // the mesh's silhouette in each view: triangles filled at 4x4 samples a pixel
-        const int ss = 4, big = m_Res * ss;
-        m_Mesh.assign(n, std::vector<float>((size_t)m_Res * m_Res, 0.0f));
-        ParallelFor(n, [&](int v) {
-            std::vector<unsigned char> hit((size_t)big * big, 0);
-            std::vector<Vector2> pts(mesh.positions.size());
-            for (size_t i = 0; i < pts.size(); i++) pts[i] = Vector2Scale(ToPixel(m_Views[v], mesh.positions[i]), (float)ss);
-            for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) FillTriangle(pts[mesh.indices[t]], pts[mesh.indices[t + 1]], pts[mesh.indices[t + 2]], big, hit);
-            for (int y = 0; y < big; y++)
-                for (int x = 0; x < big; x++)
-                    if (hit[(size_t)y * big + x]) m_Mesh[v][(size_t)(y / ss) * m_Res + x / ss] += 1.0f / (ss * ss);
-        });
-
-        // the sphere: at the mesh's centre of volume, with its volume (signed tetrahedra from the box's centre)
+        // the mesh's centre of volume and volume (signed tetrahedra from the box's centre): the sphere's
         double volume = 0.0;
         Vector3 moment = { 0, 0, 0 };
         for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
@@ -90,42 +77,94 @@ namespace Bakugan {
             moment = Vector3Add(moment, Vector3Scale(Vector3Add(a, Vector3Add(b, c)), (float)(v / 4.0)));
         }
         bool closed = fabs(volume) > 1e-9 * m_L * m_L * m_L;
-        m_SphereStart = closed ? Vector3Add(m_Centre, Vector3Scale(moment, (float)(1.0 / volume))) : m_Centre;
-        m_SphereCentre = m_SphereStart;
+        m_MeshCentre = closed ? Vector3Add(m_Centre, Vector3Scale(moment, (float)(1.0 / volume))) : m_Centre;
+        m_SphereCentre = m_MeshCentre;
         m_SphereRadius = p.sphereDiameter > 0.0f ? 0.5f * p.sphereDiameter : (closed ? (float)cbrt(3.0 * fabs(volume) / (4.0 * PI)) : 0.25f * m_L);
+        m_MeshReach = 0.0f;
+        for (unsigned i : mesh.indices) m_MeshReach = fmaxf(m_MeshReach, Vector3Distance(mesh.positions[i], m_MeshCentre));
 
-        // points on the surface (area weighted), where the grammar puts new shapes; and the collisions' sample points
+        // the mesh's silhouette in each view, finely (4 samples a pixel across), where it is: placements resample it
+        m_Fine = m_Res * 4;
+        m_MeshFine.assign(n, std::vector<float>((size_t)m_Fine * m_Fine, 0.0f));
+        ParallelFor(n, [&](int v) {
+            std::vector<unsigned char> hit((size_t)m_Fine * m_Fine, 0);
+            std::vector<Vector2> pts(mesh.positions.size());
+            const View& w = m_Views[v];
+            for (size_t i = 0; i < pts.size(); i++) {
+                Vector3 q = Vector3Subtract(mesh.positions[i], m_Centre);
+                pts[i] = { (Vector3DotProduct(q, w.u) / m_Half + 1.0f) * 0.5f * m_Fine, (1.0f - Vector3DotProduct(q, w.v) / m_Half) * 0.5f * m_Fine };
+            }
+            for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) FillTriangle(pts[mesh.indices[t]], pts[mesh.indices[t + 1]], pts[mesh.indices[t + 2]], m_Fine, hit);
+            for (size_t k = 0; k < hit.size(); k++) m_MeshFine[v][k] = hit[k];
+        });
+
+        // the collisions' sample points
         std::mt19937 rng(p.seed * 31u + 7u);
-        std::vector<double> cdf;
-        double area = 0.0;
-        for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
-            Vector3 a = mesh.positions[mesh.indices[t]], b = mesh.positions[mesh.indices[t + 1]], c = mesh.positions[mesh.indices[t + 2]];
-            area += 0.5 * Vector3Length(Vector3CrossProduct(Vector3Subtract(b, a), Vector3Subtract(c, a)));
-            cdf.push_back(area);
-        }
         std::uniform_real_distribution<float> u01(0.0f, 1.0f);
-        for (int i = 0; i < 2000 && area > 0.0; i++) {
-            size_t t = std::min((size_t)(std::lower_bound(cdf.begin(), cdf.end(), u01(rng) * area) - cdf.begin()), cdf.size() - 1);
-            float u = u01(rng), v = u01(rng);
-            if (u + v > 1.0f) { u = 1.0f - u; v = 1.0f - v; }
-            Vector3 a = mesh.positions[mesh.indices[t * 3]], b = mesh.positions[mesh.indices[t * 3 + 1]], c = mesh.positions[mesh.indices[t * 3 + 2]];
-            m_Surface.push_back(Vector3Add(a, Vector3Add(Vector3Scale(Vector3Subtract(b, a), u), Vector3Scale(Vector3Subtract(c, a), v))));
-        }
         for (int i = 0; i < 128; i++) m_PairUnit.push_back({ u01(rng), u01(rng), u01(rng) });
+        for (int i = 0; i < 1024; i++) {                 // a Fibonacci sphere
+            float y = 1.0f - (i + 0.5f) / 512.0f, r = sqrtf(fmaxf(0.0f, 1.0f - y * y)), phi = i * 2.39996323f;
+            m_SurfaceDirs.push_back({ r * cosf(phi), y, r * sinf(phi) });
+        }
         if (p.semanticWeight > 0.0f) SetUpSemantic(mesh);
+        m_Target = TargetSilhouettes(m_Placed);
+        if (m_Dino) m_SemTarget = SemanticTargets(m_Placed);
     }
 
     Loss::~Loss() = default;
 
-    Vector2 Loss::ToPixel(const View& w, Vector3 p) const {
-        Vector3 q = Vector3Subtract(p, m_Centre);
-        return { (Vector3DotProduct(q, w.u) / m_Half + 1.0f) * 0.5f * m_Res, (1.0f - Vector3DotProduct(q, w.v) / m_Half) * 0.5f * m_Res };
+    std::vector<Vector3> Loss::ViewDirections() const {
+        std::vector<Vector3> out;
+        for (const View& w : m_Views) out.push_back(w.dir);
+        return out;
     }
 
-    float Loss::Disc(const View& w, int x, int y, Vector3 centre) const {
-        Vector2 c = ToPixel(w, centre);
-        float dx = x + 0.5f - c.x, dy = y + 0.5f - c.y;
-        return std::clamp(m_SphereRadius / (2.0f * m_Half / m_Res) - sqrtf(dx * dx + dy * dy) + 0.5f, 0.0f, 1.0f);
+    // ---- the placed mesh --------------------------------------------------------------------------------------------------
+
+    Vector2 Loss::Unplace(const View& w, float sx, float sy, const Placement& t) const {
+        Vector3 at = Vector3Add(m_Centre, Vector3Add(Vector3Scale(w.u, sx), Vector3Scale(w.v, sy)));
+        Vector3 q = Vector3Add(m_MeshCentre, Vector3Scale(Vector3Subtract(Vector3Subtract(at, m_MeshCentre), t.offset), 1.0f / fmaxf(t.scale, 1e-6f)));
+        Vector3 r = Vector3Subtract(q, m_Centre);
+        return { Vector3DotProduct(r, w.u), Vector3DotProduct(r, w.v) };
+    }
+
+    namespace {
+        // A fine map (n x n) at a point given in its pixels (centres at +0.5), bilinear, nothing outside it.
+        float Bilinear(const std::vector<float>& m, int n, float fx, float fy) {
+            fx -= 0.5f;
+            fy -= 0.5f;
+            int x0 = (int)floorf(fx), y0 = (int)floorf(fy);
+            float ax = fx - x0, ay = fy - y0;
+            auto at = [&](int x, int y) { return x < 0 || y < 0 || x >= n || y >= n ? 0.0f : m[(size_t)y * n + x]; };
+            return (1 - ay) * ((1 - ax) * at(x0, y0) + ax * at(x0 + 1, y0)) + ay * ((1 - ax) * at(x0, y0 + 1) + ax * at(x0 + 1, y0 + 1));
+        }
+    }
+
+    std::vector<std::vector<float>> Loss::TargetSilhouettes(const Placement& t) const {
+        const int nv = (int)m_Views.size();
+        std::vector<std::vector<float>> out(nv, std::vector<float>((size_t)m_Res * m_Res, 0.0f));
+        for (int v = 0; v < nv; v++)
+            for (int y = 0; y < m_Res; y++)
+                for (int x = 0; x < m_Res; x++) {
+                    float sum = 0.0f;
+                    for (int k = 0; k < 4; k++) {                // 2 x 2 samples a pixel
+                        float sx = ((x + 0.25f + 0.5f * (k & 1)) / m_Res * 2.0f - 1.0f) * m_Half, sy = (1.0f - (y + 0.25f + 0.5f * (k >> 1)) / m_Res * 2.0f) * m_Half;
+                        Vector2 b = Unplace(m_Views[v], sx, sy, t);
+                        sum += Bilinear(m_MeshFine[v], m_Fine, (b.x / m_Half + 1.0f) * 0.5f * m_Fine, (1.0f - b.y / m_Half) * 0.5f * m_Fine);
+                    }
+                    out[v][(size_t)y * m_Res + x] = 0.25f * sum;
+                }
+        return out;
+    }
+
+    Placement Loss::KeepTargetInFrame(Placement t) const {
+        t.scale = std::clamp(t.scale, 0.3f, 3.3f);
+        float room = 0.98f * m_Half;                     // the mesh's reach around its centre, inside the frame
+        t.scale = fminf(t.scale, room / fmaxf(m_MeshReach, 1e-6f));
+        Vector3 at = Vector3Add(m_MeshCentre, t.offset), off = Vector3Subtract(at, m_Centre);
+        float l = Vector3Length(off), free = fmaxf(0.0f, room - t.scale * m_MeshReach);
+        if (l > free) t.offset = Vector3Subtract(Vector3Add(m_Centre, Vector3Scale(off, free / l)), m_MeshCentre);
+        return t;
     }
 
     // ---- drawing the design ---------------------------------------------------------------------------------------------
@@ -234,15 +273,50 @@ namespace Bakugan {
 
     // ---- the loss -------------------------------------------------------------------------------------------------------
 
-    AutoScore Loss::Evaluate(const Design& d, Vector3 sphere, const std::vector<Param>& ps, std::vector<float>* grad, Vector3* sphereGrad) {
-        AutoScore s;
-        m_SphereCentre = sphere;
-        s.centre = sphere;
-        if (sphereGrad) *sphereGrad = { 0, 0, 0 };
-        s.radius = m_SphereRadius;
+    AutoScore Loss::Evaluate(const Carving& c, const Placement& target, const std::vector<Param>& ps, std::vector<float>* grad) {
         if (grad) grad->assign(ps.size(), 0.0f);
+        std::vector<int> bodyOf;
+        Design d = c.Build(&bodyOf);
+        Bodies b;
+        for (size_t k = 0; k < c.pieces.size(); k++) {
+            b.fields.push_back(BodyField::Body(d, bodyOf[k]));
+            b.box.push_back(Grow(c.PieceBounds(c.pieces[k]), 0.002f * m_L));
+            b.group.push_back(d.GroupIndex(bodyOf[k]));
+        }
+        Slopes slopes(b.fields.size());
+        Shades shades(b.fields.size());
+        AutoScore s = Score(d, b, target, &slopes, &shades);
+        s.surface = SurfaceTerm(c, &s.surfaceCarved);
+        s.total += m_P.surfaceWeight * s.surface;
+        if (!grad || ps.empty() || !s.valid) return s;
+        Gradient(c, target, bodyOf, b, slopes, shades, ps, *grad);
 
-        // the bodies, in every pose
+        // the placement: the targets drawn again with it nudged two units either way, against the design as drawn
+        const float silhouette = std::max(0.0f, m_P.silhouetteWeight);
+        for (size_t j = 0; j < ps.size(); j++) {
+            if (ps[j].kind != Param::Target) continue;
+            double loss[2] = { 0.0, 0.0 };
+            float value[2];
+            for (int side = 0; side < 2; side++) {
+                Carving cc = c;
+                Placement t = target;
+                Set(cc, t, ps[j], Get(c, target, ps[j]) + (side == 0 ? 2.0f : -2.0f) * ps[j].unit, m_L);   // (2 units: the silhouettes wiggle finer)
+                value[side] = Get(cc, t, ps[j]);
+                if (silhouette > 0.0f) loss[side] += silhouette * FitLoss(TargetSilhouettes(t));
+                if (m_Dino && m_SemGradTarget.size() == m_SemDrawn.size()) {
+                    std::vector<std::vector<float>> pictures = SemanticTargets(t);
+                    const size_t px = (size_t)m_SemRes * m_SemRes;
+                    for (size_t v = 0; v < pictures.size(); v++)
+                        for (size_t k = 0; k < px; k++) loss[side] += m_SemGradTarget[v * px + k] * pictures[v][k];
+                }
+            }
+            float step = value[0] - value[1];
+            if (step > 0.0f) (*grad)[j] = (float)((loss[0] - loss[1]) / step) * ps[j].unit;
+        }
+        return s;
+    }
+
+    AutoScore Loss::Evaluate(const Design& d, const Placement& target) {
         Bodies b;
         for (int g : d.Bodies()) {
             BodyField f = BodyField::Body(d, d.groups[g].id);
@@ -251,13 +325,26 @@ namespace Bakugan {
             b.fields.push_back(std::move(f));
             b.group.push_back(g);
         }
-        m_Extra.clear();
-        m_Overlaps.clear();
+        return Score(d, b, target, nullptr, nullptr);
+    }
+
+    AutoScore Loss::Score(const Design& d, Bodies& b, const Placement& target, Slopes* slopesOut, Shades* shadesOut) {
+        AutoScore s;
+        s.target = target;
+        s.target.centre = m_MeshCentre;
+        s.centre = m_SphereCentre;
+        s.radius = m_SphereRadius;
+        if (target.offset.x != m_Placed.offset.x || target.offset.y != m_Placed.offset.y || target.offset.z != m_Placed.offset.z ||
+            target.scale != m_Placed.scale) {
+            m_Placed = target;
+            m_Target = TargetSilhouettes(target);
+            if (m_Dino) m_SemTarget = SemanticTargets(target);
+        }
         if (b.fields.empty()) return s;
         b.fieldOf.assign(d.groups.size(), -1);
         for (size_t i = 0; i < b.group.size(); i++) b.fieldOf[b.group[i]] = (int)i;
         s.checkTimes = m_P.collisionWeight > 0.0f ? CheckTimes(d, m_P.motionChecks, m_P.motionCheckBias) : std::vector<float>{};
-        b.times = { 0.0f, 1.0f };
+        b.times = { 0.0f };
         b.times.insert(b.times.end(), s.checkTimes.begin(), s.checkTimes.end());
         for (float t : b.times) b.xf.push_back(d.Transforms(t, true));
 
@@ -267,176 +354,131 @@ namespace Bakugan {
         if (m_Dino) Semantics(b, s, slopes, shades);
         if (m_P.collisionWeight > 0.0f) Collisions(b, s, slopes);
         Hinges(d, b, s);
-        const float silhouette = std::max(0.0f, m_P.silhouetteWeight);
-        s.total = silhouette * ((1.0f - std::clamp(m_P.sphereBias, 0.0f, 1.0f)) * s.fit + std::clamp(m_P.sphereBias, 0.0f, 1.0f) * s.sphere +
-                                s.coveragePenalty) +
-                  (m_Dino ? m_P.semanticWeight * s.semantic : 0.0f) + m_P.collisionWeight * s.collision + m_P.hingeWeight * s.hinges;
+        s.total = std::max(0.0f, m_P.silhouetteWeight) * (s.fit + s.coveragePenalty) + (m_Dino ? m_P.semanticWeight * s.semantic : 0.0f) +
+                  m_P.collisionWeight * s.collision + m_P.hingeWeight * s.hinges;
         s.valid = true;
-        if (grad && !ps.empty()) Gradient(d, b, slopes, shades, ps, *grad);
-        // the sphere's centre only moves the closed pose's target: its slope comes from that part of the loss alone,
-        // measured again with the disc shifted a quarter pixel either way (the silhouettes stay as drawn); the
-        // semantic loss adds its own (from DINOv3's slope against the sphere's picture)
-        if (sphereGrad) {
-            const float h = 0.25f * 2.0f * m_Half / m_Res;
-            for (int a = 0; a < 3; a++) {
-                Vector3 e = { 0, 0, 0 };
-                (&e.x)[a] = h;
-                (&sphereGrad->x)[a] = silhouette * (ClosedLoss(Vector3Add(sphere, e)) - ClosedLoss(Vector3Subtract(sphere, e))) / (2.0f * h) * SphereUnit();
-            }
-            if (m_Dino) *sphereGrad = Vector3Add(*sphereGrad, Vector3Scale(m_SemSphereGrad, SphereUnit()));
-        }
+        if (slopesOut) *slopesOut = std::move(slopes);
+        if (shadesOut) *shadesOut = std::move(shades);
         return s;
     }
 
-    // The closed pose's share of the loss: the goal's weight on the mean sphere loss over the views, and the coverage
-    // penalty of its views (as in Silhouettes).
-    float Loss::ClosedLoss(Vector3 centre) const {
+    // ---- silhouettes ------------------------------------------------------------------------------------------------------
+
+    // The open pose drawn (each pixel keeps the piece covering it most, and where its ray came closest to it),
+    // compared with the placed mesh, and the slopes of the soft edge pixels:
+    //   d loss / d D: -1/sum(T) where the design covers less than the target, +1/sum(T) where it covers more, plus the
+    //   coverage penalty's share; and d D / d distance = -1 / (2 tau) on the edge (0 < D < 1).
+    void Loss::Silhouettes(const Bodies& b, AutoScore& s, Slopes& slopes) {
         const int nv = (int)m_Views.size(), px = m_Res * m_Res;
-        const float bias = std::clamp(m_P.sphereBias, 0.0f, 1.0f), minCover = std::clamp(m_P.minViewCoverage, 0.0f, 1.0f);
-        if (m_Cover[1].size() != (size_t)nv * px) return 0.0f;
-        double loss = 0.0;
+        std::vector<int> who((size_t)nv * px, -1);
+        std::vector<Vector3> at((size_t)nv * px, { 0, 0, 0 });
+        m_Cover.assign((size_t)nv * px, 0.0f);
+        ParallelFor(nv * m_Res, [&](int task) {               // every row of every view
+            int v = task / m_Res, y = task % m_Res;
+            for (int x = 0; x < m_Res; x++) {
+                size_t k = (size_t)v * px + (size_t)y * m_Res + x;
+                for (size_t i = 0; i < b.fields.size(); i++) {
+                    Vector3 p;
+                    float dmin = Trace(b.fields[i], b.box[i], b.xf[0][b.group[i]], m_Views[v], FrameX(x, m_Res), FrameY(y, m_Res), m_Tau, &p);
+                    float c = std::clamp(0.5f - dmin / (2.0f * m_Tau), 0.0f, 1.0f);
+                    if (c > m_Cover[k]) {
+                        m_Cover[k] = c;
+                        who[k] = (int)i;
+                        at[k] = p;
+                    }
+                }
+            }
+        });
+
+        const float minCover = std::clamp(m_P.minViewCoverage, 0.0f, 1.0f), silhouette = std::max(0.0f, m_P.silhouetteWeight);
+        const float weight = 1.0f / nv;
+        // where the design shows outside the mesh: a spread of such pixels, as points of their pieces, closed
+        m_Extra.clear();
+        {
+            std::vector<size_t> extra;
+            for (int v = 0; v < nv; v++)
+                for (int k = 0; k < px; k++) {
+                    size_t kk = (size_t)v * px + k;
+                    if (who[kk] >= 0 && m_Cover[kk] - m_Target[v][k] > 0.5f) extra.push_back(kk);
+                }
+            size_t stride = std::max<size_t>(1, extra.size() / 256);
+            for (size_t e = 0; e < extra.size(); e += stride) {
+                size_t kk = extra[e];
+                int i = who[kk];
+                const Rigid& xf = b.xf[0][b.group[i]];
+                Quaternion inv = { -xf.rotation.x, -xf.rotation.y, -xf.rotation.z, xf.rotation.w };
+                m_Extra.push_back({ i, xf.ApplyInverse(at[kk]), Vector3RotateByQuaternion(m_Views[kk / px].dir, inv) });
+            }
+        }
+        s.worstView = 1.0f;
+        double lossSum = 0.0, coverSum = 0.0, extraSum = 0.0;
         for (int v = 0; v < nv; v++) {
-            const float* D = m_Cover[1].data() + (size_t)v * px;
+            const float* D = m_Cover.data() + (size_t)v * px;
+            const std::vector<float>& T = m_Target[v];
             double tsum = 0.0, hit = 0.0, spill = 0.0;
             for (int k = 0; k < px; k++) {
-                float t = Disc(m_Views[v], k % m_Res, k / m_Res, centre);
+                tsum += T[k];
+                hit += fminf(T[k], D[k]);
+                spill += fmaxf(0.0f, D[k] - T[k]);
+            }
+            if (tsum <= 0.0) continue;
+            float cover = (float)(hit / tsum), extra = (float)(spill / tsum);
+            lossSum += (1.0f - cover) + extra;
+            coverSum += cover;
+            extraSum += extra;
+            bool shortOf = cover < minCover;
+            s.worstView = fminf(s.worstView, cover);
+            s.coveragePenalty += 10.0f * fmaxf(0.0f, minCover - cover);
+            if (silhouette <= 0.0f) continue;
+            for (int k = 0; k < px; k++) {
+                size_t kk = (size_t)v * px + k;
+                float c = D[k], t = T[k];
+                int i = who[kk];
+                if (i < 0 || c <= 0.0f || c >= 1.0f || c == t) continue;     // not on an edge, or no slope
+                float dD = c < t ? (float)((-weight - (shortOf ? 10.0f : 0.0f)) / tsum) : (float)(weight / tsum);
+                slopes[i].push_back({ 0, at[kk], silhouette * dD * (-1.0f / (2.0f * m_Tau)) });
+            }
+        }
+        s.fit = (float)(lossSum / nv);
+        s.viewCover = (float)(coverSum / nv);
+        s.viewExtra = (float)(extraSum / nv);
+    }
+
+    // The silhouettes' part of the loss (fit + coverage penalty) for the last drawing, against other targets.
+    float Loss::FitLoss(const std::vector<std::vector<float>>& target) const {
+        const int nv = (int)m_Views.size(), px = m_Res * m_Res;
+        const float minCover = std::clamp(m_P.minViewCoverage, 0.0f, 1.0f);
+        if (m_Cover.size() != (size_t)nv * px) return 0.0f;
+        double loss = 0.0;
+        for (int v = 0; v < nv; v++) {
+            const float* D = m_Cover.data() + (size_t)v * px;
+            double tsum = 0.0, hit = 0.0, spill = 0.0;
+            for (int k = 0; k < px; k++) {
+                float t = target[v][k];
                 tsum += t;
                 hit += fminf(t, D[k]);
                 spill += fmaxf(0.0f, D[k] - t);
             }
             if (tsum <= 0.0) continue;
             double cover = hit / tsum;
-            loss += bias / nv * ((1.0 - cover) + spill / tsum);
-            if (bias > 0.0f) loss += 10.0 * fmax(0.0, minCover - cover);
+            loss += ((1.0 - cover) + spill / tsum) / nv + 10.0 * fmax(0.0, minCover - cover);
         }
         return (float)loss;
     }
 
-    std::vector<Vector3> Loss::ViewDirections() const {
-        std::vector<Vector3> out;
-        for (const View& w : m_Views) out.push_back(w.dir);
-        return out;
-    }
-
-    Vector3 Loss::KeepSphereInFrame(Vector3 c) const {
-        float room = m_Half - m_SphereRadius;            // how far its centre may be from the frame's
-        Vector3 off = Vector3Subtract(c, m_Centre);
-        float l = Vector3Length(off);
-        if (room <= 0.0f) return m_Centre;
-        return l > room ? Vector3Add(m_Centre, Vector3Scale(off, room / l)) : c;
-    }
-
-    Vector3 Loss::FitSphere(const Design& d) {
-        Evaluate(d, m_SphereStart, {}, nullptr);         // draws the closed pose
-        Adam adam;
-        Vector3 c = m_SphereStart;
-        const float unit = SphereUnit(), h = 0.25f * 2.0f * m_Half / m_Res;
-        for (int k = 0; k < 300; k++) {
-            std::vector<float> x = { c.x / unit, c.y / unit, c.z / unit }, g(3);
-            for (int a = 0; a < 3; a++) {
-                Vector3 e = { 0, 0, 0 };
-                (&e.x)[a] = h;
-                g[a] = (ClosedLoss(Vector3Add(c, e)) - ClosedLoss(Vector3Subtract(c, e))) / (2.0f * h) * unit;
-            }
-            adam.Step({ 0, 1, 2 }, x, g);
-            c = KeepSphereInFrame({ x[0] * unit, x[1] * unit, x[2] * unit });
-        }
-        return ClosedLoss(c) <= ClosedLoss(m_SphereStart) ? c : m_SphereStart;
-    }
-
-    // ---- silhouettes ------------------------------------------------------------------------------------------------------
-
-    // The open and closed poses drawn (each pixel keeps the body covering it most, and where its ray came closest to
-    // it), compared with their targets, and the slopes of the soft edge pixels:
-    //   d loss / d D: -1/sum(T) where the design covers less than the target, +1/sum(T) where it covers more, plus the
-    //   coverage penalty's share; and d D / d distance = -1 / (2 tau) on the edge (0 < D < 1).
-    void Loss::Silhouettes(const Bodies& b, AutoScore& s, Slopes& slopes) {
-        const int nv = (int)m_Views.size(), px = m_Res * m_Res;
-        std::vector<int> who[2];
-        std::vector<Vector3> at[2];
-        for (int pose = 0; pose < 2; pose++) {
-            m_Cover[pose].assign((size_t)nv * px, 0.0f);
-            who[pose].assign((size_t)nv * px, -1);
-            at[pose].assign((size_t)nv * px, { 0, 0, 0 });
-        }
-        ParallelFor(2 * nv * m_Res, [&](int task) {            // every row of every view of both poses
-            int pose = task / (nv * m_Res), v = (task / m_Res) % nv, y = task % m_Res;
-            for (int x = 0; x < m_Res; x++) {
-                size_t k = (size_t)v * px + (size_t)y * m_Res + x;
-                for (size_t i = 0; i < b.fields.size(); i++) {
-                    Vector3 p;
-                    float dmin = Trace(b.fields[i], b.box[i], b.xf[pose][b.group[i]], m_Views[v], FrameX(x, m_Res), FrameY(y, m_Res), m_Tau, &p);
-                    float c = std::clamp(0.5f - dmin / (2.0f * m_Tau), 0.0f, 1.0f);
-                    if (c > m_Cover[pose][k]) {
-                        m_Cover[pose][k] = c;
-                        who[pose][k] = (int)i;
-                        at[pose][k] = p;
-                    }
-                }
-            }
-        });
-
-        const float bias = std::clamp(m_P.sphereBias, 0.0f, 1.0f), minCover = std::clamp(m_P.minViewCoverage, 0.0f, 1.0f);
-        const float silhouette = std::max(0.0f, m_P.silhouetteWeight);
-        s.worstView = 1.0f;
-        for (int pose = 0; pose < 2; pose++) {
-            const float weight = (pose == 0 ? 1.0f - bias : bias) / nv;
-            const bool counts = pose == 0 ? bias < 1.0f : bias > 0.0f;       // its views' minimum coverage applies
-            double lossSum = 0.0, coverSum = 0.0, extraSum = 0.0;
-            for (int v = 0; v < nv; v++) {
-                const float* D = m_Cover[pose].data() + (size_t)v * px;
-                auto target = [&](int k) { return pose == 0 ? m_Mesh[v][k] : Disc(m_Views[v], k % m_Res, k / m_Res, m_SphereCentre); };
-                double tsum = 0.0, hit = 0.0, spill = 0.0;
-                for (int k = 0; k < px; k++) {
-                    float t = target(k);
-                    tsum += t;
-                    hit += fminf(t, D[k]);
-                    spill += fmaxf(0.0f, D[k] - t);
-                }
-                if (tsum <= 0.0) continue;
-                float cover = (float)(hit / tsum), extra = (float)(spill / tsum);
-                lossSum += (1.0f - cover) + extra;
-                coverSum += cover;
-                extraSum += extra;
-                bool shortOf = counts && cover < minCover;
-                if (counts) {
-                    s.worstView = fminf(s.worstView, cover);
-                    s.coveragePenalty += 10.0f * fmaxf(0.0f, minCover - cover);
-                }
-                for (int k = 0; k < px; k++) {
-                    size_t kk = (size_t)v * px + k;
-                    float c = D[k], t = target(k);
-                    int i = who[pose][kk];
-                    if (pose == 0 && i >= 0 && c - t > 0.5f && kk % 7 == 0) {     // a sparse sample of the extra pixels
-                        const Rigid& xf = b.xf[0][b.group[i]];
-                        Quaternion inv = { -xf.rotation.x, -xf.rotation.y, -xf.rotation.z, xf.rotation.w };
-                        m_Extra.push_back({ b.group[i], xf.ApplyInverse(at[pose][kk]), Vector3RotateByQuaternion(m_Views[v].dir, inv) });
-                    }
-                    if (i < 0 || c <= 0.0f || c >= 1.0f || c == t) continue;     // not on an edge, or no slope
-                    float dD = c < t ? (float)((-weight - (shortOf ? 10.0f : 0.0f)) / tsum) : (float)(weight / tsum);
-                    if (silhouette > 0.0f) slopes[i].push_back({ pose, at[pose][kk], silhouette * dD * (-1.0f / (2.0f * m_Tau)) });
-                }
-            }
-            (pose == 0 ? s.fit : s.sphere) = (float)(lossSum / nv);
-            (pose == 0 ? s.viewCover : s.sphereViewCover) = (float)(coverSum / nv);
-            (pose == 0 ? s.viewExtra : s.sphereViewExtra) = (float)(extraSum / nv);
-        }
-    }
-
     // ---- collisions -------------------------------------------------------------------------------------------------------
 
-    // In every pose, every two bodies whose boxes meet are sampled where they meet (the same unit points each time). A
-    // point inside both by dd (the larger, so nearer zero, of their two distances, both negative) adds dd's depth
-    // times its share of the box's volume; its slope goes to the body whose distance that is.
+    // In every pose (open, and the checks between), every two pieces whose boxes meet are sampled where they meet (the
+    // same unit points each time). A point inside both by dd (the larger, so nearer zero, of their two distances, both
+    // negative) adds dd's depth times its share of the box's volume; its slope goes to the piece whose distance that is.
     void Loss::Collisions(const Bodies& b, AutoScore& s, Slopes& slopes) {
         const double sphereVolume = 4.0 / 3.0 * PI * pow(m_SphereRadius, 3.0), norm = sphereVolume * 0.02 * m_L;
-        const int poses = (int)b.times.size(), between = poses - 2;
+        const int poses = (int)b.times.size(), between = poses - 1;
         struct Pair {
             int pose, a, c;
             BoundingBox meet;
             double depth = 0.0, volume = 0.0;
             std::vector<std::pair<int, Slope>> slopes;
-            std::vector<Spot> spots;             // a few overlapping points, in each body's frame
         };
         std::vector<Pair> pairs;
         for (int pose = 0; pose < poses; pose++) {
@@ -449,8 +491,8 @@ namespace Bakugan {
         }
         ParallelFor((int)pairs.size(), [&](int k) {
             Pair& pr = pairs[k];
-            // the pose's share of the collision term: the ends count fully, the poses between share one
-            const float poseWeight = pr.pose < 2 ? 1.0f : 1.0f / between;
+            // the pose's share of the collision term: the open pose counts fully, the poses between share one
+            const float poseWeight = pr.pose == 0 ? 1.0f : 1.0f / between;
             const Rigid& xa = b.xf[pr.pose][b.group[pr.a]];
             const Rigid& xc = b.xf[pr.pose][b.group[pr.c]];
             Vector3 ext = Vector3Subtract(pr.meet.max, pr.meet.min);
@@ -468,10 +510,6 @@ namespace Bakugan {
                 pr.volume += dv;
                 // d loss / d dd = -weight · poseWeight · dv / norm
                 pr.slopes.push_back({ da > dc ? pr.a : pr.c, { pr.pose, p, (float)(-m_P.collisionWeight * poseWeight * dv / norm) } });
-                if (pr.spots.size() < 8) {
-                    pr.spots.push_back({ b.group[pr.a], qa, { 0, 0, 1 } });
-                    pr.spots.push_back({ b.group[pr.c], qc, { 0, 0, 1 } });
-                }
             }
         });
         std::vector<double> depth(poses, 0.0), volume(poses, 0.0);
@@ -479,10 +517,9 @@ namespace Bakugan {
             depth[pr.pose] += pr.depth;
             volume[pr.pose] += pr.volume;
             for (const auto& [field, slope] : pr.slopes) slopes[field].push_back(slope);
-            m_Overlaps.insert(m_Overlaps.end(), pr.spots.begin(), pr.spots.end());
         }
         double betweenSum = 0.0;
-        for (int pose = 2; pose < poses; pose++) {
+        for (int pose = 1; pose < poses; pose++) {
             betweenSum += depth[pose] / norm;
             float share = (float)(volume[pose] / sphereVolume);
             if (share > s.clashMotion) {
@@ -490,14 +527,13 @@ namespace Bakugan {
                 s.clashMotionT = b.times[pose];
             }
         }
-        s.collision = (float)(depth[0] / norm + depth[1] / norm + (between > 0 ? betweenSum / between : 0.0));
+        s.collision = (float)(depth[0] / norm + (between > 0 ? betweenSum / between : 0.0));
         s.clashOpen = (float)(volume[0] / sphereVolume);
-        s.clashClosed = (float)(volume[1] / sphereVolume);
     }
 
     // ---- hinges ----------------------------------------------------------------------------------------------------------
 
-    // Each pivot against the two bodies it joins, both in the design pose (the frame pivots are given in).
+    // Each pivot against the two pieces it joins, both in the design pose (closed: the frame pivots are given in).
     void Loss::Hinges(const Design& d, const Bodies& b, AutoScore& s) const {
         for (const Hinge& h : d.hinges) {
             int pg = d.GroupIndex(h.parent), cg = d.GroupIndex(h.child);
@@ -508,65 +544,98 @@ namespace Bakugan {
         }
     }
 
+    // ---- the surface --------------------------------------------------------------------------------------------------------
+
+    // Points just under the sphere's surface, each against the hollows (the union of them): how deep inside one it is,
+    // d, counts d / (d + 1% of the mesh's size): nothing until a hollow reaches it, nearly 1 once well inside.
+    float Loss::SurfaceTerm(const Carving& c, float* carved) const {
+        const float scale = 0.01f * m_L, under = c.radius * 0.997f;
+        double sum = 0.0;
+        int in = 0;
+        bool any = false;
+        for (const Cutter& k : c.cutters) any |= k.hollow;
+        if (any)
+            for (Vector3 dir : m_SurfaceDirs) {
+                Vector3 p = Vector3Add(c.centre, Vector3Scale(dir, under));
+                float d = FLT_MAX;
+                for (const Cutter& k : c.cutters)
+                    if (k.hollow) d = fminf(d, k.sf.Distance(p));
+                if (d >= 0.0f) continue;
+                in++;
+                sum += -d / (-d + scale);
+            }
+        if (carved) *carved = (float)in / m_SurfaceDirs.size();
+        return (float)(sum / m_SurfaceDirs.size());
+    }
+
     // ---- the gradient -------------------------------------------------------------------------------------------------------
 
     // d loss / d parameter = sum over the slopes of (slope · d distance / d parameter). To first order a distance only
-    // changes through the body's field and pose at its fixed world point (for a silhouette's ray, where it comes
+    // changes through the piece's field and pose at its fixed world point (for a silhouette's ray, where it comes
     // closest: the envelope theorem), so d distance / d parameter comes from central differences there: the parameter
-    // nudged either way, the body's field (a shape's parameter) or the poses (a hinge's) rebuilt, the distance measured
-    // again. The hinge term is measured again directly, for the hinges the parameter touches. The poses' times stay as
-    // they were (the checks are placed by the design, not part of what is moved).
-    void Loss::Gradient(const Design& d, const Bodies& b, const Slopes& slopes, const Shades& shades, const std::vector<Param>& ps,
-                        std::vector<float>& grad) const {
-        const std::vector<int>& fieldOf = b.fieldOf;
+    // nudged either way, the carving built again, the fields of the pieces a cutter shapes (a cutter's parameter) or
+    // the poses (a joint's) rebuilt, the distance measured again. The hinge term is measured again directly, for the
+    // joints the parameter touches. The poses' times stay as they were (the checks are placed by the design, not part
+    // of what is moved).
+    void Loss::Gradient(const Carving& c, const Placement& target, const std::vector<int>& bodyOf, const Bodies& b, const Slopes& slopes,
+                        const Shades& shades, const std::vector<Param>& ps, std::vector<float>& grad) {
         ParallelFor((int)ps.size(), [&](int j) {
             const Param& p = ps[j];
+            if (p.kind == Param::Target) return;            // the placement's: see Evaluate
+            bool ok = false;
+            float base = Get(c, target, p, &ok);
+            if (!ok) return;
             double sum[2] = { 0.0, 0.0 };
             float value[2] = { 0.0f, 0.0f };
             for (int side = 0; side < 2; side++) {
-                Design e = d;
-                float* ref = Ref(e, p);
-                if (!ref) return;
-                SetParam(e, p, *ref + (side == 0 ? 0.1f : -0.1f) * p.unit, m_L);
-                value[side] = *Ref(e, p);
+                Carving e = c;
+                Placement t = target;
+                Set(e, t, p, base + (side == 0 ? 0.1f : -0.1f) * p.unit, m_L);
+                value[side] = Get(e, t, p);
                 Tidy(e);
+                Design de = e.Build();
                 std::vector<std::vector<Rigid>> xf;
-                for (float t : b.times) xf.push_back(e.Transforms(t, true));
-                int own = -1;                                           // a shape's parameter changes its body's field
-                BodyField changed;
-                if (p.kind == Param::Shape) {
-                    int body = e.GroupIndex(e.ShapeBody(e.ShapeIndex(p.id)));
-                    own = body >= 0 ? fieldOf[body] : -1;
-                    if (own >= 0) changed = BodyField::Body(e, e.groups[body].id);
-                }
-                for (size_t i = 0; i < b.fields.size(); i++)
+                for (float time : b.times) xf.push_back(de.Transforms(time, true));
+                // a cutter's parameter changes the fields of the pieces it shapes
+                std::vector<int> changedOf(b.fields.size(), -1);
+                std::vector<BodyField> changed;
+                if (p.kind == Param::Cutter)
+                    for (int k : e.PiecesUsing(p.id)) {
+                        changedOf[k] = (int)changed.size();
+                        changed.push_back(BodyField::Body(de, bodyOf[k]));
+                    }
+                auto field = [&](size_t i) -> const BodyField& { return changedOf[i] >= 0 ? changed[changedOf[i]] : b.fields[i]; };
+                for (size_t i = 0; i < b.fields.size(); i++) {
                     for (const Slope& sl : slopes[i]) {
                         const Rigid& before = b.xf[sl.pose][b.group[i]];
                         const Rigid& after = xf[sl.pose][b.group[i]];
-                        bool fieldMoves = (int)i == own, poseMoves = memcmp(&before, &after, sizeof(Rigid)) != 0;
-                        if (!fieldMoves && !poseMoves) continue;        // this parameter doesn't touch it
-                        sum[side] += sl.weight * (fieldMoves ? changed : b.fields[i]).Distance(after.ApplyInverse(sl.at));
+                        bool poseMoves = memcmp(&before, &after, sizeof(Rigid)) != 0;
+                        if (changedOf[i] < 0 && !poseMoves) continue;   // this parameter doesn't touch it
+                        sum[side] += sl.weight * field(i).Distance(after.ApplyInverse(sl.at));
                     }
-                // the semantic pixels' shades: the surface point slid along its ray, and shaded again
-                for (size_t i = 0; i < b.fields.size(); i++)
+                    // the semantic pixels' shades: the surface point slid along its ray, and shaded again
                     for (const Shade& sh : shades[i]) {
                         const Rigid& before = b.xf[sh.pose][b.group[i]];
                         const Rigid& after = xf[sh.pose][b.group[i]];
-                        bool fieldMoves = (int)i == own, poseMoves = memcmp(&before, &after, sizeof(Rigid)) != 0;
-                        if (!fieldMoves && !poseMoves) continue;
-                        sum[side] += sh.weight * ShadeAt(fieldMoves ? changed : b.fields[i], after, sh);
+                        bool poseMoves = memcmp(&before, &after, sizeof(Rigid)) != 0;
+                        if (changedOf[i] < 0 && !poseMoves) continue;
+                        sum[side] += sh.weight * ShadeAt(field(i), after, sh);
                     }
-                // the hinge term, for the hinges this parameter touches: a pivot it moves, or a body whose field it changes
+                }
+                // the surface term, for a hollow's parameter
+                if (p.kind == Param::Cutter && m_P.surfaceWeight > 0.0f) {
+                    int k = e.CutterIndex(p.id);
+                    if (k >= 0 && e.cutters[k].hollow) sum[side] += m_P.surfaceWeight * SurfaceTerm(e);
+                }
+                // the hinge term, for the joints this parameter touches: a pivot it moves, or a piece whose field it changes
                 if (m_P.hingeWeight > 0.0f)
-                    for (const Hinge& h : e.hinges) {
-                        int pg = e.GroupIndex(h.parent), cg = e.GroupIndex(h.child);
-                        int pi = pg >= 0 ? fieldOf[pg] : -1, ci = cg >= 0 ? fieldOf[cg] : -1;
+                    for (const Hinge& h : de.hinges) {
+                        int pg = de.GroupIndex(h.parent), cg = de.GroupIndex(h.child);
+                        int pi = pg >= 0 ? b.fieldOf[pg] : -1, ci = cg >= 0 ? b.fieldOf[cg] : -1;
                         if (pi < 0 || ci < 0) continue;
-                        bool pivotMoves = p.kind == Param::Hinge && p.id == h.id && p.field < 3;
-                        if (!pivotMoves && own != pi && own != ci) continue;
-                        const BodyField& pf = own == pi ? changed : b.fields[pi];
-                        const BodyField& cf = own == ci ? changed : b.fields[ci];
-                        sum[side] += m_P.hingeWeight * (PivotGap(pf, h.pivot) + PivotGap(cf, h.pivot)) / m_L;
+                        bool pivotMoves = p.kind == Param::Joint && h.name == "Joint " + std::to_string(p.id) && p.field < 3;
+                        if (!pivotMoves && changedOf[pi] < 0 && changedOf[ci] < 0) continue;
+                        sum[side] += m_P.hingeWeight * (PivotGap(field(pi), h.pivot) + PivotGap(field(ci), h.pivot)) / m_L;
                     }
             }
             float step = value[0] - value[1];
@@ -576,23 +645,22 @@ namespace Bakugan {
 
     // ---- the picture for the UI ---------------------------------------------------------------------------------------
 
-    // Dark where both cover a pixel, red where only the target does (missing), blue where only the design does (extra).
+    // Dark where both cover a pixel, red where only the placed mesh does (missing), blue where only the design does (extra).
     void Loss::Picture(std::vector<unsigned char>* rgba, int* w, int* h) const {
         const int nv = (int)m_Views.size(), px = m_Res * m_Res, gap = 3;
-        if (m_Cover[0].size() != (size_t)nv * px) { *w = *h = 0; rgba->clear(); return; }
+        if (m_Cover.size() != (size_t)nv * px) { *w = *h = 0; rgba->clear(); return; }
         *w = nv * m_Res + (nv + 1) * gap;
-        *h = 2 * m_Res + 3 * gap;
+        *h = m_Res + 2 * gap;
         rgba->assign((size_t)*w * *h * 4, 255);
         for (size_t k = 0; k < rgba->size(); k += 4) { (*rgba)[k] = 222; (*rgba)[k + 1] = 225; (*rgba)[k + 2] = 232; }
         const float both[3] = { 70, 74, 86 }, miss[3] = { 235, 110, 95 }, extra[3] = { 90, 140, 235 };
-        for (int pose = 0; pose < 2; pose++)
-            for (int v = 0; v < nv; v++)
-                for (int k = 0; k < px; k++) {
-                    int x = k % m_Res, y = k / m_Res;
-                    float t = pose == 0 ? m_Mesh[v][k] : Disc(m_Views[v], x, y, m_SphereCentre), dd = m_Cover[pose][(size_t)v * px + k];
-                    float ov = fminf(t, dd), ms = t - ov, ex = dd - ov, rest = 1.0f - fmaxf(t, dd);
-                    unsigned char* out = &(*rgba)[((size_t)(gap + pose * (m_Res + gap) + y) * *w + gap + v * (m_Res + gap) + x) * 4];
-                    for (int c = 0; c < 3; c++) out[c] = (unsigned char)std::clamp(lroundf(ov * both[c] + ms * miss[c] + ex * extra[c] + rest * 255.0f), 0L, 255L);
-                }
+        for (int v = 0; v < nv; v++)
+            for (int k = 0; k < px; k++) {
+                int x = k % m_Res, y = k / m_Res;
+                float t = m_Target[v][k], dd = m_Cover[(size_t)v * px + k];
+                float ov = fminf(t, dd), ms = t - ov, ex = dd - ov, rest = 1.0f - fmaxf(t, dd);
+                unsigned char* out = &(*rgba)[((size_t)(gap + y) * *w + gap + v * (m_Res + gap) + x) * 4];
+                for (int c = 0; c < 3; c++) out[c] = (unsigned char)std::clamp(lroundf(ov * both[c] + ms * miss[c] + ex * extra[c] + rest * 255.0f), 0L, 255L);
+            }
     }
 }

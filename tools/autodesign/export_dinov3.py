@@ -12,12 +12,12 @@ and gives each view's loss and the gradient of the summed loss with respect to e
 The graph compares one view at a time, at the size it was exported for (S, a multiple of the patch size, 16); the
 generator reads S from the file and renders its views at that size:
     render       float [1, 1, S, S]   a view of the design, grey, 0..1
-    target       float [1, 1, S, S]   what it should look like (the mesh, or the sphere), grey, 0..1
+    target       float [1, 1, S, S]   what it should look like (the mesh, as placed), grey, 0..1
     patch_weight float [1]            0: compare the global (CLS) embeddings, 1: the patch embeddings, between: a mix
   ->
     loss         float [1]            (1 - w) (1 - cos(global_r, global_t)) + w mean_p (1 - cos(patch_r, patch_t))
     grad_render  float [1, 1, S, S]   d loss / d render
-    grad_target  float [1, 1, S, S]   d loss / d target (the sphere's views move with it)
+    grad_target  float [1, 1, S, S]   d loss / d target (the mesh's placement moves it)
 
 Patches are compared position by position: the two views share a camera, so patch p of one covers what patch p of the
 other does. Grey goes in as R = G = B; the ImageNet normalization is folded into the patch embedding.

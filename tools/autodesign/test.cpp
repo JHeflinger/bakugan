@@ -1,7 +1,10 @@
-// Headless run of the generator: ./autotest mesh.obj [steps] [sphereBias] [seed] [outPrefix]
-// Env: VIEWS, VRES, LR, ROUND (steps per round), REWRITES, LOOKAHEAD, MAXBODIES, WEIGHTS (the rules', e.g. 1,1,1,0.5,0.5,0.5,0.5,0.5). Semantic loss: semantic_env.hpp.
+// Headless run of the generator: ./autotest mesh.obj [steps] [seed] [outPrefix]
+// Env: VIEWS, VRES, LR, ROUND (steps per round), REWRITES, LOOKAHEAD, MARGIN, MAXPIECES, WEIGHTS (the rules', e.g. 1,0.5),
+// FIXTARGET (the mesh stays put), NOSCALE (it may move but not scale), HINGEW, COLW, CHECKS, CHECKBIAS.
+// Semantic loss: semantic_env.hpp.
 // Writes <outPrefix>_design.txt (open it in the editor) and <outPrefix>_views.ppm (silhouettes against targets).
 #include "autodesign/autodesign.hpp"
+#include "autodesign/loss.hpp"
 #include "semantic_env.hpp"
 #include "autodesign/suite.hpp"
 #include "data/field.hpp"
@@ -10,22 +13,23 @@
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
+#include <raymath.h>
 using namespace Bakugan;
 
 int main(int argc, char** argv) {
-    if (argc < 2) { printf("usage: %s mesh.obj [steps] [sphereBias] [seed] [outPrefix]\n", argv[0]); return 1; }
+    if (argc < 2) { printf("usage: %s mesh.obj [steps] [seed] [outPrefix]\n", argv[0]); return 1; }
     TriMesh mesh;
     std::string err;
     if (!LoadObj(argv[1], &mesh, &err)) { printf("can't load %s: %s\n", argv[1], err.c_str()); return 1; }
     AutoParams p;
     if (argc > 2) p.steps = atoi(argv[2]);
-    if (argc > 3) p.sphereBias = (float)atof(argv[3]);
-    if (argc > 4) p.seed = (unsigned)atoi(argv[4]);
-    std::string out = argc > 5 ? argv[5] : "out";
+    if (argc > 3) p.seed = (unsigned)atoi(argv[3]);
+    std::string out = argc > 4 ? argv[4] : "out";
     auto env = [](const char* name, auto& value) { if (const char* s = getenv(name)) value = (std::remove_reference_t<decltype(value)>)atof(s); };
     env("VIEWS", p.views); env("VRES", p.viewResolution); env("LR", p.learningRate); env("ROUND", p.stepsPerRound);
-    env("REWRITES", p.rewritesPerRound); env("LOOKAHEAD", p.lookahead); env("MAXBODIES", p.maxBodies);
-    if (getenv("FIXSPHERE")) p.moveSphere = false;
+    env("REWRITES", p.rewritesPerRound); env("LOOKAHEAD", p.lookahead); env("MAXPIECES", p.maxPieces); env("MARGIN", p.rewriteMargin);
+    if (getenv("FIXTARGET")) p.moveTarget = p.scaleTarget = false;
+    if (getenv("NOSCALE")) p.scaleTarget = false;
     env("HINGEW", p.hingeWeight);
     env("COLW", p.collisionWeight); env("CHECKS", p.motionChecks); env("CHECKBIAS", p.motionCheckBias);
     SemanticFromEnv(p);
@@ -71,19 +75,44 @@ int main(int argc, char** argv) {
         printf("pivots: farthest %.1f mm outside a body, mean %.1f mm (%d hinges)\n", worst, r.design.hinges.empty() ? 0.0f : sum / r.design.hinges.size(),
                (int)r.design.hinges.size());
     }
-    printf("sphere: centre %.1f %.1f %.1f, %.1f mm across\n", r.score.centre.x, r.score.centre.y, r.score.centre.z, 2.0f * r.score.radius);
+    const Placement& t = r.score.target;
+    printf("mesh: moved %.1f %.1f %.1f mm, scaled %.3fx; sphere %.1f mm across\n", t.offset.x, t.offset.y, t.offset.z, t.scale, 2.0f * r.score.radius);
+    {
+        // closed, the pieces should be the sphere exactly: points in none of them inside it, in one outside, in two
+        const Carving& k = r.carving;
+        std::vector<Rigid> xf = r.design.Transforms(1.0f, false);
+        std::vector<std::pair<BodyField, int>> pieces;
+        for (int g : r.design.Bodies()) pieces.push_back({ BodyField::Body(r.design, r.design.groups[g].id), g });
+        int none = 0, outside = 0, two = 0, n = 20000;
+        unsigned seed = 5;
+        auto u = [&] { seed = seed * 1664525u + 1013904223u; return (seed >> 8) / 16777216.0f * 2.0f - 1.0f; };
+        for (int i = 0; i < n; i++) {
+            Vector3 q = Vector3Add(k.centre, Vector3Scale({ u(), u(), u() }, 1.2f * k.radius));
+            float ds = Vector3Distance(q, k.centre) - k.radius;
+            if (fabsf(ds) < 0.002f * k.radius) continue;
+            bool hollowed = false;                      // (hollows take material away: no piece there is right)
+            for (const Cutter& h : k.cutters) hollowed |= h.hollow && h.sf.Distance(q) < 0.0f;
+            if (hollowed) continue;
+            int in = 0;
+            for (auto& [f, g] : pieces) in += f.Distance(xf[g].ApplyInverse(q)) < 0.0f;
+            none += ds < 0.0f && in == 0;
+            outside += ds > 0.0f && in > 0;
+            two += in > 1;
+        }
+        printf("closed: of %d points, %d in the sphere (less its hollows) but no piece, %d outside it in a piece, %d in two pieces; "
+               "%d hollows, %.1f%% of the surface carved\n", n, none, outside, two, k.Hollows(), r.score.surfaceCarved * 100.0f);
+    }
     {
         // the result checked for overlaps the same way whatever the run used: 32 poses between, evenly over the motion
         AutoParams q = p;
         q.collisionWeight = 1.0f;
         q.motionChecks = 32;
         q.motionCheckBias = 0.0f;
-        q.steps = 0;
-        q.fromCurrent = true;
-        JobControl c2;
-        AutoResult e = AutoDesign(mesh, r.design, q, c2, nullptr);
-        printf("checked: overlapping %.2f%% open, %.2f%% closed, worst between %.2f%% at t=%.2f\n", e.score.clashOpen * 100.0f,
-               e.score.clashClosed * 100.0f, e.score.clashMotion * 100.0f, e.score.clashMotionT);
+        q.semanticWeight = 0.0f;
+        Loss check(mesh, q);
+        AutoScore e = check.Evaluate(r.carving, t);
+        printf("checked: overlapping %.2f%% open, worst between %.2f%% at t=%.2f\n", e.clashOpen * 100.0f, e.clashMotion * 100.0f,
+               e.clashMotionT);
     }
     FILE* f = fopen((out + "_design.txt").c_str(), "w");
     fputs(r.design.Serialize().c_str(), f);

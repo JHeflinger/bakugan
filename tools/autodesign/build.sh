@@ -1,12 +1,12 @@
 #!/bin/sh
 # Headless builds of the generator, without the editor's GUI: they need only raylib's headers.
 #   RAYLIB_SRC=/path/to/raylib/src ./build.sh
-#   ./autotest mesh.obj [steps] [sphereBias] [seed] [outPrefix]     a design, and its silhouettes as a picture
+#   ./autotest mesh.obj [steps] [seed] [outPrefix]     a carving, and its silhouettes as a picture
 #   ./suitetest <folder> [steps] [videoSize] [searchSeconds]         the Generate tab's test suite (needs ffmpeg)
 #   ./gradcheck mesh.obj      the loss's gradient against brute force differences of the whole loss
 #   ./adamtest                Adam's memory as parameters come and go
 #   ./checktimes              where the collision checks between open and closed go, for a few hinge timings
-#   ./rulecheck mesh.obj      splitting a body changes no pose; merging two keeps the open pose
+#   ./rulecheck mesh.obj      adding a cut changes nothing; closed, the pieces are always the sphere
 # The semantic loss (DINOv3) is on in autotest and gradcheck with SEM=model.onnx ORT=path/to/libonnxruntime (see
 # semantic_env.hpp); export_dinov3.py makes the model. Linking needs nothing more: ONNX Runtime is loaded at run time
 # (on glibc older than 2.34, add -ldl).

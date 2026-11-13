@@ -21,11 +21,7 @@ namespace Bakugan {
         auto mesh = std::make_shared<const TriMesh>(Utils::ModelToTriMesh(m_Reference, ReferenceMatrix()));
         if (mesh->indices.empty()) { m_Status = "The reference mesh has no triangles to fit."; return; }
         AutoParams p = m_AutoParams;
-        if (scoreOnly) {
-            p.steps = 0;                 // only score the start: the current design
-            p.fromCurrent = true;
-        }
-        if (p.fromCurrent && m_Design.shapes.empty()) p.fromCurrent = false;
+        if (scoreOnly) p.steps = 0;      // only score the current design (against the mesh where it is)
         Design start = m_Design;
         m_AutoLive = std::make_shared<AutoLive>();
         m_AutoLive->ruleWeights = p.ruleWeights;      // the Grammar sliders change these while it runs
@@ -42,7 +38,7 @@ namespace Bakugan {
         }
         m_AutoJob.Start([mesh, start, p, live](JobControl& c) { return AutoDesign(*mesh, start, p, c, live); });
         m_Status = scoreOnly ? "Scoring the design against " + m_ReferenceName + "..."
-                             : "Generating a design for " + m_ReferenceName + (p.fromCurrent ? " from the current one..." : "...");
+                             : "Carving a sphere into " + m_ReferenceName + "...";
     }
 
     // The scored silhouettes of the best design, as a texture for the Generate tab (on this thread: it has the GL
@@ -115,6 +111,8 @@ namespace Bakugan {
         m_HasSweep = false;
         FrameView(m_OutputView);
         m_Status += " Space plays the fold; Ctrl+Z brings back the design from before.";
+        if (fabsf(r.score.target.scale - 1.0f) > 1e-3f || Vector3Length(r.score.target.offset) > 1e-3f)
+            m_Status += " The reference mesh shows where it was compared (moved and scaled); its own placement is unchanged.";
     }
 
     void App::ClearAutoScore() {
@@ -152,7 +150,6 @@ namespace Bakugan {
         SuiteParams p = m_SuiteParams;
         p.folder = folder;
         p.generate = m_AutoParams;
-        p.generate.fromCurrent = false;
         m_SuiteLive = std::make_shared<SuiteLive>();
         std::shared_ptr<SuiteLive> live = m_SuiteLive;
         m_SuiteStart = GetTime();

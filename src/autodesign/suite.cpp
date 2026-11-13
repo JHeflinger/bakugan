@@ -144,9 +144,9 @@ namespace Bakugan {
         // A design's score in a few words.
         std::vector<std::string> ScoreWords(const AutoScore& s) {
             std::vector<std::string> w = { Utils::Format("score %.3f", s.total) };
-            w.insert(w.end(), { "outline " + Pct(s.viewCover), "extra " + Pct(s.viewExtra), "sphere " + Pct(s.sphereViewCover),
-                                "worst view " + Pct(s.worstView), Utils::Format("overlap %.1f%%", (s.clashOpen + s.clashClosed) * 50.0f),
-                                Utils::Format("moving %.1f%%", s.clashMotion * 100.0f) });
+            w.insert(w.end(), { "outline " + Pct(s.viewCover), "extra " + Pct(s.viewExtra), "worst view " + Pct(s.worstView),
+                                Utils::Format("overlap %.1f%%", s.clashOpen * 100.0f), Utils::Format("moving %.1f%%", s.clashMotion * 100.0f),
+                                Utils::Format("surface %.0f%%", s.surfaceCarved * 100.0f) });
             return w;
         }
 
@@ -371,7 +371,6 @@ namespace Bakugan {
             }
             Normalize(e.mesh, p.meshSize);
             AutoParams ap = p.generate;
-            ap.fromCurrent = false;
             auto search = std::make_shared<AutoLive>();
             search->recordFrames = searchFrames;
             show([&](SuiteLive& s) { s.search = search; });
@@ -382,12 +381,14 @@ namespace Bakugan {
                 continue;
             }
             e.result = r.design;
+            for (Vector3& q : e.mesh.positions) q = r.score.target.Apply(q);      // the mesh where the design was fitted to it
+            e.mesh.box = { r.score.target.Apply(e.mesh.box.min), r.score.target.Apply(e.mesh.box.max) };
             e.iterations = ap.steps;
             {
                 std::lock_guard<std::mutex> l(search->mutex);
                 e.frames = search->frames;
             }
-            if (e.frames.empty()) e.frames.push_back({ r.design, r.score, ap.steps });
+            if (e.frames.empty()) e.frames.push_back({ r.design, r.carving, r.score, ap.steps });
             std::ofstream(outDir / (e.name + ".txt")) << r.design.Serialize();
             entries.push_back(std::move(e));
         }
