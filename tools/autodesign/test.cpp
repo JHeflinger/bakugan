@@ -1,6 +1,8 @@
 // Headless run of the generator: ./autotest mesh.obj [steps] [seed] [outPrefix]
 // Env: VIEWS, VRES, LR, ROUND (steps per round), REWRITES, LOOKAHEAD, MARGIN, MAXPIECES, WEIGHTS (the rules', e.g. 1,0.5),
-// FIXTARGET (the mesh stays put), NOSCALE (it may move but not scale), HINGEW, COLW, CHECKS, CHECKBIAS.
+// FIXTARGET (the mesh stays put), NOSCALE (it may move but not scale), HINGEW, COLW, CHECKS (per hinge), FREETIMING (the
+// hinges' timing is Adam's, not an opening order), DEPS (hinges hold each other shut: ledges), DEPW, CARVE (carve what
+// still collides when done), LATCH (a press latch on the first hinge), RAMP (what overlaps cost by the end, times COLW).
 // Semantic loss: semantic_env.hpp.
 // Writes <outPrefix>_design.txt (open it in the editor) and <outPrefix>_views.ppm (silhouettes against targets).
 #include "autodesign/autodesign.hpp"
@@ -31,7 +33,11 @@ int main(int argc, char** argv) {
     if (getenv("FIXTARGET")) p.moveTarget = p.scaleTarget = false;
     if (getenv("NOSCALE")) p.scaleTarget = false;
     env("HINGEW", p.hingeWeight);
-    env("COLW", p.collisionWeight); env("CHECKS", p.motionChecks); env("CHECKBIAS", p.motionCheckBias);
+    env("COLW", p.collisionWeight); env("CHECKS", p.hingeChecks); env("DEPW", p.dependencyWeight); env("RAMP", p.collisionRamp);
+    if (getenv("FREETIMING")) p.orderHinges = false;
+    if (getenv("DEPS")) p.dependencies = true;
+    if (getenv("CARVE")) p.carveWhenDone = true;
+    if (getenv("LATCH")) p.latchWhenDone = true;
     SemanticFromEnv(p);
     if (const char* w = getenv("WEIGHTS"))          // the grammar's weights, comma separated, in AutoRules() order
         for (const char* q = w; *q; q++) {
@@ -103,16 +109,23 @@ int main(int argc, char** argv) {
                "%d hollows, %.1f%% of the surface carved\n", n, none, outside, two, k.Hollows(), r.score.surfaceCarved * 100.0f);
     }
     {
-        // the result checked for overlaps the same way whatever the run used: 32 poses between, evenly over the motion
-        AutoParams q = p;
-        q.collisionWeight = 1.0f;
-        q.motionChecks = 32;
-        q.motionCheckBias = 0.0f;
-        q.semanticWeight = 0.0f;
-        Loss check(mesh, q);
-        AutoScore e = check.Evaluate(r.carving, t);
-        printf("checked: overlapping %.2f%% open, worst between %.2f%% at t=%.2f\n", e.clashOpen * 100.0f, e.clashMotion * 100.0f,
-               e.clashMotionT);
+        // the finished design's motion checked for overlaps the same way whatever the run used: 48 poses in every
+        // hinge's turn, at two phases, on a fine grid
+        const double sphere = 4.0 / 3.0 * PI * pow(r.score.radius, 3.0);
+        for (float phase : { 0.5f, 0.0f }) {
+            MotionOverlap m = MeasureMotion(r.design, 48, r.score.radius / 12.0f, phase);
+            printf("checked (%d poses): overlapping %.3f%% open, worst on the way %.3f%% at t=%.2f, up to %.2f mm deep\n", m.poses,
+                   100.0 * m.openVolume / sphere, 100.0 * m.worstVolume / sphere, m.worstT, m.deepest);
+        }
+        // which hinges are held shut, closed (the first to open should be the only one that isn't, with dependencies)
+        std::vector<int> order = OpeningOrder(r.design);
+        printf("opening order:");
+        for (int h : order) {
+            double v = 0.0;
+            bool held = HeldShut(r.design, h, 0.5f, &v);
+            printf(" %s%s", r.design.hinges[h].name.c_str(), held ? " (held)" : " (free)");
+        }
+        printf("\n");
     }
     FILE* f = fopen((out + "_design.txt").c_str(), "w");
     fputs(r.design.Serialize().c_str(), f);

@@ -1,3 +1,5 @@
 build/*
 .tools/*
 *.DS_Store
+*.so.*
+*.onnx

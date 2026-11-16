@@ -29,12 +29,22 @@ namespace Bakugan {
 
             // where: a point of the sphere's surface that's this piece's, and the cap under it is the piece's too
             float a = R * Uniform(ctx.rng, 0.35f, 0.7f), depth = a * Uniform(ctx.rng, 0.15f, 0.3f);
+            // With dependencies, and other pieces to be next to: where another piece's surface is within the cap's reach,
+            // so that one of the two can come to hold the other shut (if nowhere is, anywhere).
+            std::vector<BodyField> others;
+            if (ctx.p.dependencies)
+                for (size_t k = 0; k < c.pieces.size(); k++)
+                    if ((int)k != pi) others.push_back(BodyField::Body(d, bodyOf[k]));
             Vector3 dir = { 0, 0, 0 };
             bool found = false;
-            for (int k = 0; k < 64 && !found; k++) {
+            for (int k = 0; k < 192 && !found; k++) {
                 dir = RandomDirection(ctx.rng);
-                found = piece.Distance(Vector3Add(c.centre, Vector3Scale(dir, R - 0.02f * R))) < 0.0f &&
-                        piece.Distance(Vector3Add(c.centre, Vector3Scale(dir, R - 0.5f * depth))) < 0.0f;
+                Vector3 top = Vector3Add(c.centre, Vector3Scale(dir, R - 0.02f * R));
+                found = piece.Distance(top) < 0.0f && piece.Distance(Vector3Add(c.centre, Vector3Scale(dir, R - 0.5f * depth))) < 0.0f;
+                if (!found || others.empty() || k >= 128) continue;
+                bool near = false;
+                for (const BodyField& o : others) near |= o.Distance(top) < 0.6f * a;
+                found = near;
             }
             if (!found) return false;
 
@@ -54,18 +64,28 @@ namespace Bakugan {
             c.pieces.push_back(cap);
             const int rest = c.pieces[pi].id;
 
-            // the hinge's line: along the cut face, at its edge (the farthest the face still has both pieces against it)
+            // the hinge's line: along the cut's edge, where it comes out of the sphere's surface. First along the cut
+            // face to its edge (the farthest the face still has both pieces against it), then straight out from there
+            // to the surface: a lid hinged on its outer edge swings clear of its seat, one hinged at the bottom of its
+            // wall would swing the wall into it.
             d = c.Build(&bodyOf);
             BodyField restField = BodyField::Body(d, bodyOf[pi]), capField = BodyField::Body(d, bodyOf.back());
             Vector3 side = Vector3Normalize(Vector3CrossProduct(dir, fabsf(dir.y) < 0.9f ? Vector3{ 0, 1, 0 } : Vector3{ 1, 0, 0 }));
             float turn = Uniform(ctx.rng, 0.0f, 2.0f * PI);
             side = Vector3RotateByQuaternion(side, QuaternionFromAxisAngle(dir, turn));
             Vector3 face = Vector3Add(c.centre, Vector3Scale(dir, R - depth)), pivot = face;
+            float out = 0.0f;
             for (int k = 1; k <= 64; k++) {
                 Vector3 q = Vector3Add(face, Vector3Scale(side, k * R / 64.0f));
                 Vector3 above = Vector3Add(q, Vector3Scale(dir, 0.01f * R)), below = Vector3Subtract(q, Vector3Scale(dir, 0.01f * R));
                 if (capField.Distance(above) >= 0.0f || restField.Distance(below) >= 0.0f) break;
                 pivot = q;
+                out = k * R / 64.0f;
+            }
+            if (out < R) {
+                Vector3 onSurface = Vector3Add(c.centre, Vector3Add(Vector3Scale(side, out), Vector3Scale(dir, 0.995f * sqrtf(R * R - out * out))));
+                const float near = 0.01f * ctx.loss.L();
+                if (capField.Distance(onSurface) < near && restField.Distance(onSurface) < near) pivot = onSurface;
             }
 
             // the joints the piece had go with the part their pivot is in (or nearer)
@@ -84,7 +104,9 @@ namespace Bakugan {
             j.open = 0.0f;
             j.t0 = Uniform(ctx.rng, 0.0f, 0.5f);
             j.t1 = j.t0 + 0.5f;
+            for (const Joint& o : c.joints) j.order = std::max(j.order, o.order + 1);   // it opens last, until the order is looked at again
             c.joints.push_back(j);
+            Tidy(c);
             return true;
         }
 
@@ -171,6 +193,7 @@ namespace Bakugan {
             c.joints.erase(c.joints.begin() + pick.joint);
             c.pieces.erase(c.pieces.begin() + c.PieceIndex(j.child));
             c.cutters.erase(c.cutters.begin() + c.CutterIndex(pick.cutter));
+            Tidy(c);                                        // (an ordered carving's joints close ranks)
             return true;
         }
     }

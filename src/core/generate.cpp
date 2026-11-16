@@ -12,6 +12,7 @@ namespace Bakugan {
     void App::StartAuto(bool scoreOnly) {
         if (m_AutoJob.Busy()) return;
         if (m_SuiteJob.Busy()) { m_Status = "A test suite is running: wait for it or stop it first."; return; }
+        if (m_FinishJob.Busy()) { m_Status = "A finishing pass is running: wait for it or stop it first."; return; }
         if (!m_HasReference) {
             m_Status = "Load the mesh to fit as the reference mesh first (Model tab > Reference mesh).";
             return;
@@ -21,6 +22,7 @@ namespace Bakugan {
         auto mesh = std::make_shared<const TriMesh>(Utils::ModelToTriMesh(m_Reference, ReferenceMatrix()));
         if (mesh->indices.empty()) { m_Status = "The reference mesh has no triangles to fit."; return; }
         AutoParams p = m_AutoParams;
+        p.gpu = m_AutoUseGpu && m_Gpu->Ok() ? m_Gpu : nullptr;
         if (scoreOnly) p.steps = 0;      // only score the current design (against the mesh where it is)
         Design start = m_Design;
         m_AutoLive = std::make_shared<AutoLive>();
@@ -98,6 +100,8 @@ namespace Bakugan {
         if (!r.ok) return;
         m_AutoScore = r.score;
         m_HasAutoScore = r.score.valid;
+        m_AutoChecked = r.checked;
+        m_HasAutoChecked = true;
         if (m_AutoScoreOnly) {
             m_AutoScoreFor = m_Design;
             return;
@@ -115,8 +119,42 @@ namespace Bakugan {
             m_Status += " The reference mesh shows where it was compared (moved and scaled); its own placement is unchanged.";
     }
 
+    // ---- finishing passes ------------------------------------------------------------------------------------------------
+
+    void App::StartFinish(Finish what) {
+        if (m_FinishJob.Busy() || m_AutoJob.Busy() || m_SuiteJob.Busy()) return;
+        if (m_Design.hinges.empty()) { m_Status = "Nothing to finish: the design has no hinges."; return; }
+        Design d = m_Design;
+        const AutoParams& p = m_AutoParams;
+        if (what == Finish::Carve) {
+            CarveParams q = p.carve;
+            m_FinishJob.Start([d, q](JobControl& c) { c.SetStage("Carving collisions away"); return CarveCollisions(d, q, &c); });
+        } else if (what == Finish::Ledges) {
+            LedgeParams q = p.ledges;
+            m_FinishJob.Start([d, q](JobControl& c) { c.SetStage("Adding ledges"); return AddLedges(d, q, &c); });
+        } else {
+            LatchParams q = p.latch;
+            q.hinge = m_Sel.hinge;           // the selected hinge, or (none selected) the first to open
+            m_FinishJob.Start([d, q](JobControl& c) { c.SetStage("Adding the latch"); return AddLatch(d, q, &c); });
+        }
+        m_BuildJob.Cancel();
+        m_SweepJob.Cancel();
+        m_Status = "Finishing...";
+    }
+
+    void App::PollFinish() {
+        FinishResult r;
+        if (!m_FinishJob.Poll(&r)) return;
+        m_Status = r.message;
+        if (!r.ok) return;
+        m_Design = r.design;                 // (one undo step: Ctrl+Z brings back the design from before)
+        m_HasSweep = false;
+        SanitizeSelection();
+    }
+
     void App::ClearAutoScore() {
         m_HasAutoScore = false;
+        m_HasAutoChecked = false;
         m_AutoHistory.clear();
         if (m_HasAutoViews) UnloadTexture(m_AutoViews);
         m_HasAutoViews = false;
@@ -150,6 +188,7 @@ namespace Bakugan {
         SuiteParams p = m_SuiteParams;
         p.folder = folder;
         p.generate = m_AutoParams;
+        p.generate.gpu = m_AutoUseGpu && m_Gpu->Ok() ? m_Gpu : nullptr;
         m_SuiteLive = std::make_shared<SuiteLive>();
         std::shared_ptr<SuiteLive> live = m_SuiteLive;
         m_SuiteStart = GetTime();

@@ -14,10 +14,17 @@
 // DINOv3's embeddings (global, patch, or a mix). DINOv3 gives d loss / d pixel; a pixel depends on the design through
 // its soft edges (as silhouettes do) and through the shade of the surface its ray hits.
 //
-// Collisions. Pieces overlapping each other in the open pose and motionChecks poses between, placed where joints are
-// moving (CheckTimes). Per pose: the depth of the overlap integrated over its volume, relative to the sphere's volume
-// times 2% of the mesh's size; the total adds the open pose's and the mean of the poses between. (Closed, the pieces
-// fill the sphere side by side: nothing to check.)
+// Collisions. Pieces overlapping each other in the open pose, and in hingeChecks poses of every hinge's turn, spread
+// evenly over its angle (data/clash.hpp): a turn is looked at as closely whether it takes all of the motion or a
+// twentieth of it, and each evaluation can look between the last one's poses (its phase). Per pose, every two pieces
+// that move against each other there are sampled where they can meet; a point inside both costs its depth, and as
+// much as 2% of the mesh's size on top once it is deeper than a quarter of that (so shallow overlaps cost steeply
+// too, not next to nothing). Over the sphere's volume times 2% of the mesh's size; the total adds the open pose's and
+// every hinge's mean over its poses. (Closed, the pieces fill the sphere side by side: nothing to check.)
+//
+// Dependencies (when asked for). Every hinge after the first to open should have a piece near the one it turns that
+// could hold it shut: one that is not carried by the hinge and moves away from the hinge's parent before its turn.
+// The term is how far the nearest such piece is, along the sphere's surface.
 //
 // Hinges. A joint's pivot should be on (or in) both pieces it joins: how far it is outside each, beyond 1% of the
 // mesh's size, adds up over the joints, relative to the mesh's size.
@@ -39,11 +46,6 @@
 #include <string>
 
 namespace Bakugan {
-    // Where in the closing motion (0 open .. 1 closed) the poses between are checked for collisions: only where at
-    // least one hinge is moving, half spread evenly over those times and half by how many hinges move at once (bias
-    // says how much). n of them, at evenly spaced quantiles, so they move smoothly as the hinges' timing changes.
-    std::vector<float> CheckTimes(const Design& d, int n, float bias);
-
     class Dino;
 
     class Loss {
@@ -62,9 +64,19 @@ namespace Bakugan {
 
         // The loss of a carving, against the mesh placed by `target`. With grad: also d loss / d each of ps (the
         // carving's and the target's parameters), per unit of the parameter.
-        AutoScore Evaluate(const Carving& c, const Placement& target, const std::vector<Param>& ps = {}, std::vector<float>* grad = nullptr);
+        // phase (0..1) shifts where in each hinge's turn, and where in space, overlaps are looked for: a different one
+        // each step leaves nowhere for an overlap to hide between the checks; the same one compares like with like.
+        AutoScore Evaluate(const Carving& c, const Placement& target, const std::vector<Param>& ps = {}, std::vector<float>* grad = nullptr,
+                           float phase = 0.5f);
         // Any design's (no gradient): its open pose against the mesh, its motion, its hinges.
-        AutoScore Evaluate(const Design& d, const Placement& target);
+        AutoScore Evaluate(const Design& d, const Placement& target, float phase = 0.5f);
+        // The order to open an ordered carving's joints in (ids, first opens first). From closed, the joint whose turn
+        // overlaps least with everything as it then stands opens next: one that has to wait for another to get out of
+        // its way comes after it. With dependencies, among turns that are as free, one that can be held comes first.
+        std::vector<int> BestOrder(const Carving& c) const;
+        // Multiplies the collision weight from now on (the search raises it as it goes: AutoParams::collisionRamp).
+        void SetCollisionScale(float scale) { m_CollisionScale = scale; }
+        float CollisionWeight() const { return m_P.collisionWeight * m_CollisionScale; }
         // The placement kept where the views see all of the mesh, and its scale within 0.3x .. 3.3x.
         Placement KeepTargetInFrame(Placement t) const;
 
@@ -92,7 +104,8 @@ namespace Bakugan {
             std::vector<BodyField> fields;
             std::vector<int> group;              // each field's body (group index)
             std::vector<BoundingBox> box;        // design pose
-            std::vector<float> times;            // the poses: 0 (open), then the checks between
+            std::vector<float> times;            // the poses: 0 (open), then the checks between (then closed, for dependencies)
+            std::vector<int> hinge;              // per pose: the hinge (index) whose turn it checks; -1: open; -2: closed
             std::vector<std::vector<Rigid>> xf;  // per pose, per group index
             std::vector<int> fieldOf;            // per group index: its field (-1: none)
         };
@@ -113,10 +126,25 @@ namespace Bakugan {
         };
         using Shades = std::vector<std::vector<Shade>>;   // per field
 
-        AutoScore Score(const Design& d, Bodies& b, const Placement& target, Slopes* slopes, Shades* shades);
+        AutoScore Score(const Design& d, Bodies& b, const Placement& target, Slopes* slopes, Shades* shades, float phase);
         void Silhouettes(const Bodies& b, AutoScore& s, Slopes& slopes);
+        // The open pose drawn: per pixel the piece that covers it most (-1: none), its coverage, and where its ray
+        // comes closest to it. On the GPU when there is a tracer (and it works), on every core otherwise.
+        void Draw(const Bodies& b, std::vector<int>& who, std::vector<Vector3>& at, bool* traced);
+        bool DrawTraced(const Bodies& b, std::vector<int>& who, std::vector<Vector3>& at);
+        Vector3 RayStart(const BoundingBox& box, const View& w, float sx, float sy) const;
         float FitLoss(const std::vector<std::vector<float>>& target) const;   // the silhouettes' part, against these targets
-        void Collisions(const Bodies& b, AutoScore& s, Slopes& slopes);
+        void Collisions(const Design& d, const Bodies& b, AutoScore& s, Slopes& slopes, float phase);
+        // What one sample inside two pieces costs, and its slope against its depth.
+        float ClashCost(float depth, float* slope) const;
+        // Which piece (field) every point just under the sphere's surface belongs to (-1: none, a hollow).
+        std::vector<int> SurfaceOwners(const Bodies& b) const;
+        // The nearest piece that could hold hinge h shut, given the hinges that open before it: how far along the
+        // surface (mm; FLT_MAX: there is none), and the two surface points (indices) it is measured between.
+        float HoldGap(const Design& d, const Bodies& b, const std::vector<std::vector<char>>& under, const std::vector<int>& owner, int h,
+                      const std::vector<int>& earlier, int* from = nullptr, int* to = nullptr) const;
+        void Dependencies(const Design& d, const Bodies& b, AutoScore& s, Slopes& slopes);
+        float SurfaceSpacing() const;
         void Hinges(const Design& d, const Bodies& b, AutoScore& s) const;
         float PivotGap(const BodyField& f, Vector3 pivot) const { return fmaxf(0.0f, f.Distance(pivot) - 0.01f * m_L); }
         float SurfaceTerm(const Carving& c, float* carved = nullptr) const;
@@ -144,6 +172,7 @@ namespace Bakugan {
         float ShadeAt(const BodyField& f, const Rigid& xf, const Shade& sh) const;
     private:
         AutoParams m_P;
+        float m_CollisionScale = 1.0f;
         float m_L = 1.0f;
         Vector3 m_Centre = { 0, 0, 0 };  // of the frame every view shows
         float m_Half = 1.0f;             // the frame is 2·half across

@@ -2,8 +2,10 @@
 #include "util/structs.hpp"
 #include "ui/viewport.hpp"
 #include "ui/raymarch.hpp"
+#include "ui/gputrace.hpp"
 #include "data/build.hpp"
 #include "data/collide.hpp"
+#include "data/finish.hpp"
 #include "autodesign/autodesign.hpp"
 #include "autodesign/suite.hpp"
 #include <functional>
@@ -142,6 +144,9 @@ namespace Bakugan {
         void PollSuite();
         void BrowseSuiteFolder();
         void Notify();                               // plays notification.mp3, if there is one
+        enum class Finish { Carve, Ledges, Latch };
+        void StartFinish(Finish what);               // a finishing pass (data/finish.hpp) on the design as it is
+        void PollFinish();
 
         // generatetab.cpp: the Generate tab, section by section
         void DrawGenerateTab();
@@ -151,6 +156,7 @@ namespace Bakugan {
         void GenerateStart();
         void GenerateOptimizer();
         void GenerateGrammar();
+        void GenerateFinish();
         void GenerateRun();
         void GenerateScore();
         void GenerateTimeline();
@@ -258,6 +264,13 @@ namespace Bakugan {
         bool m_ShowAutoSphere = true;
         std::vector<float> m_AutoHistory;
         double m_AutoStart = 0.0;
+        MotionOverlap m_AutoChecked;                  // the last result's motion, checked densely
+        bool m_HasAutoChecked = false;
+        std::shared_ptr<GpuSilhouettes> m_Gpu;        // draws the generator's silhouettes with this thread's GL context
+        bool m_AutoUseGpu = false;
+
+        // finishing passes on the current design (Generate tab)
+        Job<FinishResult> m_FinishJob;
 
         // test suite (Generate tab)
         Job<SuiteResult> m_SuiteJob;

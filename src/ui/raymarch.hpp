@@ -15,6 +15,9 @@ namespace Bakugan {
         // Same map, but each pixel evaluates it at a point read from a float texture (for checking against the CPU).
         std::string ProbeFragmentSource(const std::string& mapBody, int uniforms);
         const char* ProbeVertexSource();
+        // Same map, marched the way the generator draws its silhouettes (ui/gputrace.cpp).
+        std::string TraceFragmentSource(const std::string& mapBody, int uniforms);
+        const char* TraceVertexSource();
         // One superfrustum on its own (the design view's shapes).
         std::string ShapeMap();
         void ShapeParams(const SuperFrustum& f, std::vector<Vector4>* U);

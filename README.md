@@ -37,6 +37,20 @@ exported or collision-checked.
 The closing motion is re-checked after every edit: each body's surface is tested against every other body's signed
 distance field at evenly spaced moments (Hinges tab: *Checks*, *Tolerance*).
 
+## Generate
+
+The Generate tab carves a sphere into hinged pieces that, opened, look like the reference mesh (`src/autodesign/README.md`
+has the details). For something that can be printed and played with:
+
+- **Collisions**: every hinge's turn is checked at the same number of poses however fast it turns, and the hinges open
+  one at a time, the freest first. *... by the end* is how much more overlaps cost at the end of the search.
+- **Hinges hold each other shut**: every hinge but the first to open is held by a piece that moves away before its
+  turn (small ledges cut from the sphere's surface). One hinge then keeps the design closed.
+- **Finishing**: *Carve collisions away* cuts out whatever still overlaps on the way; *Latch* puts a press latch, flush
+  with the sphere, on the first hinge. Both run when a search is done, or on the current design with the buttons.
+- **Draw the silhouettes on the GPU** (Optimizer): the search's views are raymarched by the graphics card. The editor
+  redraws only a dozen times a second while it runs.
+
 ## Keys
 
 | | |
