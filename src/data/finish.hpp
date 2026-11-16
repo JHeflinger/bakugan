@@ -4,6 +4,9 @@
 //
 //   CarveCollisions   wherever two bodies still run into each other on the way between open and closed, the overlap
 //                     is cut out of one of them (the one it shows less on, closed).
+//   AddHinges         the hinges themselves: each axis gets the smallest barrel that can be printed (three knuckles on
+//                     a printed-in-place pin), put where both of its bodies are along the axis and, for a carved
+//                     sphere, far enough under the surface to be inside it.
 //   AddLedges         every hinge but the first to open gets a small ledge of a piece that moves away earlier, lying
 //                     over the piece the hinge turns: it can't open until that piece has. So one hinge holds the whole
 //                     design shut, and letting it go lets the rest unfurl in turn.
@@ -39,6 +42,29 @@ namespace Bakugan {
         float reach = 0.0f;              // mm of another piece's surface a ledge may cross to get there (0: 35% of the radius)
     };
 
+    struct HingeParams {
+        int hinge = -1;                  // hinge id (-1: every hinge)
+        float scale = 1.0f;              // its size, against the smallest that prints (a 1.6 mm pin in a 3.8 mm barrel)
+        float clearance = 0.3f;          // mm between the pin and the knuckles around it, and between knuckles
+        float reach = 0.0f;              // mm a body may be from the axis and still be joined to its knuckles, by a
+                                         // leaf that long (0: 1.2 mm at the default size, just enough to tie them in)
+        bool flush = true;               // a carved sphere: the axis goes far enough under the surface for the barrel
+                                         // to be inside the sphere (it moves, so the motion changes a little near it)
+        PinStyle pin = PinStyle::Fused;  // printed in place; or a separate pin (flush: with a channel to push it in by)
+    };
+
+    // The hardware AddHinges builds, for a sphere of this radius (0: not a carved sphere).
+    struct HingeSizes {
+        float pinRadius = 0.0f, radius = 0.0f, clearance = 0.0f;
+        int knuckles = 3;
+        float length = 0.0f;             // along the axis
+        float leafLength = 0.0f, leafThickness = 0.0f;
+        float pivotRadius = 0.0f;        // flush: the farthest from the sphere's centre the middle of the axis can be
+        float relief = 0.0f;             // flush: within this of the axis, its two bodies are in each other's way as
+                                         // they turn (the axis being under the seam); AddHinges cuts that room
+    };
+    HingeSizes PlanHinge(float sphereRadius, const HingeParams& p);
+
     struct LatchParams {
         int hinge = -1;                  // hinge id (-1: the first to open)
         float scale = 1.0f;              // its size, against the default for the sphere
@@ -58,9 +84,14 @@ namespace Bakugan {
         int held = 0;                    // ... of them, those that now are
         int root = -1;                   // the hinge that opens first (id)
         std::vector<std::string> unheld; // the names of the rest
+        // AddHinges
+        int built = 0;                   // hinges that got hardware
+        int relieved = 0;                // cuts that make room next to them
+        float moved = 0.0f;              // the farthest an axis was moved (mm)
     };
 
     FinishResult CarveCollisions(const Design& d, const CarveParams& p, JobControl* c = nullptr);
+    FinishResult AddHinges(const Design& d, const HingeParams& p, JobControl* c = nullptr);
     FinishResult AddLedges(const Design& d, const LedgeParams& p, JobControl* c = nullptr);
     FinishResult AddLatch(const Design& d, const LatchParams& p, JobControl* c = nullptr);
 

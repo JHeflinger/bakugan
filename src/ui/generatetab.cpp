@@ -105,8 +105,10 @@ namespace Bakugan {
                                   "set into a groove (auto: 35%% of the sphere's radius)");
         }
         ImGui::SliderFloat("Hinges on pieces", &p.hingeWeight, 0.0f, 10.0f, p.hingeWeight > 0.0f ? "%.2f" : "ignored");
-        ImGui::SetItemTooltip("What a joint's pivot being away from the two pieces it joins costs: how far it is outside\n"
-                              "each, beyond 1%% of the mesh's size, over the mesh's size. A real hinge sits where its pieces meet.");
+        ImGui::SetItemTooltip("What a hinge being away from the two pieces it joins costs: how far each is from its axis, along\n"
+                              "the length a hinge's barrel takes up there, beyond half of what a leaf can bridge (Finishing: Hinge reach).\n"
+                              "A real hinge sits where its pieces meet. It is also what limits the search most: with it ignored,\n"
+                              "axes go wherever the pieces swing clear of each other, which no hinge could be built on.");
         ImGui::SliderFloat("Keep the surface", &p.surfaceWeight, 0.0f, 10.0f, p.surfaceWeight > 0.0f ? "%.2f" : "ignored");
         ImGui::SetItemTooltip("What hollows carving into the sphere's surface cost (about the share of the surface carved away).\n"
                               "Hollows take material out from inside the sphere; this keeps its outside whole, closed.");
@@ -262,6 +264,33 @@ namespace Bakugan {
         ImGui::SeparatorText("Finishing");
         bool busy = m_AutoJob.Busy() || m_SuiteJob.Busy() || m_FinishJob.Busy();
         ImGui::BeginDisabled(busy);
+        ImGui::Checkbox("Build the hinges when done", &p.buildHinges);
+        ImGui::SetItemTooltip("Give every hinge the smallest barrel that prints: three knuckles on a pin, where both of its pieces\n"
+                              "are along the axis. The search then keeps each axis where such a hinge fits, and (under the\n"
+                              "surface) checks collisions with the axis where it will be.");
+        ImGui::Checkbox("Hinges under the surface", &p.hinges.flush);
+        ImGui::SetItemTooltip("Each axis far enough under the sphere's surface for its barrel to be inside the sphere, so the closed\n"
+                              "sphere stays round. Off: the barrel is on the axis wherever that is, and sticks out if it is at\n"
+                              "the surface. On an existing design this moves the axes inward: carve collisions away afterwards.");
+        ImGui::SliderFloat("Hinge size", &p.hinges.scale, 0.75f, 2.5f, "x %.2f");
+        {
+            HingeSizes sz = PlanHinge(0.0f, p.hinges);
+            ImGui::SetItemTooltip("Now: a %.1f mm pin in a %.1f mm barrel, %.1f mm long", 2.0f * sz.pinRadius, 2.0f * sz.radius, sz.length);
+        }
+        ImGui::SliderFloat("Hinge reach", &p.hinges.reach, 0.0f, 8.0f, p.hinges.reach > 0.0f ? "%.1f mm" : "smallest");
+        ImGui::SetItemTooltip("How far a piece may be from a hinge's axis and still be joined to it, by a leaf that long. The search\n"
+                              "counts a hinge as on its pieces within this ('Hinges on pieces'), so more reach leaves it freer\n"
+                              "where it puts the axes, at the price of longer leaves.");
+        ImGui::DragFloat("Hinge clearance", &p.hinges.clearance, 0.01f, 0.1f, 1.0f, "%.2f mm");
+        ImGui::SetItemTooltip("Between the pin and the knuckles around it, and between knuckles (what your printer needs between\n"
+                              "parts that must not fuse)");
+        {
+            int pin = p.hinges.pin == PinStyle::Fused ? 0 : 1;
+            if (ImGui::Combo("Hinge pin", &pin, "Printed in place\0Separate pin\0")) p.hinges.pin = pin == 0 ? PinStyle::Fused : PinStyle::Separate;
+            ImGui::SetItemTooltip("Printed in place: the pin is part of one piece and runs through the other's knuckle.\n"
+                                  "Separate: both are bored for a pin pushed in afterwards (under the surface, through a channel\n"
+                                  "cut from the pin's end out of the sphere).");
+        }
         ImGui::Checkbox("Carve collisions away when done", &p.carveWhenDone);
         ImGui::SetItemTooltip("Wherever two pieces still run into each other between open and closed, cut the overlap out of\n"
                               "one of them: the one it shows less on when the design is closed");
@@ -282,7 +311,10 @@ namespace Bakugan {
             return;
         }
         ImGui::BeginDisabled(busy || m_Design.hinges.empty());
-        float third = (ImGui::GetContentRegionAvail().x - 2.0f * ImGui::GetStyle().ItemSpacing.x) / 3.0f;
+        float third = (ImGui::GetContentRegionAvail().x - 3.0f * ImGui::GetStyle().ItemSpacing.x) / 4.0f;
+        if (ImGui::Button("Add hinges", ImVec2(third, 0))) StartFinish(Finish::Hinges);
+        ImGui::SetItemTooltip("Build the selected hinge's hardware, or every hinge's when none is selected (any design; Ctrl+Z undoes it)");
+        ImGui::SameLine();
         if (ImGui::Button("Carve now", ImVec2(third, 0))) StartFinish(Finish::Carve);
         ImGui::SetItemTooltip("Carve the current design's collisions away (any design; Ctrl+Z undoes it)");
         ImGui::SameLine();
@@ -397,7 +429,7 @@ namespace Bakugan {
         GenerateTimeline();
         ImVec4 pivotColor = s.hingeGap > 0.02f * Vector3Distance(ReferenceBounds().min, ReferenceBounds().max) ? Amber
                                                                                                              : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
-        ImGui::TextColored(pivotColor, "Farthest pivot %.1f mm outside one of its pieces", fmaxf(s.hingeGap, 0.0f));
+        ImGui::TextColored(pivotColor, "Farthest hinge %.1f mm off one of its pieces", fmaxf(s.hingeGap, 0.0f));
         ImGui::TextColored(s.surfaceCarved > 0.02f ? Amber : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled), "Sphere surface carved: %.1f%%",
                            s.surfaceCarved * 100.0f);
         ImGui::SetItemTooltip("The share of the sphere's surface hollows reach (closed, it shows there)");
@@ -408,7 +440,7 @@ namespace Bakugan {
                               "Fit: the mean over the views of the share of the mesh missed plus the share of extra pixels.\n"
                               "Collisions: overlap depth over its volume, against the sphere's volume (times how far the\n"
                               "search had raised their cost when this was scored).\n"
-                              "Hinges: how far pivots are outside their pieces (beyond 1%% of the mesh's size), over its size.");
+                              "Hinges: how far each hinge's pieces are from its axis, along the length its barrel takes up, over the mesh's size.");
         ImGui::TextDisabled("sphere %.1f mm across; mesh moved %.1f mm, scaled %.2fx", s.radius * 2.0f, Vector3Length(s.target.offset), s.target.scale);
         if (m_AutoHistory.size() > 1) {
             auto [lo, hi] = std::minmax_element(m_AutoHistory.begin(), m_AutoHistory.end());

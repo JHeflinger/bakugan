@@ -144,7 +144,7 @@ namespace Bakugan {
         void PollSuite();
         void BrowseSuiteFolder();
         void Notify();                               // plays notification.mp3, if there is one
-        enum class Finish { Carve, Ledges, Latch };
+        enum class Finish { Hinges, Carve, Ledges, Latch };
         void StartFinish(Finish what);               // a finishing pass (data/finish.hpp) on the design as it is
         void PollFinish();
 

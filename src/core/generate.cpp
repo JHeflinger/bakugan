@@ -126,7 +126,11 @@ namespace Bakugan {
         if (m_Design.hinges.empty()) { m_Status = "Nothing to finish: the design has no hinges."; return; }
         Design d = m_Design;
         const AutoParams& p = m_AutoParams;
-        if (what == Finish::Carve) {
+        if (what == Finish::Hinges) {
+            HingeParams q = p.hinges;
+            q.hinge = m_Sel.hinge;           // the selected hinge, or (none selected) all of them
+            m_FinishJob.Start([d, q](JobControl& c) { c.SetStage("Building the hinges"); return AddHinges(d, q, &c); });
+        } else if (what == Finish::Carve) {
             CarveParams q = p.carve;
             m_FinishJob.Start([d, q](JobControl& c) { c.SetStage("Carving collisions away"); return CarveCollisions(d, q, &c); });
         } else if (what == Finish::Ledges) {

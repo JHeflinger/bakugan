@@ -81,6 +81,7 @@ namespace Bakugan {
         m_MeshCentre = closed ? Vector3Add(m_Centre, Vector3Scale(moment, (float)(1.0 / volume))) : m_Centre;
         m_SphereCentre = m_MeshCentre;
         m_SphereRadius = p.sphereDiameter > 0.0f ? 0.5f * p.sphereDiameter : (closed ? (float)cbrt(3.0 * fabs(volume) / (4.0 * PI)) : 0.25f * m_L);
+        m_Hinge = PlanHinge(m_SphereRadius, p.hinges);
         m_MeshReach = 0.0f;
         for (unsigned i : mesh.indices) m_MeshReach = fmaxf(m_MeshReach, Vector3Distance(mesh.positions[i], m_MeshCentre));
 
@@ -319,7 +320,7 @@ namespace Bakugan {
         Hinges(d, b, s);
         if (m_P.dependencies) Dependencies(d, b, s, slopes);
         s.total = std::max(0.0f, m_P.silhouetteWeight) * (s.fit + s.coveragePenalty) + (m_Dino ? m_P.semanticWeight * s.semantic : 0.0f) +
-                  CollisionWeight() * s.collision + m_P.hingeWeight * s.hinges + (m_P.dependencies ? m_P.dependencyWeight * s.dependency : 0.0f);
+                  CollisionWeight() * s.collision + HingeWeight() * s.hinges + (m_P.dependencies ? m_P.dependencyWeight * s.dependency : 0.0f);
         s.collisionScale = m_CollisionScale;
         s.valid = true;
         if (slopesOut) *slopesOut = std::move(slopes);
@@ -528,8 +529,21 @@ namespace Bakugan {
             Clash clash;
             SampleOverlap({ &b.fields[pr.a], b.box[pr.a], b.xf[pr.pose][b.group[pr.a]] }, { &b.fields[pr.c], b.box[pr.c], b.xf[pr.pose][b.group[pr.c]] },
                           cell, jitter, &clash, true);
-            pr.volume = clash.volume;
+            // next to a hinge that will be built under the surface, its two pieces are in each other's way as they turn,
+            // whatever their shapes: AddHinges cuts that room (HingeSizes::relief), so it isn't a collision here
+            const Hinge* joint = nullptr;
+            if (m_P.buildHinges && m_Hinge.relief > 0.0f)
+                for (const Hinge& h : d.hinges) {
+                    const int ia = d.groups[b.group[pr.a]].id, ic = d.groups[b.group[pr.c]].id;
+                    if ((h.parent == ia && h.child == ic) || (h.child == ia && h.parent == ic)) joint = &h;
+                }
+            pr.volume = joint ? 0.0 : clash.volume;
             for (const OverlapSample& sm : clash.samples) {
+                if (joint) {
+                    const Vector3 a = Vector3Normalize(joint->axis), q = Vector3Subtract(b.xf[pr.pose][b.group[pr.a]].ApplyInverse(sm.at), joint->pivot);
+                    if (Vector3Length(Vector3Subtract(q, Vector3Scale(a, Vector3DotProduct(q, a)))) < m_Hinge.relief) continue;
+                    pr.volume += sm.volume;
+                }
                 float slope;
                 pr.cost += (double)ClashCost(sm.depth, &slope) * sm.volume;
                 // d loss / d distance = -weight · poseWeight · slope · volume / norm (the distance is minus the depth)
@@ -739,9 +753,24 @@ namespace Bakugan {
             int pg = d.GroupIndex(h.parent), cg = d.GroupIndex(h.child);
             int pi = pg >= 0 ? b.fieldOf[pg] : -1, ci = cg >= 0 ? b.fieldOf[cg] : -1;
             if (pi < 0 || ci < 0) continue;
-            s.hinges += (PivotGap(b.fields[pi], h.pivot) + PivotGap(b.fields[ci], h.pivot)) / m_L;
-            s.hingeGap = fmaxf(s.hingeGap, fmaxf(b.fields[pi].Distance(h.pivot), b.fields[ci].Distance(h.pivot)));
+            float farthest = 0.0f;
+            s.hinges += HingeCost(h, b.fields[pi], b.fields[ci], &farthest);
+            s.hingeGap = fmaxf(s.hingeGap, farthest);
         }
+    }
+
+    float Loss::HingeCost(const Hinge& h, const BodyField& parent, const BodyField& child, float* farthest) const {
+        const Vector3 a = Vector3Normalize(h.axis);
+        const float half = 0.5f * m_Hinge.length, slack = HingeSlack();
+        float sum = 0.0f;
+        for (float w : { -half, 0.0f, half }) {
+            Vector3 q = Vector3Add(h.pivot, Vector3Scale(a, w));
+            float dp = parent.Distance(q), dc = child.Distance(q);
+            sum += (fmaxf(0.0f, dp - slack) + fmaxf(0.0f, dc - slack)) / 3.0f;
+            if (farthest) *farthest = fmaxf(*farthest, fmaxf(dp, dc));
+        }
+        if (m_P.buildHinges && m_P.hinges.flush) sum += fmaxf(0.0f, Vector3Distance(h.pivot, m_SphereCentre) - m_Hinge.pivotRadius);
+        return sum / m_L;
     }
 
     // ---- the surface --------------------------------------------------------------------------------------------------------
@@ -833,9 +862,9 @@ namespace Bakugan {
                         int pg = de.GroupIndex(h.parent), cg = de.GroupIndex(h.child);
                         int pi = pg >= 0 ? b.fieldOf[pg] : -1, ci = cg >= 0 ? b.fieldOf[cg] : -1;
                         if (pi < 0 || ci < 0) continue;
-                        bool pivotMoves = p.kind == Param::Joint && h.name == "Joint " + std::to_string(p.id) && p.field < 3;
+                        bool pivotMoves = p.kind == Param::Joint && h.name == "Joint " + std::to_string(p.id) && p.field < 6;   // pivot or axis
                         if (!pivotMoves && changedOf[pi] < 0 && changedOf[ci] < 0) continue;
-                        sum[side] += m_P.hingeWeight * (PivotGap(field(pi), h.pivot) + PivotGap(field(ci), h.pivot)) / m_L;
+                        sum[side] += HingeWeight() * HingeCost(h, field(pi), field(ci));
                     }
             }
             float step = value[0] - value[1];

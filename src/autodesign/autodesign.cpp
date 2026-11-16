@@ -223,6 +223,7 @@ namespace Bakugan {
             if (!f.message.empty()) finished += " " + f.message;
         };
         if (bestScore.valid && best.joints.size() > 0) {
+            if (p.buildHinges) finish("Building the hinges", [&] { return AddHinges(design, p.hinges, &c); });
             if (p.dependencies) finish("Adding ledges", [&] { return AddLedges(design, p.ledges, &c); });
             if (p.carveWhenDone) finish("Carving collisions away", [&] { return CarveCollisions(design, p.carve, &c); });
             if (p.latchWhenDone) finish("Adding the latch", [&] { return AddLatch(design, p.latch, &c); });

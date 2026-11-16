@@ -403,7 +403,15 @@ namespace Bakugan {
         }
     }
 
-    FinishResult CarveCollisions(const Design& in, const CarveParams& p, JobControl* c) {
+    namespace {
+        FinishResult Carve(const Design& in, const CarveParams& p, JobControl* c, float nearHinges);
+    }
+
+    FinishResult CarveCollisions(const Design& in, const CarveParams& p, JobControl* c) { return Carve(in, p, c, 0.0f); }
+
+    namespace {
+    // nearHinges > 0: only what two bodies joined by a hinge with hardware share within that distance of its axis.
+    FinishResult Carve(const Design& in, const CarveParams& p, JobControl* c, float nearHinges) {
         FinishResult r;
         r.design = in;
         Design d = in;
@@ -423,9 +431,21 @@ namespace Bakugan {
             std::vector<MotionCheck> checks = HingeChecks(d, p.checksPerHinge, fmodf(0.5f + 0.6180339887f * round, 1.0f));
             checks.insert(checks.begin(), MotionCheck{ 0.0f, -1, 0.0f });
             std::vector<Rigid> closed = d.Transforms(1.0f, true);
+            bool anyHardware = false;
+            for (const Hinge& h : d.hinges) anyHardware |= h.hardware;
+            // the bodies without their hinges' hardware (cuts don't reach hardware), and every hinge's knuckles
+            BodySet bare;
+            std::vector<std::vector<Knuckle>> knuckles(d.hinges.size());
+            if (anyHardware) {
+                Design plain = d;
+                for (Hinge& h : plain.hinges) h.hardware = false;
+                bare = MakeBodySet(plain, cell);
+                for (size_t h = 0; h < d.hinges.size(); h++) knuckles[h] = d.Knuckles((int)h);
+            }
             // what overlaps, per pair of bodies, as points of each of the two (in its own frame)
             struct Found {
                 std::vector<Spot> a, b;
+                std::vector<Spot> onlyA, onlyB;          // inside the other's hinge hardware (which no cut reaches): this one gives way
                 double shownA = 0.0, shownB = 0.0;       // the volume that is near the closed surface, in each
             };
             std::map<std::pair<int, int>, Found> found;
@@ -447,6 +467,40 @@ namespace Bakugan {
                         Found& f = found[{ i, j }];
                         for (const OverlapSample& s : clash.samples) {
                             Vector3 la = xa.ApplyInverse(s.at), lb = xb.ApplyInverse(s.at);
+                            if (nearHinges > 0.0f) {
+                                bool near = false;
+                                for (const Hinge& h : d.hinges) {
+                                    if (!h.hardware) continue;
+                                    const int ia = d.groups[set.group[i]].id, ib = d.groups[set.group[j]].id;
+                                    if (!(h.parent == ia && h.child == ib) && !(h.child == ia && h.parent == ib)) continue;
+                                    const Vector3 a = Vector3Normalize(h.axis), q = Vector3Subtract(la, h.pivot);
+                                    near |= Vector3Length(Vector3Subtract(q, Vector3Scale(a, Vector3DotProduct(q, a)))) < nearHinges;
+                                }
+                                if (!near) continue;
+                            }
+                            if (anyHardware) {
+                                // in a body's hardware: in the body, but not in what it is without hardware
+                                bool hardA = bare.fields[i].Distance(la) > 0.0f, hardB = bare.fields[j].Distance(lb) > 0.0f;
+                                if (hardA && hardB) continue;                            // hardware in hardware: nothing to carve
+                                if (hardA) { f.onlyB.push_back({ lb, s.volume }); continue; }
+                                if (hardB) { f.onlyA.push_back({ la, s.volume }); continue; }
+                                // next to the hinge that joins the two: along one's knuckle, the other gives way (what
+                                // is cut around a body's own knuckle would cut it loose)
+                                int giving = -1;
+                                for (const Hinge& h : d.hinges) {
+                                    if (!h.hardware) continue;
+                                    const bool aParent = h.parent == d.groups[set.group[i]].id && h.child == d.groups[set.group[j]].id;
+                                    const bool aChild = h.child == d.groups[set.group[i]].id && h.parent == d.groups[set.group[j]].id;
+                                    if (!aParent && !aChild) continue;
+                                    const Vector3 a = Vector3Normalize(h.axis), q = Vector3Subtract(la, h.pivot);
+                                    const float z = Vector3DotProduct(q, a);
+                                    if (Vector3Length(Vector3Subtract(q, Vector3Scale(a, z))) > h.leafLength + 1.0f) continue;
+                                    for (const Knuckle& k : knuckles[&h - d.hinges.data()])
+                                        if (!k.removed && z > k.lo - h.clearance && z < k.hi + h.clearance) giving = k.child == aChild ? 1 : 0;   // 1: B gives way
+                                }
+                                if (giving == 1) { f.onlyB.push_back({ lb, s.volume }); continue; }
+                                if (giving == 0) { f.onlyA.push_back({ la, s.volume }); continue; }
+                            }
                             f.a.push_back({ la, s.volume });
                             f.b.push_back({ lb, s.volume });
                             if (sp.ok) {
@@ -466,11 +520,17 @@ namespace Bakugan {
             for (auto& [pair, f] : found) {
                 // carved from the one it shows less on when closed (the same: from the second, usually the smaller)
                 bool fromA = f.shownA < f.shownB;
-                int body = d.groups[set.group[fromA ? pair.first : pair.second]].id;
-                for (const SuperFrustum& s : CoverPatches(fromA ? f.a : f.b, cell, margin)) {
-                    d.AddShape(s, body, "Carved", Op::Cut);
-                    r.cuts++;
-                }
+                const int bodyA = d.groups[set.group[pair.first]].id, bodyB = d.groups[set.group[pair.second]].id;
+                auto carve = [&](const std::vector<Spot>& pts, int body) {
+                    if (pts.empty()) return;
+                    for (const SuperFrustum& s : CoverPatches(pts, cell, margin)) {
+                        d.AddShape(s, body, "Carved", Op::Cut);
+                        r.cuts++;
+                    }
+                };
+                carve(fromA ? f.a : f.b, fromA ? bodyA : bodyB);
+                carve(f.onlyA, bodyA);
+                carve(f.onlyB, bodyB);
             }
         }
         if (c) c->SetProgress(1.0f);
@@ -482,6 +542,241 @@ namespace Bakugan {
         r.design = d;
         r.message = Utils::Format("Carved %d cut%s where bodies ran into each other: %.1f mm3 overlapped at the worst pose, %.2f mm3 now.", r.cuts,
                                   r.cuts == 1 ? "" : "s", r.before, r.after);
+        return r;
+    }
+    }
+
+    // ---- hinges ---------------------------------------------------------------------------------------------------------------
+
+    // The smallest barrel that prints: a pin, the clearance around it, and a wall around that; three knuckles, each
+    // long enough to hold (the parent the outer two, the child the one between).
+    HingeSizes PlanHinge(float R, const HingeParams& p) {
+        HingeSizes s;
+        const float k = std::clamp(p.scale, 0.5f, 4.0f);
+        s.clearance = std::clamp(p.clearance, 0.1f, 1.0f);
+        s.pinRadius = fmaxf(0.6f, 0.8f * k);
+        s.radius = s.pinRadius + s.clearance + fmaxf(0.6f, 0.8f * k);
+        s.knuckles = 3;
+        s.length = 3.0f * fmaxf(1.6f, 2.0f * k) + 2.0f * s.clearance;
+        s.leafThickness = fmaxf(1.2f, 1.6f * k);
+        s.leafLength = s.radius + (p.reach > 0.0f ? p.reach : fmaxf(1.0f, 1.2f * k));
+        // flush: the barrel's ends are what comes nearest the surface
+        const float in = R - s.radius - 0.1f;
+        s.pivotRadius = R > 0.0f && p.flush ? sqrtf(fmaxf(0.0f, in * in - 0.25f * s.length * s.length)) : FLT_MAX;
+        s.relief = R > 0.0f && p.flush ? 2.0f * s.radius : 0.0f;
+        return s;
+    }
+
+    // Each hinge's hardware, sized by PlanHinge. Where along the axis: where both bodies are nearest it over the
+    // barrel's whole length (the pivot slides along its axis, which changes nothing about the motion). Flush, the
+    // axis also moves toward the sphere's centre until the barrel is inside the sphere: that does change the motion
+    // near the hinge, so the motion is checked before and after. Each body's leaf (a short plate tying its knuckles
+    // in) points where it finds the most of its own body and none of the other.
+    FinishResult AddHinges(const Design& in, const HingeParams& p, JobControl* c) {
+        FinishResult r;
+        r.design = in;
+        const SphereInfo sp = FindSphere(in);
+        const HingeSizes sz = PlanHinge(sp.ok ? sp.radius : 0.0f, p);
+        const bool flush = sp.ok && p.flush;
+        if (flush && sz.pivotRadius <= 0.0f) { r.message = "No hinges: the sphere is too small for a barrel this size inside it."; return r; }
+        // the bodies as they are without any hinge's hardware
+        Design bare = in;
+        for (Hinge& h : bare.hinges) h.hardware = false;
+        const BodySet set = MakeBodySet(bare, 0.5f);
+        BoundingBox bounds = in.Bounds();
+        const float cell = std::clamp(Vector3Distance(bounds.min, bounds.max) / 56.0f, 0.3f, 2.0f);
+        const MotionOverlap before = MeasureMotion(bare, 12, cell);
+        Design d = in;
+        std::vector<std::string> apart;
+        int asked = 0;
+        for (size_t h = 0; h < d.hinges.size(); h++) {
+            Hinge& hg = d.hinges[h];
+            if (p.hinge >= 0 && hg.id != p.hinge) continue;
+            if (c && c->Cancelled()) { r.cancelled = true; r.message = "Stopped."; return r; }
+            if (c) c->SetProgress(0.8f * h / d.hinges.size());
+            const int pg = d.GroupIndex(hg.parent), cg = d.GroupIndex(hg.child);
+            const int pf = pg >= 0 ? set.fieldOf[pg] : -1, cf = cg >= 0 ? set.fieldOf[cg] : -1;
+            if (pf < 0 || cf < 0) continue;
+            asked++;
+            const BodyField &parent = set.fields[pf], &child = set.fields[cf];
+            const Vector3 a = Vector3Normalize(hg.axis);
+            const float half = 0.5f * sz.length;
+            // the axis as a line: its point nearest the sphere's centre (or the pivot), and how far out that is
+            Vector3 mid = hg.pivot, out = { 0, 0, 0 };
+            float rho = 0.0f, u0 = 0.0f;
+            if (flush) {
+                u0 = -Vector3DotProduct(Vector3Subtract(sp.centre, hg.pivot), a);
+                mid = Vector3Subtract(hg.pivot, Vector3Scale(a, u0));
+                rho = Vector3Distance(mid, sp.centre);
+                out = rho > 1e-4f ? Vector3Scale(Vector3Subtract(mid, sp.centre), 1.0f / rho) : Utils::AnyPerpendicular(a);
+                mid = sp.centre;
+            }
+            // the barrel's middle at u along the axis (flush: on the line moved in as far as a barrel there needs)
+            const float in2 = (sp.radius - sz.radius - 0.1f) * (sp.radius - sz.radius - 0.1f);
+            auto at = [&](float u, float w) {
+                if (!flush) return Vector3Add(mid, Vector3Scale(a, u + w));
+                float most = sqrtf(fmaxf(0.0f, in2 - (fabsf(u) + half) * (fabsf(u) + half)));
+                return Vector3Add(mid, Vector3Add(Vector3Scale(out, fminf(rho, most)), Vector3Scale(a, u + w)));
+            };
+            // how far the worse of the two bodies is from the barrel's axis there, over its length
+            auto gap = [&](float u) {
+                float worst = -FLT_MAX;
+                for (float w : { -half, -0.5f * half, 0.0f, 0.5f * half, half }) {
+                    Vector3 q = at(u, w);
+                    worst = fmaxf(worst, fmaxf(parent.Distance(q), child.Distance(q)));
+                }
+                return worst;
+            };
+            const float reach = flush ? sqrtf(fmaxf(0.0f, in2)) - half : 2.0f * Vector3Distance(bounds.min, bounds.max);
+            float best = u0, bestCost = FLT_MAX, bestGap = FLT_MAX;
+            for (float u = -reach; u <= reach; u += 0.25f) {
+                float g = gap(u);
+                // on (or in) both is enough; of those places, the nearest to where the pivot is
+                float cost = fmaxf(g, 0.0f) + 0.02f * fabsf(u - u0);
+                if (cost < bestCost) { bestCost = cost; best = u; bestGap = g; }
+            }
+            if (bestCost == FLT_MAX) continue;
+            // a leaf bridges a little; farther apart than that and the two aren't joined there
+            if (bestGap > sz.leafLength - sz.radius) {
+                apart.push_back(Utils::Format("%s (%.1f mm from %s)", hg.name.c_str(), bestGap,
+                                              d.groups[parent.Distance(at(best, 0.0f)) > child.Distance(at(best, 0.0f)) ? pg : cg].name.c_str()));
+                continue;
+            }
+            const Vector3 pivot = at(best, 0.0f);
+            // how far the axis itself moved (sliding along it doesn't count)
+            Vector3 shift = Vector3Subtract(pivot, hg.pivot);
+            shift = Vector3Subtract(shift, Vector3Scale(a, Vector3DotProduct(shift, a)));
+            r.moved = fmaxf(r.moved, Vector3Length(shift));
+            hg.pivot = pivot;
+            hg.hardware = true;
+            hg.length = sz.length;
+            hg.radius = sz.radius;
+            hg.pinRadius = sz.pinRadius;
+            hg.clearance = sz.clearance;
+            hg.knuckles = sz.knuckles;
+            hg.swapKnuckles = false;
+            hg.removed = 0;
+            hg.pin = p.pin;
+            hg.headDiameter = 0.0f;
+            hg.leafLength = sz.leafLength;
+            hg.leafThickness = sz.leafThickness;
+            hg.autoLeaves = false;
+            // the leaves: for each body, the direction about the axis with the most of it and the least of the other
+            const Vector3 ref = Utils::AnyPerpendicular(a);
+            std::vector<Knuckle> knuckles = d.Knuckles((int)h);
+            for (int side = 0; side < 2; side++) {
+                const BodyField &own = side ? child : parent, &other = side ? parent : child;
+                float bestAngle = 0.0f, bestScore = -FLT_MAX;
+                for (int k = 0; k < 36; k++) {
+                    float angle = 2.0f * PI * k / 36;
+                    Vector3 leaf = Vector3RotateByQuaternion(ref, QuaternionFromAxisAngle(a, angle)), across = Vector3CrossProduct(a, leaf);
+                    float score = 0.0f;
+                    for (const Knuckle& kn : knuckles) {
+                        if (kn.child != (side == 1)) continue;
+                        for (float z : { kn.lo + 0.2f, 0.5f * (kn.lo + kn.hi), kn.hi - 0.2f })
+                            for (int i = 1; i <= 12; i++) {
+                                Vector3 q = Vector3Add(pivot, Vector3Add(Vector3Scale(a, z), Vector3Scale(leaf, sz.leafLength * ((i + 1) / 2) / 6.0f)));
+                                q = Vector3Add(q, Vector3Scale(across, (i % 2 ? 0.5f : -0.5f) * sz.leafThickness));      // along both of its faces
+                                if (flush && Vector3Distance(q, sp.centre) > sp.radius - 0.5f * sz.leafThickness) score -= 6.0f;
+                                else if (other.Distance(q) < 0.0f) score -= 3.0f;
+                                else if (own.Distance(q) < 0.0f) score += 1.0f;
+                            }
+                    }
+                    if (score > bestScore) { bestScore = score; bestAngle = angle; }
+                }
+                hg.leafAngle[side] = bestAngle;
+                // whatever of the other body is still where the leaf goes makes way for it
+                Frame f;
+                f.o = pivot;
+                f.z = a;
+                f.x = Vector3RotateByQuaternion(ref, QuaternionFromAxisAngle(a, bestAngle));
+                f.y = Vector3CrossProduct(f.z, f.x);
+                const float t = 0.5f * sz.leafThickness + sz.clearance;
+                for (const Knuckle& kn : knuckles) {
+                    if (kn.child != (side == 1)) continue;
+                    SuperFrustum room = BoxIn(f, 0.0f, sz.leafLength + sz.clearance, -t, t, kn.lo - sz.clearance, kn.hi + sz.clearance);
+                    if (Reaches(other, room, 0.0f)) d.AddShape(room, side ? hg.parent : hg.child, hg.name + " leaf room", Op::Cut);
+                    // ... and so does any other body's (the two bodies' own fields only clear each other's knuckles)
+                    for (size_t k = 0; k < set.fields.size(); k++)
+                        if ((int)k != pf && (int)k != cf && Reaches(set.fields[k], room, 0.0f))
+                            d.AddShape(room, d.groups[set.group[k]].id, hg.name + " leaf room", Op::Cut);
+                }
+            }
+            // a body the hinge doesn't join that is where its barrel goes makes way for that too
+            {
+                Frame f;
+                f.o = pivot;
+                f.z = a;
+                f.x = ref;
+                f.y = Vector3CrossProduct(a, ref);
+                const float w = sz.radius + sz.clearance;
+                SuperFrustum room = BoxIn(f, -w, w, -w, w, -half - sz.clearance, half + sz.clearance, 0.3f);
+                for (size_t k = 0; k < set.fields.size(); k++)
+                    if ((int)k != pf && (int)k != cf && Reaches(set.fields[k], room, 0.0f))
+                        d.AddShape(room, d.groups[set.group[k]].id, hg.name + " barrel room", Op::Cut);
+            }
+            // a separate pin under the surface: a channel from its head out of the sphere, to push it in by
+            if (flush && p.pin == PinStyle::Separate) {
+                float from = 0.0f, to = 0.0f, head = 0.0f;
+                d.PinHead((int)h, &from, &to, &head);
+                Frame f;
+                f.z = a;
+                f.x = ref;
+                f.y = Vector3CrossProduct(a, ref);
+                f.o = pivot;
+                const float w = head + sz.clearance;
+                SuperFrustum channel = BoxIn(f, -w, w, -w, w, to - 0.1f, to + 2.0f * sp.radius);
+                for (size_t k = 0; k < set.fields.size(); k++)
+                    if (Reaches(set.fields[k], channel, 0.2f)) d.AddShape(channel, d.groups[set.group[k]].id, hg.name + " pin channel", Op::Cut);
+            }
+            r.built++;
+        }
+        if (asked == 0) { r.message = "No hinges: no hinge joins two bodies with shapes."; return r; }
+        std::string rest;
+        for (size_t k = 0; k < apart.size(); k++) rest += (k ? ", " : " ") + apart[k];
+        if (r.built == 0) {
+            r.message = "No hinges built: the two bodies aren't both at the axis anywhere along it for" + rest + ".";
+            return r;
+        }
+        if (c) c->SetProgress(0.5f);
+        // under the surface, the two bodies of a hinge are in each other's way next to it as they turn: that room is cut
+        if (flush) {
+            CarveParams relief;
+            relief.checksPerHinge = 24;
+            relief.clearance = sz.clearance;
+            relief.rounds = 3;
+            FinishResult made = Carve(d, relief, nullptr, sz.relief);
+            if (made.ok) { d = made.design; r.relieved = made.cuts; }
+        }
+        if (c && c->Cancelled()) { r.cancelled = true; r.message = "Stopped."; return r; }
+        if (c) c->SetProgress(0.8f);
+        // what it did to the design: the motion again, and how much of the hardware is in a body it doesn't belong to
+        // when closed (or outside the sphere)
+        const MotionOverlap after = MeasureMotion(d, 12, cell);
+        double closedOverlap = 0.0;
+        {
+            BodySet built = MakeBodySet(d, 0.5f);
+            std::vector<Rigid> xf = d.TransformsAt(ClosedAngles(d));
+            for (size_t i = 0; i < built.fields.size(); i++)
+                for (size_t j = i + 1; j < built.fields.size(); j++) {
+                    Clash clash;
+                    SampleOverlap({ &built.fields[i], built.boxes[i], xf[built.group[i]] }, { &built.fields[j], built.boxes[j], xf[built.group[j]] }, 0.5f * cell,
+                                  { 0.5f, 0.5f, 0.5f }, &clash, false);
+                    closedOverlap += clash.volume;
+                }
+        }
+        if (c) c->SetProgress(1.0f);
+        r.ok = true;
+        r.design = d;
+        r.message = Utils::Format("Hinges: %d of %d built, %s: a %.1f mm barrel %.1f mm long (3 knuckles) on a %.1f mm pin, %.2f mm clearance.", r.built, asked,
+                                  p.pin == PinStyle::Fused ? "printed in place" : "for a separate pin", 2.0f * sz.radius, sz.length, 2.0f * sz.pinRadius, sz.clearance);
+        if (r.moved > 0.05f)
+            r.message += Utils::Format(" To be inside the sphere, axes moved up to %.1f mm toward its centre, which changes the motion a little.", r.moved);
+        if (r.relieved > 0) r.message += Utils::Format(" %d cut%s next to them, where their two bodies would rub as they turn.", r.relieved, r.relieved == 1 ? "" : "s");
+        r.message += Utils::Format(" Overlapping on the way: %.1f mm3 at worst before, %.1f mm3 now", before.worstVolume, after.worstVolume);
+        r.message += after.worstVolume > before.worstVolume + 0.5 ? " (Carve collisions away clears the rest)." : ".";
+        if (closedOverlap > 0.5) r.message += Utils::Format(" Closed, %.1f mm3 of hardware is inside another body.", closedOverlap);
+        if (!apart.empty()) r.message += " Not built, the two bodies aren't both at the axis:" + rest + ".";
         return r;
     }
 

@@ -2,7 +2,8 @@
 // Env: VIEWS, VRES, LR, ROUND (steps per round), REWRITES, LOOKAHEAD, MARGIN, MAXPIECES, WEIGHTS (the rules', e.g. 1,0.5),
 // FIXTARGET (the mesh stays put), NOSCALE (it may move but not scale), HINGEW, COLW, CHECKS (per hinge), FREETIMING (the
 // hinges' timing is Adam's, not an opening order), DEPS (hinges hold each other shut: ledges), DEPW, CARVE (carve what
-// still collides when done), LATCH (a press latch on the first hinge), RAMP (what overlaps cost by the end, times COLW).
+// still collides when done), LATCH (a press latch on the first hinge), RAMP (what overlaps cost by the end, times COLW),
+// HINGES (build the hinges' hardware; PROUD: on the axis as it is, not moved under the surface; REACH: mm a leaf may bridge).
 // Semantic loss: semantic_env.hpp.
 // Writes <outPrefix>_design.txt (open it in the editor) and <outPrefix>_views.ppm (silhouettes against targets).
 #include "autodesign/autodesign.hpp"
@@ -34,6 +35,9 @@ int main(int argc, char** argv) {
     if (getenv("NOSCALE")) p.scaleTarget = false;
     env("HINGEW", p.hingeWeight);
     env("COLW", p.collisionWeight); env("CHECKS", p.hingeChecks); env("DEPW", p.dependencyWeight); env("RAMP", p.collisionRamp);
+    if (getenv("HINGES")) p.buildHinges = true;
+    if (getenv("PROUD")) p.hinges.flush = false;
+    env("REACH", p.hinges.reach);
     if (getenv("FREETIMING")) p.orderHinges = false;
     if (getenv("DEPS")) p.dependencies = true;
     if (getenv("CARVE")) p.carveWhenDone = true;
@@ -70,15 +74,22 @@ int main(int argc, char** argv) {
     }
     printf("%s\n%.1f s (%.1f ms a step)\n", r.message.c_str(), secs, 1000.0 * secs / std::max(1, p.steps));
     {
-        // every pivot against its two bodies, in mm, whatever the run's weights
+        // every hinge against its two bodies (as they are without hardware), at its pivot and 3.3 mm either way along
+        // the axis: what a barrel there needs; in mm, whatever the run's weights
         float worst = 0.0f, sum = 0.0f;
-        for (const Hinge& h : r.design.hinges) {
-            BodyField a = BodyField::Body(r.design, h.parent), b = BodyField::Body(r.design, h.child);
-            float g = fmaxf(fmaxf(a.Distance(h.pivot), b.Distance(h.pivot)), 0.0f);
+        Design bare = r.design;
+        for (Hinge& h : bare.hinges) h.hardware = false;
+        for (const Hinge& h : bare.hinges) {
+            BodyField a = BodyField::Body(bare, h.parent), b = BodyField::Body(bare, h.child);
+            float g = 0.0f;
+            for (float w : { -3.3f, 0.0f, 3.3f }) {
+                Vector3 q = Vector3Add(h.pivot, Vector3Scale(Vector3Normalize(h.axis), w));
+                g = fmaxf(g, fmaxf(a.Distance(q), b.Distance(q)));
+            }
             worst = fmaxf(worst, g);
             sum += g;
         }
-        printf("pivots: farthest %.1f mm outside a body, mean %.1f mm (%d hinges)\n", worst, r.design.hinges.empty() ? 0.0f : sum / r.design.hinges.size(),
+        printf("hinges: farthest %.1f mm off a body along the barrel, mean %.1f mm (%d hinges)\n", worst, r.design.hinges.empty() ? 0.0f : sum / r.design.hinges.size(),
                (int)r.design.hinges.size());
     }
     const Placement& t = r.score.target;

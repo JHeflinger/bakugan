@@ -45,7 +45,7 @@ Pieces are joined by **joints**, one per cut. A joint turns its child piece abou
    - What overlaps cost rises steadily over the run, from `collisionWeight` to `collisionRamp` times it: early on the search may try things, by the end the pieces have to be clear of each other. Carvings from different times are compared as they'd score at the end of the ramp.
    - Every `stepsPerRound` steps there is a rewrite round. First the opening order is looked at again (below). Then rewrites are drawn from the grammar. Each rewritten carving, and the unchanged one, gets `lookahead` Adam steps of its own. Whichever has the lowest loss afterwards carries on, with its Adam memory.
 4. **Result.** The best carving seen during the run, built into a design (`AutoResult::design`; the carving itself is in `AutoResult::carving`). The editor shows the reference mesh where it was placed for it.
-5. **Finishing**, as asked (below): ledges, carving, a latch. They change the design only, not the carving. Then the finished design's motion is checked once more, at 24 poses in every hinge's turn on a finer grid than the search could afford (`AutoResult::checked`).
+5. **Finishing**, as asked (below): the hinges' hardware, ledges, carving, a latch. They change the design only, not the carving. Then the finished design's motion is checked once more, at 24 poses in every hinge's turn on a finer grid than the search could afford (`AutoResult::checked`).
 
 With 0 steps it only scores the editor's design as it is: its open pose against the mesh where it is.
 
@@ -133,6 +133,7 @@ With `dependencies`, every hinge but the first to open should be held shut by a 
 The same passes the Generate tab's Finishing section runs on any design (`data/finish.hpp`):
 
 - **Carve collisions away** (`CarveCollisions`). The motion is checked at `checksPerHinge` poses of every hinge's turn. Whatever is inside two bodies is covered with rounded boxes (the overlap's own box along its principal axes, split while it is mostly empty), `clearance` larger all round, and cut from the body it shows less on when closed. Then it checks again between those poses and carves what is left, up to `rounds` times. It works on any design; nothing is added anywhere, so nothing sticks out of the sphere.
+- **Add hinges** (`AddHinges`): each hinge's hardware; see Hinges.
 - **Add ledges**: as above, for a carved sphere.
 - **Add latch** (`AddLatch`). A press latch on the hinge that opens first (or the selected one): a small rocker printed into the surface, flush with it. A thin web joins its leg to the body below; pressing the arm's far end in turns the rocker about the web, and its catch steps back off a lip on the other body. Where the body that stays down is deep enough at the seam, the rocker is in it and its catch lies *over* a lip on the lid's edge. Where it isn't (a thin edge), the rocker is in the lid and its catch hooks *under* a lip left at the surface of the other body; its web is then under the catch's tip where that is the lid's own material, and just inside the seam where it isn't (the lip gets a little more room over the catch there, because the catch rises slightly as it steps back). Either way it is cut from the sphere, with `clearance` around it. A place is taken only if the lid runs into the catch when it starts to open, and, with the rocker pressed, clears it all the way open. The web is made as long as the body is deep there (the longer, the less it is strained); the result says how far it bends. The rocker needs about 0.6 of the sphere's radius of depth at the seam in one of the two bodies: where neither has it, there is no latch, and the result says so.
 
@@ -146,7 +147,28 @@ How much it gains depends on how much of a step is drawing: with 5 pieces, about
 
 ## Hinges
 
-A joint's pivot should sit where its two pieces meet. For each joint, the term adds how far the pivot is outside each of its two pieces, beyond 1% of the mesh's size, over the mesh's size. Both are in the closed pose, the frame pivots are given in. A new cut's pivot starts on the edge of its cut face, on both pieces.
+A hinge has to sit where its two pieces meet, over the whole length its barrel takes up, or nothing can be built on it. For each joint the term takes three points on the axis (the pivot, and half a barrel's length either way: `PlanHinge` in `data/finish.hpp`) and adds how far each of the two pieces is from each, beyond `HingeSlack` (half of what a knuckle's leaf can bridge: 0.6 mm at the default size and reach); the mean of the three, over the mesh's size. Both pieces are in the closed pose, the frame pivots are given in.
+
+It used to look at the pivot alone, with 1% of the mesh's size to spare. A pivot is a point: the axis through it was free to turn away from the seam, and a pivot could float that far off both pieces, so hinges came out joined at one spot or not at all. Raising its weight didn't change what it measured.
+
+This term is also what limits the search most. With it ignored (`hingeWeight` 0) the same run finds twice the pieces and far better cover, on axes tens of millimetres from the pieces they turn. `hinges.reach` is the honest way to give the search more room: the pieces may then be that far from the axis, and the hinge is built with leaves that long.
+
+With `buildHinges` the search plans for the hardware `AddHinges` builds when it is done:
+
+- **Under the surface** (`hinges.flush`): the term also adds how far the pivot is from being deep enough for the barrel to be inside the sphere, and a new lid's pivot starts that deep, in from its rim until the lid is within reach.
+- **Room to turn.** An axis under the surface has its two pieces in each other's way next to it as they turn, whatever their shapes. `AddHinges` cuts that room (`HingeSizes::relief`), so overlaps between a hinge's two pieces within that distance of its axis aren't counted as collisions.
+
+### The hardware (`AddHinges`)
+
+The smallest barrel that prints: a 1.6 mm pin, the clearance around it and a 0.8 mm wall (3.8 mm across), three knuckles 2 mm long each; the parent has the outer two and, printed in place, the pin. `hinges.scale` scales it. For each hinge:
+
+- **Where along the axis**: where both bodies are nearest the axis over the barrel's whole length. Sliding the pivot along its axis changes nothing about the motion.
+- **Under the surface** (`flush`, a carved sphere): the axis moves toward the sphere's centre until the barrel is inside the sphere. On a design that wasn't searched with `buildHinges` this moves the axis by the barrel's radius or more, and the lid is often not there any more: the hinge is then not built, and named. Without `flush` the barrel is on the axis as it is, and sticks out of the sphere when the axis is at its surface.
+- **Leaves**: each body's knuckles are tied in by a short plate, pointed where it finds the most of its own body and none of the other, inside the sphere.
+- **Room**: the other body is cut away around each leaf, any third body around the barrel, and (flush) the two bodies where they would rub next to the axis as they turn.
+- **A separate pin** (`pin`): both bodies are bored for a pin pushed in afterwards; under the surface, a channel is cut from the pin's end out of the sphere to push it in by.
+
+A hinge is built only if both bodies are within a leaf's reach of the axis there. The result gives the sizes, what was moved and cut, and the motion's overlap before and after. Carving collisions away afterwards never cuts hardware: what a knuckle or leaf runs into gives way, and next to a hinge each body gives way along the other's knuckles, so no body is cut loose from its own.
 
 ## The gradient
 

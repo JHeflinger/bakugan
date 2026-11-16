@@ -26,8 +26,11 @@
 // could hold it shut: one that is not carried by the hinge and moves away from the hinge's parent before its turn.
 // The term is how far the nearest such piece is, along the sphere's surface.
 //
-// Hinges. A joint's pivot should be on (or in) both pieces it joins: how far it is outside each, beyond 1% of the
-// mesh's size, adds up over the joints, relative to the mesh's size.
+// Hinges. A hinge should be on (or in) both pieces it joins, over the whole length its barrel takes up along the axis
+// (PlanHinge), not just at its pivot: at the pivot and half a barrel either way, how far each piece is from the axis,
+// beyond half of what a knuckle's leaf can bridge (HingeSlack: 0.6 mm at the default size and reach); the
+// mean of the three, added up over the joints, relative to the mesh's size. With buildHinges and hinges.flush, also
+// how far the pivot is from being deep enough under the surface for the barrel.
 //
 // Surface. Hollows should take material from inside the sphere, not its surface: over a thousand points just under the
 // surface, the mean of d / (d + 1% of the mesh's size), d how deep the point is inside a hollow. About the share of the
@@ -94,6 +97,9 @@ namespace Bakugan {
         void SemanticPicture(std::vector<unsigned char>* rgba, int* w, int* h) const;
 
         float L() const { return m_L; }
+        // How far from the axis a piece may be and still count as at the hinge: half of what a knuckle's leaf can
+        // bridge (so AddHinges can join it with room to spare; a new lid's hinge, along its rim, is about within that).
+        float HingeSlack() const { return 0.5f * (m_Hinge.leafLength - m_Hinge.radius); }
         std::vector<Vector3> ViewDirections() const;     // the way each view looks
     private:
         struct View {
@@ -146,7 +152,9 @@ namespace Bakugan {
         void Dependencies(const Design& d, const Bodies& b, AutoScore& s, Slopes& slopes);
         float SurfaceSpacing() const;
         void Hinges(const Design& d, const Bodies& b, AutoScore& s) const;
-        float PivotGap(const BodyField& f, Vector3 pivot) const { return fmaxf(0.0f, f.Distance(pivot) - 0.01f * m_L); }
+        // One hinge against its two pieces (see Hinges); farthest: the most either is from the axis along the barrel.
+        float HingeCost(const Hinge& h, const BodyField& parent, const BodyField& child, float* farthest = nullptr) const;
+        float HingeWeight() const { return m_P.hingeWeight; }
         float SurfaceTerm(const Carving& c, float* carved = nullptr) const;
         void Gradient(const Carving& c, const Placement& target, const std::vector<int>& bodyOf, const Bodies& b, const Slopes& slopes,
                       const Shades& shades, const std::vector<Param>& ps, std::vector<float>& grad);
@@ -187,6 +195,7 @@ namespace Bakugan {
         std::vector<std::vector<float>> m_Target;    // the placed mesh's silhouette per view
         Vector3 m_SphereCentre = { 0, 0, 0 };
         float m_SphereRadius = 0.0f;
+        HingeSizes m_Hinge;              // the hardware a hinge would get (data/finish.hpp)
         std::vector<Vector3> m_PairUnit;  // fixed points in [0, 1]^3, mapped into where two bodies' boxes meet
         std::vector<Vector3> m_SurfaceDirs;   // points spread evenly over the sphere (unit directions), for its surface
         std::vector<Spot> m_Extra;

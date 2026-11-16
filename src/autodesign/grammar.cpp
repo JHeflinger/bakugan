@@ -87,6 +87,21 @@ namespace Bakugan {
                 const float near = 0.01f * ctx.loss.L();
                 if (capField.Distance(onSurface) < near && restField.Distance(onSurface) < near) pivot = onSurface;
             }
+            // with hinges to be built under the surface: as deep as their barrel needs, from the start
+            if (ctx.p.buildHinges && ctx.p.hinges.flush) {
+                const float most = PlanHinge(R, ctx.p.hinges).pivotRadius, at = Vector3Distance(pivot, c.centre);
+                if (at > most && at > 1e-4f) pivot = Vector3Add(c.centre, Vector3Scale(Vector3Subtract(pivot, c.centre), most / at));
+                // ... and, the lid being thinnest at its rim, in from the rim until the lid is within a knuckle's reach
+                // (as long as the rest still is)
+                const float slack = ctx.loss.HingeSlack();
+                for (int k = 0; k < 24 && capField.Distance(pivot) > slack; k++) {
+                    Vector3 q = Vector3Subtract(pivot, Vector3Scale(side, R / 64.0f));
+                    float r = Vector3Distance(q, c.centre);
+                    if (r > most) q = Vector3Add(c.centre, Vector3Scale(Vector3Subtract(q, c.centre), most / r));
+                    if (restField.Distance(q) > 2.0f * slack) break;
+                    pivot = q;
+                }
+            }
 
             // the joints the piece had go with the part their pivot is in (or nearer)
             int anchor = rest;                              // the part on the piece's own joint

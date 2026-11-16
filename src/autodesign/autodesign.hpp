@@ -39,7 +39,8 @@ namespace Bakugan {
         float collisionRamp = 20.0f;     // ... times this by the end of the search: it rises steadily from the weight to
                                          // this many times it, so the search can try things early on and has to have
                                          // them clear of each other by the end (1: the same throughout)
-        float hingeWeight = 2.0f;        // what a joint's pivot being away from its two pieces costs (0: ignored)
+        float hingeWeight = 2.0f;        // what a hinge being away from its two pieces costs (0: ignored): how far each
+                                         // piece is from the axis, over the length a hinge's barrel takes up along it
         float surfaceWeight = 1.0f;      // what hollows carving into the sphere's surface cost (0: ignored)
         int hingeChecks = 6;             // poses checked for overlaps in every hinge's turn, spread evenly over its angle
                                          // however long the turn takes (open always is checked; closed needs none: the
@@ -52,6 +53,9 @@ namespace Bakugan {
         float dependencyWeight = 1.0f;   // what a hinge with nothing near enough to hold it costs
         LedgeParams ledges;              // the ledges that do the holding, added when the search is done
         // finishing, when the search is done (the same passes the editor offers on any design: data/finish.hpp)
+        bool buildHinges = false;        // the hinges' hardware (AddHinges). The search then keeps every axis where that
+                                         // fits: with hinges.flush, far enough under the surface for the barrel
+        HingeParams hinges;
         bool carveWhenDone = false;      // carve away whatever still overlaps on the way
         CarveParams carve;
         bool latchWhenDone = false;      // a press latch on the hinge that opens first
@@ -101,9 +105,9 @@ namespace Bakugan {
         int dependents = 0;              // hinges that should be held (the moving ones, less the first to open)
         int holdable = 0;                // ... of them, those with a holder within a ledge's reach
         bool traced = false;             // the silhouettes were drawn on the GPU
-        float hinges = 0.0f;             // pivots away from their pieces: the sum of how far, beyond 1% of the mesh's
-                                         // size, each pivot is outside each of its two pieces, over the mesh's size
-        float hingeGap = 0.0f;           // the farthest a pivot is outside one of its pieces (mm)
+        float hinges = 0.0f;             // hinges away from their pieces: per hinge, how far each of its two pieces is
+                                         // from its axis (the mean over the barrel's length, beyond a small slack), plus how far it is from fitting under the surface; over the mesh's size
+        float hingeGap = 0.0f;           // the farthest a piece is from its hinge's axis, anywhere along the barrel (mm)
         float surface = 0.0f;            // hollows into the sphere's surface: over points just under it, the mean of
                                          // d / (d + 1% of the mesh's size), d how deep inside a hollow it is
         float surfaceCarved = 0.0f;      // the share of those points inside a hollow
