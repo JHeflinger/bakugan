@@ -10,6 +10,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -273,6 +274,65 @@ namespace Bakugan {
 
     // ---- public ---------------------------------------------------------------------------------------------------------
 
+    void NormalizeMesh(TriMesh& m, float size) { Normalize(m, size); }
+
+    bool WritePng(const std::string& path, const std::vector<unsigned char>& pixels, int width, int height, int channels,
+                  std::string* error) {
+        if ((channels != 3 && channels != 4) || width <= 0 || height <= 0 || pixels.size() != (size_t)width * height * channels) {
+            *error = "bad picture size for " + path;
+            return false;
+        }
+        Image img = {};
+        img.data = (void*)pixels.data();         // (ExportImage only reads it)
+        img.width = width;
+        img.height = height;
+        img.mipmaps = 1;
+        img.format = channels == 3 ? PIXELFORMAT_UNCOMPRESSED_R8G8B8 : PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+        if (!ExportImage(img, path.c_str())) {
+            *error = "can't write " + path;
+            return false;
+        }
+        return true;
+    }
+
+    bool WritePreviewPng(const Design& d, const TriMesh& placed, int cell, const std::string& path, std::string* error) {
+        cell = std::clamp(cell, 64, 2048);
+        const int ss = Layout::ss, poses = 4;
+        const int rw = cell * ss, rh = cell * ss;
+        Entry e;
+        e.mesh = placed;
+        e.result = d;
+        Frame(e, rw, rh);
+        const DesignMesh meshes = MeshDesign(d, Vector3Distance(placed.box.min, placed.box.max) / 90.0f);
+        const int ts = cell >= 520 ? 3 : 2, gap = 6, labelH = 10 * ts + 6;
+        Canvas cv;
+        cv.Resize(poses * cell + (poses + 1) * gap, cell + labelH + 2 * gap);
+        const char* labels[poses] = { "open", "1/3 closed", "2/3 closed", "closed" };
+        Raster r;
+        for (int k = 0; k < poses; k++) {
+            const float t = k / (float)(poses - 1), ghost = 1.0f - t;       // 0: open .. 1: closed; the mesh fades as it closes
+            std::vector<Rgb> bg(e.ghost.size());
+            for (size_t i = 0; i < bg.size(); i++) bg[i] = Mix(White, e.ghost[i], ghost);
+            r.Clear(rw, rh, bg);
+            DrawDesign(r, meshes, d.Transforms(t, true), e.view);
+            const int x0 = gap + k * (cell + gap), y0 = gap + labelH;
+            for (int y = 0; y < cell; y++)
+                for (int x = 0; x < cell; x++) {
+                    int sr = 0, sg = 0, sb = 0;
+                    for (int q = 0; q < ss * ss; q++) {
+                        const Rgb& c = r.color[(size_t)(y * ss + q / ss) * rw + x * ss + q % ss];
+                        sr += c.r; sg += c.g; sb += c.b;
+                    }
+                    cv.px[(size_t)(y0 + y) * cv.w + x0 + x] = { (unsigned char)(sr / (ss * ss)), (unsigned char)(sg / (ss * ss)), (unsigned char)(sb / (ss * ss)) };
+                }
+            cv.Frame(x0 - 1, y0 - 1, x0 + cell + 1, y0 + cell + 1, 1, Border);
+            cv.Text(x0, gap, ts, labels[k], Muted);
+        }
+        std::vector<unsigned char> bytes;
+        cv.Rgb24(&bytes);
+        return WritePng(path, bytes, cv.w, cv.h, 3, error);
+    }
+
     std::vector<std::string> SuiteMeshes(const std::string& folder) {
         std::vector<std::string> out;
         std::error_code ec;
@@ -338,18 +398,19 @@ namespace Bakugan {
         // 1. the meshes, ffmpeg, the output folder
         std::vector<std::string> files = SuiteMeshes(p.folder);
         if (files.empty()) { res.message = "No .obj files in " + p.folder + "."; return res; }
-        if (!FfmpegAvailable()) {
-            res.message = "The test suite needs ffmpeg on the PATH to write the video (Arch: pacman -S ffmpeg).";
+        if (p.video && !FfmpegAvailable()) {
+            res.message = "The test suite needs ffmpeg on the PATH to write the video (Arch: pacman -S ffmpeg), or turn the video off "
+                          "(suite.video = false in the CLI): then only the designs, pictures and summary are written.";
             return res;
         }
-        fs::path outDir = fs::path(p.folder) / "autodesign_suite";
+        fs::path outDir = p.outDir.empty() ? fs::path(p.folder) / "autodesign_suite" : fs::path(p.outDir);
         std::error_code ec;
         fs::create_directories(outDir, ec);
         if (ec) { res.message = "Can't create " + outDir.string() + ": " + ec.message(); return res; }
         res.folder = outDir.string();
         fs::path video = outDir / "suite.mp4";
         std::string vpath = video.string();
-        if (vpath.find('"') != std::string::npos) { res.message = "The folder's path has a quote in it: ffmpeg can't be given it."; return res; }
+        if (p.video && vpath.find('"') != std::string::npos) { res.message = "The folder's path has a quote in it: ffmpeg can't be given it."; return res; }
 
         const int fps = std::clamp(p.fps, 1, 120);
         auto frames = [&](float seconds, int least) { return std::max(least, (int)lroundf(seconds * fps)); };
@@ -359,25 +420,39 @@ namespace Bakugan {
         // 2. the searches, one mesh at a time (each uses every core)
         std::vector<Entry> entries;
         std::vector<std::string> skipped;
+        // summary.csv: one row per mesh, written as each finishes (a stopped run keeps what it has)
+        std::ofstream summary(outDir / "summary.csv");
+        summary << "mesh,status,seconds,pieces,joints,loss,fit,cover,extra,worst_view,collision,overlap_open,overlap_motion,"
+                   "surface_carved,mesh_scale,mesh_moved_mm\n";
+        auto csv = [](const std::string& s) {
+            if (s.find_first_of(",\"\n") == std::string::npos) return s;
+            std::string q = "\"";
+            for (char ch : s) q += ch == '"' ? std::string("\"\"") : std::string(1, ch);
+            return q + "\"";
+        };
         for (size_t i = 0; i < files.size(); i++) {
             Entry e;
+            const auto meshStart = std::chrono::steady_clock::now();
+            auto seconds = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - meshStart).count(); };
             e.name = fs::path(files[i]).stem().string();
             show([&](SuiteLive& s) { s.index = (int)i; s.count = (int)files.size(); s.name = e.name; });
             phase("Searching");
             std::string err;
             if (!LoadObj(files[i], &e.mesh, &err)) {
                 skipped.push_back(e.name + " (" + err + ")");
+                summary << csv(e.name) << "," << csv("skipped: " + err) << "\n" << std::flush;
                 continue;
             }
             Normalize(e.mesh, p.meshSize);
             AutoParams ap = p.generate;
             auto search = std::make_shared<AutoLive>();
-            search->recordFrames = searchFrames;
+            search->recordFrames = p.video ? searchFrames : 0;      // (snapshots are only for the video)
             show([&](SuiteLive& s) { s.search = search; });
             AutoResult r = AutoDesign(e.mesh, Design{}, ap, c, search);
             if (c.Cancelled()) { res.cancelled = true; res.message = "Test suite stopped."; return res; }
             if (!r.ok) {
                 skipped.push_back(e.name + " (" + r.message + ")");
+                summary << csv(e.name) << "," << csv("failed: " + r.message) << "," << seconds() << "\n" << std::flush;
                 continue;
             }
             e.result = r.design;
@@ -390,10 +465,34 @@ namespace Bakugan {
             }
             if (e.frames.empty()) e.frames.push_back({ r.design, r.carving, r.score, ap.steps });
             std::ofstream(outDir / (e.name + ".txt")) << r.design.Serialize();
+            std::ofstream(outDir / (e.name + ".report.txt")) << r.message << "\n";
+            if (p.preview) {
+                std::string perr;
+                if (!WritePreviewPng(r.design, e.mesh, p.previewSize, (outDir / (e.name + ".png")).string(), &perr))
+                    skipped.push_back(e.name + " (no picture: " + perr + ")");
+            }
+            {
+                const AutoScore& s = r.score;
+                summary << csv(e.name) << ",ok," << Utils::Format("%.1f,%d,%d,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.6f,%.6f,%.5f,%.4f,%.3f",
+                           seconds(), (int)r.carving.pieces.size(), (int)r.carving.joints.size(), s.total, s.fit, s.viewCover, s.viewExtra,
+                           s.worstView, s.collision, s.clashOpen, s.clashMotion, s.surfaceCarved, s.target.scale,
+                           Vector3Length(s.target.offset)) << "\n" << std::flush;
+            }
             entries.push_back(std::move(e));
         }
         show([&](SuiteLive& s) { s.search.reset(); });
         if (entries.empty()) { res.message = "No mesh could be used: " + (skipped.empty() ? std::string() : skipped[0]); return res; }
+
+        if (!p.video) {
+            res.ok = true;
+            res.message = Utils::Format("Test suite done: %d mesh%s searched, designs, pictures and summary.csv in %s.", (int)entries.size(),
+                                        entries.size() == 1 ? "" : "es", res.folder.c_str());
+            if (!skipped.empty()) {
+                res.message += " Skipped:";
+                for (const std::string& s : skipped) res.message += " " + s;
+            }
+            return res;
+        }
 
         // 3. a fixed camera per mesh
         const int n = (int)entries.size();
