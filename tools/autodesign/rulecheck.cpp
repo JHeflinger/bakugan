@@ -60,7 +60,7 @@ int main(int argc, char** argv) {
     if (!LoadObj(argv[1], &mesh, &err)) { printf("can't load %s: %s\n", argv[1], err.c_str()); return 1; }
     AutoParams p;
     p.maxPieces = 12;
-    p.transportWeight = 1.0f;                // (so "aim a cut" has transport's material to aim with)
+    p.transport = true;                // (so "aim a cut" has transport's material to aim with)
     Loss loss(mesh, p);
     std::mt19937 rng(7);
     RuleContext ctx{ loss, p, rng };

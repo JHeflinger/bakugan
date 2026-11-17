@@ -1,4 +1,4 @@
-// The transport part of the loss (transportWeight): how far the sphere's material has to travel, opened, to fill the
+// The transport part of the loss (transport, transportWeight): how far the sphere's material has to travel, opened, to fill the
 // placed mesh. Optimal transport (the earth mover's distance) between the two volumes.
 //
 // Why: the carving can't grow or shrink, only rearrange the sphere's material (less its hollows), so the question is

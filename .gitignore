@@ -7,3 +7,10 @@ test/
 *.onnx
 assets/zard.obj
 tools/autodesign/suitetest
+tools/autodesign/autotest
+tools/autodesign/gradcheck
+tools/autodesign/adamtest
+tools/autodesign/checktimes
+tools/autodesign/rulecheck
+*.so.*
+foldaball_out/*

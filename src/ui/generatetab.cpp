@@ -23,6 +23,7 @@ namespace Bakugan {
         GenerateOptimizer();
         ImGui::EndDisabled();
         GenerateGrammar();                   // changes take while it runs too
+        GenerateFinish();
         GenerateRun();
         if (m_HasAutoScore) GenerateScore();
         GenerateSuite();
@@ -69,28 +70,64 @@ namespace Bakugan {
                                   "steeply (10 per whole share missing), so no single view can be given up.");
         }
         ImGui::SliderFloat("Collisions", &p.collisionWeight, 0.0f, 5.0f, p.collisionWeight > 0.0f ? "%.2f" : "ignored");
-        ImGui::SetItemTooltip("What pieces overlapping each other costs: in the open pose, and the poses checked between\n"
-                              "(together they weigh as much as the open pose). Closed, the pieces fill the sphere side by side.");
+        ImGui::SetItemTooltip("What pieces overlapping each other costs: in the open pose, and in every hinge's turn.\n"
+                              "Closed, the pieces fill the sphere side by side.");
         ImGui::BeginDisabled(p.collisionWeight <= 0.0f);
-        ImGui::SliderInt("Poses between", &p.motionChecks, 0, 64);
-        ImGui::SetItemTooltip("Poses checked for overlaps between open and closed. They go only where some hinge is moving,\n"
-                              "so no part of the motion can hide a collision from them.");
-        ImGui::SliderFloat("Follow busy times", &p.motionCheckBias, 0.0f, 1.0f, "%.2f");
-        ImGui::SetItemTooltip("0: the poses between are spread evenly over the times any hinge moves. 1: placed by how many\n"
-                              "hinges move at once. Between, a mix: some evenly everywhere a hinge moves, the rest where most do.");
+        ImGui::SliderFloat("... by the end", &p.collisionRamp, 1.0f, 100.0f, "x %.0f", ImGuiSliderFlags_Logarithmic);
+        ImGui::SetItemTooltip("Overlaps cost this many times as much by the end of the search as at its start, rising steadily:\n"
+                              "the search may try things early on, and has to have the pieces clear of each other when it ends.");
+        ImGui::SliderInt("Checks per hinge", &p.hingeChecks, 1, 24);
+        ImGui::SetItemTooltip("Poses checked for overlaps in every hinge's turn, spread evenly over its angle, however long or\n"
+                              "short the turn is: turning faster hides nothing. Each step looks between the last step's poses.");
+        bool order = p.orderHinges || p.dependencies;
+        ImGui::BeginDisabled(p.dependencies);
+        if (ImGui::Checkbox("Open one at a time, the freest first", &order)) p.orderHinges = order;
         ImGui::EndDisabled();
+        ImGui::SetItemTooltip("The hinges open one after another, each in its own share of the motion. From closed, the hinge\n"
+                              "whose turn runs into the least opens next, so one that needs another out of its way waits for\n"
+                              "it (the order is looked at again at every rewrite round). Off: each hinge's timing is a number\n"
+                              "Adam tunes, and hinges may turn at once.");
+        ImGui::EndDisabled();
+        ImGui::Checkbox("Hinges hold each other shut", &p.dependencies);
+        ImGui::SetItemTooltip("Every hinge but the first to open should be held closed by a piece that moves away before its\n"
+                              "turn: then one hinge keeps the whole design shut, and letting it go lets the rest unfurl in turn.\n"
+                              "The search keeps such pieces next to each other; when it is done, small ledges are cut from the\n"
+                              "sphere's surface: each is part of the holding piece and lies over the piece it holds.");
+        if (p.dependencies) {
+            ImGui::SliderFloat("Holding", &p.dependencyWeight, 0.0f, 5.0f, "%.2f");
+            ImGui::SetItemTooltip("What a hinge with nothing near enough to hold it costs: how far the nearest piece that could is,\n"
+                                  "along the sphere's surface, over the sphere's radius");
+            ImGui::DragFloat("Ledge size", &p.ledges.size, 0.05f, 0.0f, 10.0f, p.ledges.size > 0.0f ? "%.2f mm" : "auto");
+            ImGui::SetItemTooltip("How far a ledge reaches over the piece it holds (auto: 12%% of the sphere's radius). It is 2.5\n"
+                                  "times as wide, 0.6 times as thick, and anchored as far again in its own piece.");
+            ImGui::DragFloat("Ledge reach", &p.ledges.reach, 0.1f, 0.0f, 50.0f, p.ledges.reach > 0.0f ? "%.1f mm" : "auto");
+            ImGui::SetItemTooltip("How much of another piece's surface a ledge may cross to reach the piece it holds, as a strap\n"
+                                  "set into a groove (auto: 35%% of the sphere's radius)");
+        }
         ImGui::SliderFloat("Hinges on pieces", &p.hingeWeight, 0.0f, 10.0f, p.hingeWeight > 0.0f ? "%.2f" : "ignored");
-        ImGui::SetItemTooltip("What a joint's pivot being away from the two pieces it joins costs: how far it is outside\n"
-                              "each, beyond 1%% of the mesh's size, over the mesh's size. A real hinge sits where its pieces meet.");
+        ImGui::SetItemTooltip("What a hinge being away from the two pieces it joins costs: how far each is from its axis, along\n"
+                              "the length a hinge's barrel takes up there, beyond half of what a leaf can bridge (Finishing: Hinge reach).\n"
+                              "A real hinge sits where its pieces meet. It is also what limits the search most: with it ignored,\n"
+                              "axes go wherever the pieces swing clear of each other, which no hinge could be built on.");
         ImGui::SliderFloat("Keep the surface", &p.surfaceWeight, 0.0f, 10.0f, p.surfaceWeight > 0.0f ? "%.2f" : "ignored");
         ImGui::SetItemTooltip("What hollows carving into the sphere's surface cost (about the share of the surface carved away).\n"
                               "Hollows take material out from inside the sphere; this keeps its outside whole, closed.");
+        ImGui::SliderFloat("No thin pieces", &p.thinWeight, 0.0f, 10.0f, p.thinWeight > 0.0f ? "%.2f" : "ignored");
+        ImGui::SetItemTooltip("What a piece thinner than the minimum costs: 1 - its thickness / the minimum, for each such piece.\n"
+                              "A piece's thickness is the largest ball that fits inside it, across: slivers, thin caps and flat\n"
+                              "plates are all caught (a thin fin on a thick piece isn't).");
+        ImGui::BeginDisabled(p.thinWeight <= 0.0f);
+        ImGui::DragFloat("Min thickness", &p.minThickness, 0.1f, 0.5f, 50.0f, "%.1f mm");
+        ImGui::SetItemTooltip("The thinnest a piece may be. About 3 mm prints and handles well; a hinge's barrel needs about 4 mm.");
+        ImGui::EndDisabled();
         ImGui::SeparatorText("In 3D");
-        ImGui::SliderFloat("Transport", &p.transportWeight, 0.0f, 5.0f, p.transportWeight > 0.0f ? "%.2f" : "off");
+        ImGui::Checkbox("Optimal transport", &p.transport);
         ImGui::SetItemTooltip("Optimal transport: how far the sphere's material has to travel, opened, to fill the mesh.\n"
                               "Every bit of material is paired with a bit of the mesh it should fill, however far away, so a\n"
                               "piece opened to the wrong place is pulled to where it's needed.");
-        ImGui::BeginDisabled(p.transportWeight <= 0.0f);
+        ImGui::BeginDisabled(!p.transport);
+        ImGui::SliderFloat("Transport", &p.transportWeight, 0.0f, 5.0f, p.transportWeight > 0.0f ? "%.2f" : "off");
+        ImGui::SetItemTooltip("Its share of the loss");
         ImGui::SliderInt("Transport points", &p.transportPoints, 256, 4096);
         ImGui::SetItemTooltip("Points of the sphere's material, and points filling the mesh: more is finer and slower (its\n"
                               "cost grows with the square)");
@@ -207,6 +244,14 @@ namespace Bakugan {
         ImGui::SetItemTooltip("Adding a cut makes one more piece: no more than this");
         ImGui::SliderInt("Max hollows", &p.maxHollows, 0, 512);
         ImGui::SetItemTooltip("Hollows: material taken out of the sphere (from every piece) without making a piece");
+        ImGui::BeginDisabled(!m_Gpu->Ok());
+        ImGui::Checkbox("Draw the silhouettes on the GPU", &m_AutoUseGpu);
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("%s", m_Gpu->Ok() ? "Every step's views of the open design are raymarched by the graphics card instead of the\n"
+                                                  "CPU's cores (the comparison with the mesh, and the gradient, stay on the CPU). The editor's\n"
+                                                  "window is drawn with the same card: it redraws only a dozen times a second while a search\n"
+                                                  "runs, between the search's steps. The DINOv3 views are still drawn on the CPU."
+                                                : m_Gpu->Error().c_str());
         int seed = (int)p.seed;
         ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
         if (ImGui::InputInt("Seed", &seed)) p.seed = (unsigned)std::max(seed, 0);
@@ -242,6 +287,74 @@ namespace Bakugan {
             std::lock_guard<std::mutex> l(m_AutoLive->mutex);
             m_AutoLive->ruleWeights = p.ruleWeights;
         }
+    }
+
+    // What makes a carved sphere printable (data/finish.hpp): at the end of a search, or on the design as it is.
+    void App::GenerateFinish() {
+        AutoParams& p = m_AutoParams;
+        ImGui::SeparatorText("Finishing");
+        bool busy = m_AutoJob.Busy() || m_SuiteJob.Busy() || m_FinishJob.Busy();
+        ImGui::BeginDisabled(busy);
+        ImGui::Checkbox("Build the hinges when done", &p.buildHinges);
+        ImGui::SetItemTooltip("Give every hinge the smallest barrel that prints: three knuckles on a pin, where both of its pieces\n"
+                              "are along the axis. The search then keeps each axis where such a hinge fits, and (under the\n"
+                              "surface) checks collisions with the axis where it will be.");
+        ImGui::Checkbox("Hinges under the surface", &p.hinges.flush);
+        ImGui::SetItemTooltip("Each axis far enough under the sphere's surface for its barrel to be inside the sphere, so the closed\n"
+                              "sphere stays round. Off: the barrel is on the axis wherever that is, and sticks out if it is at\n"
+                              "the surface. On an existing design this moves the axes inward: carve collisions away afterwards.");
+        ImGui::SliderFloat("Hinge size", &p.hinges.scale, 0.75f, 2.5f, "x %.2f");
+        {
+            HingeSizes sz = PlanHinge(0.0f, p.hinges);
+            ImGui::SetItemTooltip("Now: a %.1f mm pin in a %.1f mm barrel, %.1f mm long", 2.0f * sz.pinRadius, 2.0f * sz.radius, sz.length);
+        }
+        ImGui::SliderFloat("Hinge reach", &p.hinges.reach, 0.0f, 8.0f, p.hinges.reach > 0.0f ? "%.1f mm" : "smallest");
+        ImGui::SetItemTooltip("How far a piece may be from a hinge's axis and still be joined to it, by a leaf that long. The search\n"
+                              "counts a hinge as on its pieces within this ('Hinges on pieces'), so more reach leaves it freer\n"
+                              "where it puts the axes, at the price of longer leaves.");
+        ImGui::DragFloat("Hinge clearance", &p.hinges.clearance, 0.01f, 0.1f, 1.0f, "%.2f mm");
+        ImGui::SetItemTooltip("Between the pin and the knuckles around it, and between knuckles (what your printer needs between\n"
+                              "parts that must not fuse)");
+        {
+            int pin = p.hinges.pin == PinStyle::Fused ? 0 : 1;
+            if (ImGui::Combo("Hinge pin", &pin, "Printed in place\0Separate pin\0")) p.hinges.pin = pin == 0 ? PinStyle::Fused : PinStyle::Separate;
+            ImGui::SetItemTooltip("Printed in place: the pin is part of one piece and runs through the other's knuckle.\n"
+                                  "Separate: both are bored for a pin pushed in afterwards (under the surface, through a channel\n"
+                                  "cut from the pin's end out of the sphere).");
+        }
+        ImGui::Checkbox("Carve collisions away when done", &p.carveWhenDone);
+        ImGui::SetItemTooltip("Wherever two pieces still run into each other between open and closed, cut the overlap out of\n"
+                              "one of them: the one it shows less on when the design is closed");
+        ImGui::DragFloat("Carve clearance", &p.carve.clearance, 0.01f, 0.0f, 3.0f, "%.2f mm");
+        ImGui::SetItemTooltip("Room left around what is carved away");
+        ImGui::SliderInt("Carve checks", &p.carve.checksPerHinge, 8, 96);
+        ImGui::SetItemTooltip("Poses looked at in every hinge's turn; it carves, checks again between those, and carves what is left");
+        ImGui::Checkbox("Latch the first hinge when done", &p.latchWhenDone);
+        ImGui::SetItemTooltip("A press latch on the hinge that opens first (with 'Hinges hold each other shut', the one that keeps\n"
+                              "the whole design closed): a small rocker in the sphere's surface, flush with it. Its catch lies\n"
+                              "over a lip on the lid's edge; pressing its other end in steps the catch back off the lip.");
+        ImGui::SliderFloat("Latch size", &p.latch.scale, 0.6f, 1.6f, "x %.2f");
+        ImGui::DragFloat("Latch clearance", &p.latch.clearance, 0.01f, 0.15f, 1.0f, "%.2f mm");
+        ImGui::SetItemTooltip("The gap printed around the rocker (what your printer needs between parts that must not fuse)");
+        ImGui::EndDisabled();
+        if (m_FinishJob.Busy()) {
+            DrawJob(m_FinishJob.Control(), true, "finish", [&] { m_FinishJob.Cancel(); });
+            return;
+        }
+        ImGui::BeginDisabled(busy || m_Design.hinges.empty());
+        float third = (ImGui::GetContentRegionAvail().x - 3.0f * ImGui::GetStyle().ItemSpacing.x) / 4.0f;
+        if (ImGui::Button("Add hinges", ImVec2(third, 0))) StartFinish(Finish::Hinges);
+        ImGui::SetItemTooltip("Build the selected hinge's hardware, or every hinge's when none is selected (any design; Ctrl+Z undoes it)");
+        ImGui::SameLine();
+        if (ImGui::Button("Carve now", ImVec2(third, 0))) StartFinish(Finish::Carve);
+        ImGui::SetItemTooltip("Carve the current design's collisions away (any design; Ctrl+Z undoes it)");
+        ImGui::SameLine();
+        if (ImGui::Button("Add ledges", ImVec2(third, 0))) StartFinish(Finish::Ledges);
+        ImGui::SetItemTooltip("Make the current design's hinges hold each other shut, in the order they open (a carved sphere)");
+        ImGui::SameLine();
+        if (ImGui::Button("Add latch", ImVec2(-FLT_MIN, 0))) StartFinish(Finish::Latch);
+        ImGui::SetItemTooltip("A press latch on the selected hinge, or on the first to open when none is selected (a carved sphere)");
+        ImGui::EndDisabled();
     }
 
     // The buttons, or the progress of a run.
@@ -282,6 +395,8 @@ namespace Bakugan {
         if (ImGui::Button("Stop", ImVec2(-FLT_MIN, 0))) m_AutoJob.Cancel();
         ImGui::SetItemTooltip("Stop and keep the best design found so far");
         if (rounds > 0) ImGui::TextDisabled("%d of %d rewrite rounds changed the design", accepted, rounds);
+        if (m_AutoUseGpu && m_Gpu->Drawn() > 0)
+            ImGui::TextDisabled("GPU: %d drawings, %.1f ms the last, %d shaders compiled", m_Gpu->Drawn(), m_Gpu->LastMs(), m_Gpu->Compiles());
     }
 
     void App::GenerateScore() {
@@ -325,16 +440,34 @@ namespace Bakugan {
         }
         ImVec4 clashColor = s.clashOpen + s.clashMotion > 0.005f ? Amber : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
         ImGui::TextColored(clashColor, "Overlapping: %.1f%% open, %.1f%% worst between", s.clashOpen * 100.0f, s.clashMotion * 100.0f);
-        ImGui::SetItemTooltip("Volume inside two pieces at once, as a share of the sphere's. Worst between: at %.0f%% of the\n"
-                              "closing motion. (Closed, carved pieces never overlap.)", s.clashMotionT * 100.0f);
+        ImGui::SetItemTooltip("Volume inside two pieces at once, as a share of the sphere's, at the poses the search last looked\n"
+                              "at. Worst between: at %.0f%% of the closing motion. (Closed, carved pieces never overlap.)", s.clashMotionT * 100.0f);
+        if (m_HasAutoChecked && s.radius > 0.0f) {
+            const MotionOverlap& m = m_AutoChecked;
+            const double sphere = 4.0 / 3.0 * PI * pow(s.radius, 3.0);
+            bool clear = m.openVolume + m.worstVolume < 0.0005 * sphere;
+            ImGui::TextColored(clear ? Green : Amber, "Checked at %d poses: %.2f%% open, %.2f%% worst between, %.2f mm deep", m.poses,
+                               100.0 * m.openVolume / sphere, 100.0 * m.worstVolume / sphere, m.deepest);
+            ImGui::SetItemTooltip("The finished design, checked once more at 24 poses in every hinge's turn on a finer grid.\n"
+                                  "What is left can be carved away (Finishing).");
+        }
+        if (s.dependents > 0) {
+            ImGui::TextColored(s.holdable < s.dependents ? Amber : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled),
+                               "Holding: %d of %d hinges have a piece near enough to hold them", s.holdable, s.dependents);
+            ImGui::SetItemTooltip("Of the hinges after the first to open, those with a piece within a ledge's reach that moves away\n"
+                                  "before their turn (the status line says which ledges were made)");
+        }
         GenerateTimeline();
         ImVec4 pivotColor = s.hingeGap > 0.02f * Vector3Distance(ReferenceBounds().min, ReferenceBounds().max) ? Amber
                                                                                                              : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
-        ImGui::TextColored(pivotColor, "Farthest pivot %.1f mm outside one of its pieces", fmaxf(s.hingeGap, 0.0f));
+        ImGui::TextColored(pivotColor, "Farthest hinge %.1f mm off one of its pieces", fmaxf(s.hingeGap, 0.0f));
         ImGui::TextColored(s.surfaceCarved > 0.02f ? Amber : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled), "Sphere surface carved: %.1f%%",
                            s.surfaceCarved * 100.0f);
         ImGui::SetItemTooltip("The share of the sphere's surface hollows reach (closed, it shows there)");
-        if (m_AutoParams.transportWeight > 0.0f) {
+        ImGui::TextColored(m_AutoParams.thinWeight > 0.0f && s.thinnest < m_AutoParams.minThickness ? Amber : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled),
+                           "Thinnest piece: %.1f mm", s.thinnest);
+        ImGui::SetItemTooltip("The largest ball that fits in the thinnest piece, across");
+        if (m_AutoParams.TransportOn()) {
             ImGui::TextDisabled("Transport: the material travels %.1f mm (rms); %.0f%% of the mesh unfilled", s.transportMove,
                                 s.transportUnfilled * 100.0f);
             ImGui::SetItemTooltip("How far, root mean square, the open design's material is from the part of the mesh it's paired with");
@@ -343,15 +476,16 @@ namespace Bakugan {
             ImGui::TextDisabled("3D: mesh %.1f mm from the design, design %.1f mm from the mesh (on average)", s.meshGap, s.designGap);
             ImGui::SetItemTooltip("Mean distance from the mesh's surface to the open design's, and back");
         }
-        ImGui::TextDisabled("loss %.3f (fit %.3f, coverage %.3f, semantic %.3f, collisions %.3f, hinges %.3f, surface %.3f, transport %.3f, "
-                            "sdf %.3f, chamfer %.3f)", s.total, s.fit, s.coveragePenalty, s.semantic, s.collision, s.hinges, s.surface,
-                            s.transport, s.sdf, s.chamfer);
+        ImGui::TextDisabled("loss %.3f (fit %.3f, coverage %.3f, semantic %.3f, collisions %.3f x %.0f, hinges %.3f, surface %.3f, holding %.3f, "
+                            "thin %.3f, transport %.3f, sdf %.3f, chamfer %.3f)", s.total, s.fit, s.coveragePenalty, s.semantic, s.collision,
+                            s.collisionScale, s.hinges, s.surface, s.dependency, s.thin, s.transport, s.sdf, s.chamfer);
         ImGui::SetItemTooltip("Lower is better: silhouettes * (fit + coverage penalty) + semantic * its weight\n"
                               "+ collisions * their weight + hinges * their weight + surface * its weight\n"
                               "+ transport, sdf and chamfer * theirs.\n"
                               "Fit: the mean over the views of the share of the mesh missed plus the share of extra pixels.\n"
-                              "Collisions: overlap depth over its volume, against the sphere's volume.\n"
-                              "Hinges: how far pivots are outside their pieces (beyond 1%% of the mesh's size), over its size.");
+                              "Collisions: overlap depth over its volume, against the sphere's volume (times how far the\n"
+                              "search had raised their cost when this was scored).\n"
+                              "Hinges: how far each hinge's pieces are from its axis, along the length its barrel takes up, over the mesh's size.");
         ImGui::TextDisabled("sphere %.1f mm across; mesh moved %.1f mm, scaled %.2fx", s.radius * 2.0f, Vector3Length(s.target.offset), s.target.scale);
         if (m_AutoHistory.size() > 1) {
             auto [lo, hi] = std::minmax_element(m_AutoHistory.begin(), m_AutoHistory.end());

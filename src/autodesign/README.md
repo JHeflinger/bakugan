@@ -11,9 +11,12 @@ The editor and the test suite call one function, `AutoDesign`, declared in `auto
 | `autodesign.cpp` | the optimizer, top to bottom: the sphere, Adam steps, rewrite rounds, result |
 | `carving.hpp/.cpp` | what's designed: the sphere, its cutters, pieces and joints; building it into a `Design`; its parameters |
 | `adam.hpp` | Adam, with memory kept per parameter key, so parameters can come and go |
-| `loss.hpp/.cpp` | the loss (the open pose against the placed mesh, collisions, pivots) and its gradient; where collisions are checked |
+| `loss.hpp/.cpp` | the loss (the open pose against the placed mesh, collisions, holding, pivots) and its gradient; the opening order |
 | `transport.cpp` | the transport part of the loss: optimal transport between the sphere's material, opened, and the placed mesh |
 | `shape.cpp` | the 3D shape part of the loss: the Chamfer distance and signed distances against the placed mesh |
+| `tracer.hpp` | the silhouettes drawn somewhere else than on the CPU's cores (the editor's GPU: `ui/gputrace.cpp`) |
+| `../data/clash.hpp/.cpp` | overlaps between bodies on their exact fields, and where in the motion to look for them |
+| `../data/finish.hpp/.cpp` | the finishing passes: ledges, carving collisions away, the press latch |
 | `semantic.cpp` | the semantic part of the loss: the views drawn as pictures and compared by DINOv3 |
 | `dino.hpp/.cpp` | DINOv3 through ONNX Runtime, loaded at run time (its C API header is in `src/vendor/onnxruntime`) |
 | `grammar.hpp/.cpp` | the rewrite rules: add or remove a cut (and its hinge), add or remove a hollow |
@@ -42,8 +45,10 @@ Pieces are joined by **joints**, one per cut. A joint turns its child piece abou
 2. **Start.** The sphere, whole: one piece.
 3. **Steps.** Until the step budget runs out:
    - Every step is one Adam step on every parameter: the cutters', the joints' and the placement's.
-   - Every `stepsPerRound` steps there is a rewrite round. Rewrites are drawn from the grammar. Each rewritten carving, and the unchanged one, gets `lookahead` Adam steps of its own. Whichever has the lowest loss afterwards carries on, with its Adam memory.
+   - What overlaps cost rises steadily over the run, from `collisionWeight` to `collisionRamp` times it: early on the search may try things, by the end the pieces have to be clear of each other. Carvings from different times are compared as they'd score at the end of the ramp.
+   - Every `stepsPerRound` steps there is a rewrite round. First the opening order is looked at again (below). Then rewrites are drawn from the grammar. Each rewritten carving, and the unchanged one, gets `lookahead` Adam steps of its own. Whichever has the lowest loss afterwards carries on, with its Adam memory.
 4. **Result.** The best carving seen during the run, built into a design (`AutoResult::design`; the carving itself is in `AutoResult::carving`). The editor shows the reference mesh where it was placed for it.
+5. **Finishing**, as asked (below): the hinges' hardware, ledges, carving, a latch. They change the design only, not the carving. Then the finished design's motion is checked once more, at 24 poses in every hinge's turn on a finer grid than the search could afford (`AutoResult::checked`).
 
 With 0 steps it only scores the editor's design as it is: its open pose against the mesh where it is.
 
@@ -64,17 +69,18 @@ Only the open pose and the motion are scored. Closed, the pieces are the sphere.
 
 - **Silhouettes.** Per view, with T the placed mesh's coverage of a pixel and D the design's: covered = Σ min(T, D) / Σ T, extra = Σ max(0, D − T) / Σ T, and the view's loss is (1 − covered) + extra. `fit` is the mean over the views. A view covered less than `minViewCoverage` costs 10 per whole share short.
 - **Semantics** (below), when `semanticWeight` > 0.
-- **Collisions**, weighted by `collisionWeight`.
+- **Collisions**, weighted by `collisionWeight` (times the ramp).
+- **Holding** (with `dependencies`): hinges nothing could hold shut, weighted by `dependencyWeight`.
 - **Hinges**: pivots away from their pieces, weighted by `hingeWeight`.
 - **Surface**: hollows reaching the sphere's surface, weighted by `surfaceWeight`. Over 1024 points spread just under the surface, the mean of d / (d + 1% of the mesh's size), d how deep the point is inside a hollow: about the share of the surface carved away, rising smoothly as a hollow reaches it (so it has a gradient). Its gradient is measured directly, by nudging the hollows' parameters.
 
-total = `silhouetteWeight` · (fit + coverage penalty) + `semanticWeight` · semantic + `collisionWeight` · collision + `hingeWeight` · hinges + `surfaceWeight` · surface.
+total = `silhouetteWeight` · (fit + coverage penalty) + `semanticWeight` · semantic + `collisionWeight` · collision + `hingeWeight` · hinges + `surfaceWeight` · surface + `dependencyWeight` · holding.
 
 ## The 3D terms
 
-All off by default. They compare the open design with the placed mesh in 3D, not as outlines from a few views.
+All off by default (transport is a switch; SDF and Chamfer are off at weight 0). They compare the open design with the placed mesh in 3D, not as outlines from a few views.
 
-**Transport** (`transportWeight`, `transportPoints`; `transport.cpp`). The carving can't grow or shrink, only rearrange the sphere's material, so the question is where that material goes. Silhouettes, the SDF and the Chamfer distance only see mistakes near the mesh: a piece opened to the wrong place, far from where it's needed, gets no pull from them. Optimal transport (the earth mover's distance) pairs every bit of material with a bit of the mesh it should fill, however far away, and pulls it there.
+**Transport** (`transport` switches it on; `transportWeight`, `transportPoints`; `transport.cpp`). In the Generate tab it's the *Optimal transport* checkbox; in the CLI `transport = true`; in `autotest`/`gradcheck` `OT=1` (or `OTW=...`). The carving can't grow or shrink, only rearrange the sphere's material, so the question is where that material goes. Silhouettes, the SDF and the Chamfer distance only see mistakes near the mesh: a piece opened to the wrong place, far from where it's needed, gets no pull from them. Optimal transport (the earth mover's distance) pairs every bit of material with a bit of the mesh it should fill, however far away, and pulls it there.
 - *The material*: fixed points spread evenly through the sphere, in its frame. Each belongs to the piece it's inside (a point in a hollow: to none) and moves rigidly with that piece's open pose, so there's nothing to sample again.
 - *The mesh*: fixed points filling it (winding number over ½), moved with the placement.
 - *The masses*, in shares of the sphere's volume: a material point weighs its share of the sphere, a mesh point its share of the placed mesh's volume (over the sphere's). The transport is unbalanced: mass left unmatched costs ρ = (the mesh's size)² a unit, so moving material is always cheaper than dropping it and only a real difference in amount goes unmatched. A mesh with less room than the sphere's material can't take all of it, and material taken by hollows leaves part of the mesh unfilled (`transportUnfilled`): both cost.
@@ -121,17 +127,71 @@ If either file can't be loaded, the run stops and says why, rather than carry on
 
 ## Collisions
 
-Pieces are checked for overlaps in the open pose, and `motionChecks` poses between open and closed (`CheckTimes` in `loss.cpp`). Closed needs no check.
+Pieces are checked for overlaps in the open pose, and in `hingeChecks` poses of every hinge's turn (`HingeChecks` in `data/clash.cpp`). Closed needs no check.
 
-- **Where the poses between go.** The timeline is cut wherever a joint starts or stops turning. Stretches where no joint turns get no checks.
-- **How they're spread.** A share `1 - motionCheckBias` of the checks is spread evenly over the stretches where at least one joint turns. The rest goes by how many joints turn at once.
-- **Why they follow the joints.** The checks sit at evenly spaced quantiles of that distribution, so they move along smoothly when Adam changes a joint's timing (`t0`, `t1`). The optimizer can't hide a collision by scheduling every turn where nothing is checked.
+- **Per hinge, not per second.** A hinge's checks are spread evenly over its *angle*. A turn that takes all of the motion and one that takes a twentieth of it are looked at equally closely, so turning faster hides nothing and gains nothing.
+- **Between the last ones.** Every Adam step shifts the checks (and the sampling grid) by the golden ratio, so each step looks between the poses the steps before it looked at. An overlap can't sit between two checks for long. Rewrites that are compared with each other look in the same places.
+- **Who is checked against whom.** In a pose of a hinge's turn, every two pieces that hinge (or another turning then) moves against each other. The rest stand as they did at the end of an earlier turn, which was checked then.
+- **How much.** Two pieces are sampled on a grid over the box where they can meet (`SampleOverlap`). A cell the fields show to be clear of either piece is skipped, one inside both counts whole, and one a surface passes through is split in eight and sampled again: an overlap thicker than half a cell can't fall between samples.
+- **What it costs.** A point inside two pieces costs its depth, plus up to 2% of the mesh's size more, reached at a quarter of that depth. Depth alone makes thin overlaps nearly free (their cost goes with the square of their thickness); this way a shallow one already costs five times its depth. Over the sphere's volume times 2% of the mesh's size. The open pose counts fully; each hinge's poses share one weight.
 
-For each pose, every two pieces whose boxes meet are sampled where they meet, using the same unit points each time. A piece's box is the sphere's, cut down by the boxes of the cutters it's inside of. The term is the depth of the overlap integrated over its volume, relative to the sphere's volume times 2% of the mesh's size. The open pose counts fully; the poses between share one weight.
+### The opening order
+
+With `orderHinges` (the default) the hinges open one after another, each in its own equal share of the motion; timing is then no parameter (`Carving::ordered`, `Joint::order`, and `Tidy` sets `t0`/`t1` from them). `Loss::BestOrder` finds the order greedily: from closed, the hinge whose turn overlaps least with everything as it then stands opens next, then the next freest with that one open, and so on. A hinge that needs another out of its way so comes after it. The order is looked at again at every rewrite round and at the end, and taken when the carving scores better with it.
+
+Without it, each hinge's `t0` and `t1` are Adam's, and hinges may turn at once.
+
+## Dependencies
+
+With `dependencies`, every hinge but the first to open should be held shut by a piece that moves away before its turn. Then one hinge keeps the whole design closed, and letting it go lets the rest unfurl in order (the hinges are spring loaded).
+
+- **Who can hold a hinge.** A piece that doesn't turn with the hinge, and that an earlier hinge parts from the hinge's parent (so it has gone by the hinge's turn; the parent itself never goes).
+- **Where.** On the turned pieces' surface where it lifts off as the hinge opens, at least 0.4 of the farthest point's lever from the axis (a hold next to the axis holds little).
+- **The term** (`Loss::Dependencies`). Per hinge after the first, how far the nearest such piece is along the sphere's surface, over the radius (1 when there is none). Its gradient is a stand-in: along the surface between the two nearest points, whatever lies outside both pieces pulls the nearer one toward it.
+- **Helping it along.** New cuts are tried first where another piece's surface is within reach, and among turns that are equally free the opening order prefers one that can be held.
+- **The ledges** (`AddLedges`, when the search is done). For each hinge after the first, a small tab is cut from the sphere itself: it becomes part of the holding piece and lies over the piece the hinge turns. Material changes hands, none is added, so the closed surface stays flush. A ledge is kept only if the hinge runs into it when it starts to open with the holder still in place, and nothing else runs into it during the motion. The result says how many hinges got one; the rest are named.
+
+## Finishing
+
+The same passes the Generate tab's Finishing section runs on any design (`data/finish.hpp`):
+
+- **Carve collisions away** (`CarveCollisions`). The motion is checked at `checksPerHinge` poses of every hinge's turn. Whatever is inside two bodies is covered with rounded boxes (the overlap's own box along its principal axes, split while it is mostly empty), `clearance` larger all round, and cut from the body it shows less on when closed. Then it checks again between those poses and carves what is left, up to `rounds` times. It works on any design; nothing is added anywhere, so nothing sticks out of the sphere.
+- **Add hinges** (`AddHinges`): each hinge's hardware; see Hinges.
+- **Add ledges**: as above, for a carved sphere.
+- **Add latch** (`AddLatch`). A press latch on the hinge that opens first (or the selected one): a small rocker printed into the surface, flush with it. A thin web joins its leg to the body below; pressing the arm's far end in turns the rocker about the web, and its catch steps back off a lip on the other body. Where the body that stays down is deep enough at the seam, the rocker is in it and its catch lies *over* a lip on the lid's edge. Where it isn't (a thin edge), the rocker is in the lid and its catch hooks *under* a lip left at the surface of the other body; its web is then under the catch's tip where that is the lid's own material, and just inside the seam where it isn't (the lip gets a little more room over the catch there, because the catch rises slightly as it steps back). Either way it is cut from the sphere, with `clearance` around it. A place is taken only if the lid runs into the catch when it starts to open, and, with the rocker pressed, clears it all the way open. The web is made as long as the body is deep there (the longer, the less it is strained); the result says how far it bends. The rocker needs about 0.6 of the sphere's radius of depth at the seam in one of the two bodies: where neither has it, there is no latch, and the result says so.
+
+## The silhouettes on the GPU
+
+`AutoParams::gpu` is a `SilhouetteTracer` (`tracer.hpp`). With one, each evaluation hands every piece's field over as GLSL and gets back, per pixel of every view, the piece that covers it most, how near its ray comes and where: what `Loss::Trace` finds on the CPU, marched the same way step for step. The comparison with the mesh and the gradient (which re-evaluates fields at edge pixels and overlap samples) stay on the CPU, and so do the DINOv3 pictures.
+
+The editor's tracer (`ui/gputrace.cpp`) draws with the editor's own OpenGL context. That belongs to the UI thread, so the search hands each request over and waits; the UI thread answers once a frame and stays at it for most of the frame while a search keeps asking. The window redraws about a dozen times a second meanwhile. All views go into one float target, one rectangle per piece; a piece's numbers are uniforms, so shaders are compiled only when a rewrite changes a piece's structure. If the tracer can't draw (no float targets, a shader that won't build, the UI thread busy for two seconds), that evaluation is drawn on the CPU.
+
+How much it gains depends on how much of a step is drawing: with 5 pieces, about 40% of a step at 64 pixels a view and 70% at 256 (measured with a software renderer, so the share is all that can be said here).
 
 ## Hinges
 
-A joint's pivot should sit where its two pieces meet. For each joint, the term adds how far the pivot is outside each of its two pieces, beyond 1% of the mesh's size, over the mesh's size. Both are in the closed pose, the frame pivots are given in. A new cut's pivot starts on the edge of its cut face, on both pieces.
+A hinge has to sit where its two pieces meet, over the whole length its barrel takes up, or nothing can be built on it. For each joint the term takes three points on the axis (the pivot, and half a barrel's length either way: `PlanHinge` in `data/finish.hpp`) and adds how far each of the two pieces is from each, beyond `HingeSlack` (half of what a knuckle's leaf can bridge: 0.6 mm at the default size and reach); the mean of the three, over the mesh's size. Both pieces are in the closed pose, the frame pivots are given in.
+
+It used to look at the pivot alone, with 1% of the mesh's size to spare. A pivot is a point: the axis through it was free to turn away from the seam, and a pivot could float that far off both pieces, so hinges came out joined at one spot or not at all. Raising its weight didn't change what it measured.
+
+This term is also what limits the search most. With it ignored (`hingeWeight` 0) the same run finds twice the pieces and far better cover, on axes tens of millimetres from the pieces they turn. `hinges.reach` is the honest way to give the search more room: the pieces may then be that far from the axis, and the hinge is built with leaves that long.
+
+With `buildHinges` the search plans for the hardware `AddHinges` builds when it is done:
+
+- **Under the surface** (`hinges.flush`): the term also adds how far the pivot is from being deep enough for the barrel to be inside the sphere, and a new lid's pivot starts that deep, in from its rim until the lid is within reach.
+- **Room to turn.** An axis under the surface has its two pieces in each other's way next to it as they turn, whatever their shapes. `AddHinges` cuts that room (`HingeSizes::relief`), so overlaps between a hinge's two pieces within that distance of its axis aren't counted as collisions.
+
+### The hardware (`AddHinges`)
+
+The smallest barrel that prints: a 1.6 mm pin, the clearance around it and a 0.8 mm wall (3.8 mm across), three knuckles 2 mm long each; the parent has the outer two and, printed in place, the pin. `hinges.scale` scales it. For each hinge:
+
+- **Where along the axis**: where both bodies are nearest the axis over the barrel's whole length. Sliding the pivot along its axis changes nothing about the motion.
+- **Under the surface** (`flush`, a carved sphere): the axis moves toward the sphere's centre until the barrel is inside the sphere. On a design that wasn't searched with `buildHinges` this moves the axis by the barrel's radius or more, and the lid is often not there any more: the hinge is then not built, and named. Without `flush` the barrel is on the axis as it is, and sticks out of the sphere when the axis is at its surface.
+- **Leaves**: each body's knuckles are tied in by a short plate, pointed where it finds the most of its own body and none of the other, inside the sphere.
+- **Room**: the other body is cut away around each leaf, any third body around the barrel, and (flush) the two bodies where they would rub next to the axis as they turn.
+- **A separate pin** (`pin`): both bodies are bored for a pin pushed in afterwards; under the surface, a channel is cut from the pin's end out of the sphere to push it in by.
+
+A hinge is built only if both bodies are within a leaf's reach of the axis there. The result gives the sizes, what was moved and cut, and the motion's overlap before and after. Carving collisions away afterwards never cuts hardware: what a knuckle or leaf runs into gives way, and next to a hinge each body gives way along the other's knuckles, so no body is cut loose from its own.
 
 ## The gradient
 

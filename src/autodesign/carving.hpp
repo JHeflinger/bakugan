@@ -38,6 +38,7 @@ namespace Bakugan {
         Vector3 axis = { 1, 0, 0 };
         float open = 0.0f;                       // the angle it opens to (radians); closed is 0
         float t0 = 0.0f, t1 = 1.0f;              // when it turns, as the design closes (0..1)
+        int order = 0;                           // its place in the opening order (0 opens first), when the carving is ordered
     };
 
     struct Carving {
@@ -47,6 +48,9 @@ namespace Bakugan {
         std::vector<Piece> pieces;
         std::vector<Joint> joints;
         int nextId = 1;
+        // Ordered: the joints open one after another, each in its own share of the motion, in the order of their
+        // `order` (Tidy sets t0 and t1 from it: timing is then no parameter). Otherwise t0 and t1 are Adam's.
+        bool ordered = false;
 
         // One piece: the whole sphere.
         static Carving Sphere(Vector3 centre, float radius);
@@ -64,6 +68,10 @@ namespace Bakugan {
         BoundingBox PieceBounds(const Piece& p) const;
         // The joint a piece hangs from (its index, or -1 for the root).
         int ParentJoint(int pieceId) const;
+        // The joints' ids in opening order.
+        std::vector<int> Order() const;
+        // Sets the opening order (joint ids, first opens first; joints left out keep their order after those).
+        void SetOrder(const std::vector<int>& ids);
     };
 
     // Where the mesh is placed for the comparison: scaled about its own centre (of volume), then moved.
@@ -94,6 +102,7 @@ namespace Bakugan {
     float Get(const Carving& c, const Placement& t, const Param& p, bool* ok = nullptr);
     // Sets it, kept inside its range (sizes stay positive, rounding within 0..1, ...).
     void Set(Carving& c, Placement& t, const Param& p, float value, float L);
-    // After changing parameters: rotations and axes back to unit length, joints' timing windows kept in order.
+    // After changing parameters: rotations and axes back to unit length, joints' timing windows kept in order (or, in an
+    // ordered carving, set from the opening order: equal shares of the motion, the first to open the last to close).
     void Tidy(Carving& c);
 }

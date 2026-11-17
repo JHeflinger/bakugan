@@ -13,9 +13,9 @@
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC="$HERE/../../src"
-: "${RAYLIB_SRC:?set RAYLIB_SRC to raylib's src folder}"
+: "${RAYLIB_SRC:?set RAYLIB_SRC to the raylib src folder}"
 FLAGS="-std=c++17 -O2 -Wall -Wextra -Wno-missing-field-initializers -I$SRC -I$RAYLIB_SRC"
-CODE="$SRC/autodesign/*.cpp $SRC/data/design.cpp $SRC/data/field.cpp $SRC/data/superfrustum.cpp $SRC/data/templates.cpp $HERE/stubs.cpp"
+CODE="$SRC/autodesign/*.cpp $SRC/data/design.cpp $SRC/data/clash.cpp $SRC/data/finish.cpp $SRC/data/field.cpp $SRC/data/superfrustum.cpp $SRC/data/templates.cpp $HERE/stubs.cpp"
 g++ $FLAGS "$HERE/test.cpp" $CODE -lpthread -o "$HERE/autotest"
 g++ $FLAGS "$HERE/suitetest.cpp" $CODE -lpthread -o "$HERE/suitetest"
 g++ $FLAGS "$HERE/gradcheck.cpp" $CODE -lpthread -o "$HERE/gradcheck"

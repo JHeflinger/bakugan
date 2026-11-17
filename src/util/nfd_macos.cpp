@@ -73,8 +73,18 @@ namespace {
 
 extern "C" {
     nfdresult_t NFD_OpenDialog(const nfdchar_t* filterList, const nfdchar_t* defaultPath, nfdchar_t** outPath) {
+        // "choose file of type" matches type identifiers; a bare extension isn't always enough (an .obj is
+        // public.geometry-definition-format to the Mac, and greyed out when only "obj" is allowed). So both.
+        static const struct { const char* ext; const char* uti; } kTypes[] = {
+            { "obj", "public.geometry-definition-format" }, { "stl", "public.standard-tesselated-geometry-format" },
+            { "gltf", "org.khronos.gltf" }, { "glb", "org.khronos.glb" }, { "txt", "public.plain-text" },
+        };
         std::string types;
-        for (const std::string& e : Extensions(filterList)) types += (types.empty() ? "" : ", ") + Quote(e.c_str());
+        for (const std::string& e : Extensions(filterList)) {
+            types += (types.empty() ? "" : ", ") + Quote(e.c_str());
+            for (const auto& t : kTypes)
+                if (e == t.ext) types += ", " + Quote(t.uti);
+        }
         std::string script = "activate\nPOSIX path of (choose file" + (types.empty() ? "" : " of type {" + types + "}") +
                              Location(defaultPath) + ")";
         return Run(script, outPath);

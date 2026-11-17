@@ -37,6 +37,25 @@ namespace Bakugan {
         return -1;
     }
 
+    std::vector<int> Carving::Order() const {
+        std::vector<const Joint*> js;
+        for (const Joint& j : joints) js.push_back(&j);
+        std::stable_sort(js.begin(), js.end(), [](const Joint* a, const Joint* b) { return a->order < b->order; });
+        std::vector<int> ids;
+        for (const Joint* j : js) ids.push_back(j->id);
+        return ids;
+    }
+
+    void Carving::SetOrder(const std::vector<int>& ids) {
+        std::vector<int> all = ids;
+        for (int id : Order())
+            if (std::find(all.begin(), all.end(), id) == all.end()) all.push_back(id);
+        for (size_t r = 0; r < all.size(); r++) {
+            int k = JointIndex(all[r]);
+            if (k >= 0) joints[k].order = (int)r;
+        }
+    }
+
     int Carving::Hollows() const {
         int n = 0;
         for (const Cutter& k : cutters) n += k.hollow;
@@ -214,7 +233,10 @@ namespace Bakugan {
         for (const Cutter& k : c.cutters)
             for (int f = 0; f < CutterCount; f++) out.push_back({ Param::Cutter, k.id, f, CutterFields[f].unit * (CutterFields[f].length ? L : 1.0f) });
         for (const Joint& j : c.joints)
-            for (int f = 0; f < JointCount; f++) out.push_back({ Param::Joint, j.id, f, JointFields[f].unit * (JointFields[f].length ? L : 1.0f) });
+            for (int f = 0; f < JointCount; f++) {
+                if (c.ordered && f >= 7) continue;       // timing comes from the opening order
+                out.push_back({ Param::Joint, j.id, f, JointFields[f].unit * (JointFields[f].length ? L : 1.0f) });
+            }
         return out;
     }
 
@@ -253,8 +275,16 @@ namespace Bakugan {
             Quaternion& q = k.sf.rotation;
             q = QuaternionLength(q) > 1e-6f ? QuaternionNormalize(q) : QuaternionIdentity();
         }
+        if (c.ordered) c.SetOrder({});                   // ranks 0 .. n - 1, as they stand
+        const float n = (float)std::max<size_t>(1, c.joints.size());
         for (Joint& j : c.joints) {
             j.axis = Vector3Length(j.axis) > 1e-6f ? Vector3Normalize(j.axis) : Vector3{ 0, 1, 0 };
+            if (c.ordered) {
+                // one after another: the first to open is the last to close
+                j.t0 = 1.0f - (j.order + 1) / n;
+                j.t1 = 1.0f - j.order / n;
+                continue;
+            }
             // its turn takes a twentieth of the motion at least, inside it
             float w = std::clamp(j.t1 - j.t0, 0.05f, 1.0f);
             j.t0 = std::clamp(j.t0, 0.0f, 1.0f - w);

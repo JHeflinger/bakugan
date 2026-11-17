@@ -201,6 +201,79 @@ void main() {
 }
 )";
 
+    static const char* TraceVertex = R"(#version 330
+in vec3 vertexPosition;
+uniform mat4 mvp;
+void main() { gl_Position = mvp * vec4(vertexPosition, 1.0); }
+)";
+
+    // The generator's silhouettes (autodesign/loss.cpp, Loss::Trace, step for step): every view side by side in one
+    // target, a pixel's ray marched through the body's field in the body's own frame. Out comes the least distance
+    // the ray gets to the body and how far along it that is; the depth is 1 - coverage, so of several bodies drawn
+    // over each other the one covering the pixel most is kept.
+    static const char* TraceMain = R"(
+uniform vec3 viewDir[24];
+uniform vec3 viewU[24];
+uniform vec3 viewV[24];
+uniform vec3 frameCentre;
+uniform float frameHalf;
+uniform float viewRes;
+uniform float tau;
+uniform float farAway;
+uniform vec4 bodyQuat;
+uniform vec3 bodyPos;
+uniform vec3 boxMin;
+uniform vec3 boxMax;
+uniform float pieceNumber;
+out vec4 finalColor;
+
+void main() {
+    float fx = floor(gl_FragCoord.x), fy = floor(gl_FragCoord.y);
+    int view = int(fx / viewRes);
+    float x = fx - float(view) * viewRes;
+    float sx = ((x + 0.5) / viewRes * 2.0 - 1.0) * frameHalf, sy = (1.0 - (fy + 0.5) / viewRes * 2.0) * frameHalf;
+    vec3 wdir = viewDir[view];
+    vec3 o = frameCentre - wdir * farAway + viewU[view] * sx + viewV[view] * sy;
+    vec4 inv = vec4(-bodyQuat.xyz, bodyQuat.w);
+    vec3 lo = qrot(inv, o - bodyPos), dir = qrot(inv, wdir);
+    float tn = 0.0, tf = 2.0 * farAway;
+    for (int a = 0; a < 3; a++) {
+        float oa = lo[a], da = dir[a], l = boxMin[a] - tau, h = boxMax[a] + tau;
+        if (abs(da) < 1e-9) {
+            if (oa < l || oa > h) discard;
+            continue;
+        }
+        float t0 = (l - oa) / da, t1 = (h - oa) / da;
+        if (t0 > t1) { float s = t0; t0 = t1; t1 = s; }
+        tn = max(tn, t0);
+        tf = min(tf, t1);
+        if (tn > tf) discard;
+    }
+    float t = tn, dmin = 3.0e38, tmin = tn;
+    for (int k = 0; k < 64 && t <= tf; k++) {
+        float d = map(lo + dir * t);
+        if (d < dmin) { dmin = d; tmin = t; }
+        if (d < -tau) break;
+        t += d > tau ? 0.9 * d : 0.5 * tau;
+    }
+    if (abs(dmin) < tau) {
+        const float g = 0.618034;
+        float a = tmin - 0.5 * tau, b = tmin + 0.5 * tau;
+        for (int k = 0; k < 8; k++) {
+            float c = b - g * (b - a), e = a + g * (b - a);
+            float dc = map(lo + dir * c), de = map(lo + dir * e);
+            if (dc < dmin) { dmin = dc; tmin = c; }
+            if (de < dmin) { dmin = de; tmin = e; }
+            if (dc < de) b = e; else a = c;
+        }
+    }
+    float cover = clamp(0.5 - dmin / (2.0 * tau), 0.0, 1.0);
+    if (cover <= 0.0) discard;
+    finalColor = vec4(dmin, tmin, pieceNumber, 1.0);
+    gl_FragDepth = 1.0 - cover;
+}
+)";
+
     static std::string Assemble(const std::string& body, int uniforms, const char* main) {
         std::string s = "#version 330\n";
         s += "uniform vec4 U[" + std::to_string(std::max(uniforms, 1)) + "];\n";
@@ -214,6 +287,8 @@ void main() {
     const char* Sdf::VertexSource() { return Vertex; }
     std::string Sdf::ProbeFragmentSource(const std::string& body, int uniforms) { return Assemble(body, uniforms, ProbeMain); }
     const char* Sdf::ProbeVertexSource() { return ProbeVertex; }
+    std::string Sdf::TraceFragmentSource(const std::string& body, int uniforms) { return Assemble(body, uniforms, TraceMain); }
+    const char* Sdf::TraceVertexSource() { return TraceVertex; }
     std::string Sdf::ShapeMap() { return "return sf(p, 0);\n"; }
 
     void Sdf::ShapeParams(const SuperFrustum& f, std::vector<Vector4>* U) {

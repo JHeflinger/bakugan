@@ -4,6 +4,8 @@
 #include <cstdarg>
 #include <cstdio>
 #include <vector>
+// raylib's ExportImage (suite.cpp's WritePng): not linked here, so PNGs can't be written by these tools
+extern "C" bool ExportImage(Image, const char*) { return false; }
 namespace Bakugan {
     Vector3 Rigid::Apply(Vector3 p) const { return Vector3Add(Vector3RotateByQuaternion(p, rotation), position); }
     Vector3 Rigid::ApplyVector(Vector3 v) const { return Vector3RotateByQuaternion(v, rotation); }

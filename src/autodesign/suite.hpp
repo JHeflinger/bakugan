@@ -10,7 +10,11 @@ namespace Bakugan {
     // side, each in its own labelled box: the best design over the whole search, then the result closing and opening.
     struct SuiteParams {
         AutoParams generate;         // the generator settings (every mesh starts from a sphere)
-        std::string folder;          // where the .obj files are; results go to <folder>/autodesign_suite/
+        std::string folder;          // where the .obj files are
+        std::string outDir;          // where the results go (empty: <folder>/autodesign_suite/)
+        bool video = true;           // render the video (needs ffmpeg); off: only the designs, pictures and summary are written
+        bool preview = true;         // a still picture per mesh: the result open, closing and closed (<name>.png)
+        int previewSize = 360;       // pixels across each pose of that picture
         float meshSize = 80.0f;      // mm: each mesh is centred and scaled so its longest side is this (0: as is)
         int videoSize = 1080;        // pixels, square
         int fps = 30;
@@ -39,6 +43,14 @@ namespace Bakugan {
     };
 
     std::vector<std::string> SuiteMeshes(const std::string& folder);     // the .obj files in a folder, sorted
+    // Centred, its longest side `size` mm (0: as it is); fills in the mesh's box.
+    void NormalizeMesh(TriMesh& m, float size);
+    // A png from 8 bit pixels (3: RGB, 4: RGBA), rows from the top. No window or GL context needed.
+    bool WritePng(const std::string& path, const std::vector<unsigned char>& pixels, int width, int height, int channels,
+                  std::string* error);
+    // One still picture of a design: open, a third and two thirds of the way closed, and closed, from one fixed camera,
+    // over the mesh it was fitted to (already placed where it was fitted: the caller applies AutoScore::target).
+    bool WritePreviewPng(const Design& design, const TriMesh& placedMesh, int cellSize, const std::string& path, std::string* error);
     bool LoadObj(const std::string& path, TriMesh* out, std::string* error);
     bool FfmpegAvailable();
     SuiteResult RunSuite(const SuiteParams& p, JobControl& c, std::shared_ptr<SuiteLive> live);

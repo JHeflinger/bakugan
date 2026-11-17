@@ -109,6 +109,8 @@ namespace Bakugan {
         // Body transforms from the design pose to the pose at timeline position t of the motion, indexed like `groups`
         // (features take their body's transform).
         std::vector<Rigid> Transforms(float t, bool ease, Motion m = Motion::Closing) const;
+        // The same with every hinge at a given angle (indexed like `hinges`): any pose, on the timeline or not.
+        std::vector<Rigid> TransformsAt(const std::vector<float>& angles) const;
         std::vector<Rigid> PoseTransforms(ExportPose pose, bool ease) const;
         void HingeInWorld(int hinge, const std::vector<Rigid>& xf, Vector3* pivot, Vector3* axis) const;
         Vector3 LeafDirection(int hinge, bool child) const;   // unit, perpendicular to the axis, design pose

@@ -37,12 +37,16 @@ namespace Bakugan {
         m_Shader = LoadShaderFromMemory(Utils::GetVertexShader(), Utils::GetFragmentShader());
         m_ViewPositionLocation = GetShaderLocation(m_Shader, "viewPos");
         if (!m_Sdf.Init()) m_Exact = false;   // no float precision / GLSL 3.3 trouble: draw meshes instead
+        m_Gpu = std::make_shared<GpuSilhouettes>();
+        m_Gpu->Init();
         LoadTemplate(0);
         m_UndoStack.clear();
         m_Committed = Capture();
     }
 
     App::~App() {
+        m_Gpu->Close();                       // a search waiting for its silhouettes gets no more of them: it can stop
+        m_FinishJob.Stop();
         m_SuiteJob.Stop();
         m_AutoJob.Stop();
         m_BuildJob.Stop();
@@ -57,6 +61,7 @@ namespace Bakugan {
         if (m_HasNotifySound) UnloadSound(m_NotifySound);
         if (m_Audio) CloseAudioDevice();
         m_Sdf.Unload();
+        m_Gpu->Unload();
         m_DesignView.Unload();
         m_OutputView.Unload();
         UnloadShader(m_Shader);
@@ -401,6 +406,7 @@ namespace Bakugan {
         }
         PollAuto();
         PollSuite();
+        PollFinish();
     }
 
     // Keeps the parts and the collision sweep in step with the design, once the user lets go of whatever they drag.
@@ -410,7 +416,7 @@ namespace Bakugan {
     void App::UpdateJobs() {
         // while the generator runs the design changes several times a second: the views raymarch it directly, and the
         // parts and the collision check catch up once it is done
-        if (Interacting() || m_AutoJob.Busy()) return;
+        if (Interacting() || m_AutoJob.Busy() || m_FinishJob.Busy()) return;
         float voxel = PreviewVoxel(m_Design, m_PreviewResolution);
         bool partsStale = !m_HasParts || !SameGeometry(m_PartsFor, m_Design) || m_PartsVoxel != voxel;
         if (partsStale) {
@@ -877,6 +883,9 @@ namespace Bakugan {
     }
 
     void App::Frame() {
+        // a search that draws its silhouettes on the GPU has them drawn here, by this thread: it stays at it for most
+        // of a frame while the search keeps asking (the editor redraws about a dozen times a second meanwhile)
+        if (m_Gpu->Ok()) m_Gpu->Service(m_AutoJob.Busy() || m_SuiteJob.Busy() ? 0.08 : 0.0);
         HandleFileDrops();
         PollJobs();
         UpdateAnimation();

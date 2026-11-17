@@ -1,6 +1,10 @@
 // Headless run of the generator: ./autotest mesh.obj [steps] [seed] [outPrefix]
-// Env: MAXSECONDS (stop after, keeping the best), SNAPSHOT (seconds between progress files), SURFW, MAXHOLLOWS, OTW (transport weight), OTN (its points), SDFW, CHAMW, SHAPEN (3D terms; 0: off), VIEWS, VRES, LR, ROUND (steps per round), REWRITES, LOOKAHEAD, MARGIN, MAXPIECES, WEIGHTS (the rules', e.g. 1,0.5),
-// FIXTARGET (the mesh stays put), NOSCALE (it may move but not scale), HINGEW, COLW, CHECKS, CHECKBIAS.
+// Env: MAXSECONDS (stop after, keeping the best), SNAPSHOT (seconds between progress files), SURFW, THINW (thin pieces), MINTHICK (mm), MAXHOLLOWS, OT (transport on), OTW (its weight; set: on), OTN (its points), SDFW, CHAMW, SHAPEN (3D terms; 0: off),
+// VIEWS, VRES, LR, ROUND (steps per round), REWRITES, LOOKAHEAD, MARGIN, MAXPIECES, WEIGHTS (the rules', e.g. 1,0.5),
+// FIXTARGET (the mesh stays put), NOSCALE (it may move but not scale), HINGEW, COLW, CHECKS (per hinge), FREETIMING (the
+// hinges' timing is Adam's, not an opening order), DEPS (hinges hold each other shut: ledges), DEPW, CARVE (carve what
+// still collides when done), LATCH (a press latch on the first hinge), RAMP (what overlaps cost by the end, times COLW),
+// HINGES (build the hinges' hardware; PROUD: on the axis as it is, not moved under the surface; REACH: mm a leaf may bridge).
 // Semantic loss: semantic_env.hpp.
 // Writes <outPrefix>_design.txt (open it in the editor) and <outPrefix>_views.ppm (silhouettes against targets).
 #include "autodesign/autodesign.hpp"
@@ -31,9 +35,17 @@ int main(int argc, char** argv) {
     env("REWRITES", p.rewritesPerRound); env("LOOKAHEAD", p.lookahead); env("MAXPIECES", p.maxPieces); env("MARGIN", p.rewriteMargin);
     if (getenv("FIXTARGET")) p.moveTarget = p.scaleTarget = false;
     if (getenv("NOSCALE")) p.scaleTarget = false;
-    env("HINGEW", p.hingeWeight); env("SURFW", p.surfaceWeight); env("MAXHOLLOWS", p.maxHollows);
+    env("HINGEW", p.hingeWeight); env("SURFW", p.surfaceWeight); env("THINW", p.thinWeight); env("MINTHICK", p.minThickness); env("MAXHOLLOWS", p.maxHollows);
+    if (getenv("OT") || getenv("OTW")) p.transport = true;
     env("OTW", p.transportWeight); env("OTN", p.transportPoints); env("SDFW", p.sdfWeight); env("CHAMW", p.chamferWeight); env("SHAPEN", p.shapeSamples);
-    env("COLW", p.collisionWeight); env("CHECKS", p.motionChecks); env("CHECKBIAS", p.motionCheckBias);
+    env("COLW", p.collisionWeight); env("CHECKS", p.hingeChecks); env("DEPW", p.dependencyWeight); env("RAMP", p.collisionRamp);
+    if (getenv("HINGES")) p.buildHinges = true;
+    if (getenv("PROUD")) p.hinges.flush = false;
+    env("REACH", p.hinges.reach);
+    if (getenv("FREETIMING")) p.orderHinges = false;
+    if (getenv("DEPS")) p.dependencies = true;
+    if (getenv("CARVE")) p.carveWhenDone = true;
+    if (getenv("LATCH")) p.latchWhenDone = true;
     SemanticFromEnv(p);
     if (const char* w = getenv("WEIGHTS"))          // the grammar's weights, comma separated, in AutoRules() order
         for (const char* q = w; *q; q++) {
@@ -98,22 +110,31 @@ int main(int argc, char** argv) {
     }
     printf("%s\n%.1f s (%.1f ms a step)\n", r.message.c_str(), secs, 1000.0 * secs / std::max(1, p.steps));
     {
-        // every pivot against its two bodies, in mm, whatever the run's weights
+        // every hinge against its two bodies (as they are without hardware), at its pivot and 3.3 mm either way along
+        // the axis: what a barrel there needs; in mm, whatever the run's weights
         float worst = 0.0f, sum = 0.0f;
-        for (const Hinge& h : r.design.hinges) {
-            BodyField a = BodyField::Body(r.design, h.parent), b = BodyField::Body(r.design, h.child);
-            float g = fmaxf(fmaxf(a.Distance(h.pivot), b.Distance(h.pivot)), 0.0f);
+        Design bare = r.design;
+        for (Hinge& h : bare.hinges) h.hardware = false;
+        for (const Hinge& h : bare.hinges) {
+            BodyField a = BodyField::Body(bare, h.parent), b = BodyField::Body(bare, h.child);
+            float g = 0.0f;
+            for (float w : { -3.3f, 0.0f, 3.3f }) {
+                Vector3 q = Vector3Add(h.pivot, Vector3Scale(Vector3Normalize(h.axis), w));
+                g = fmaxf(g, fmaxf(a.Distance(q), b.Distance(q)));
+            }
             worst = fmaxf(worst, g);
             sum += g;
         }
-        printf("pivots: farthest %.1f mm outside a body, mean %.1f mm (%d hinges)\n", worst, r.design.hinges.empty() ? 0.0f : sum / r.design.hinges.size(),
+        printf("hinges: farthest %.1f mm off a body along the barrel, mean %.1f mm (%d hinges)\n", worst, r.design.hinges.empty() ? 0.0f : sum / r.design.hinges.size(),
                (int)r.design.hinges.size());
     }
+    printf("pieces: thinnest %.1f mm across (min %.1f mm)\n", r.score.thinnest, p.minThickness);
     const Placement& t = r.score.target;
     printf("mesh: moved %.1f %.1f %.1f mm, scaled %.3fx; sphere %.1f mm across\n", t.offset.x, t.offset.y, t.offset.z, t.scale, 2.0f * r.score.radius);
     {
         // the result measured in 3D the same way whatever the run used: transport, and the surfaces' gaps
         AutoParams q = p;
+        q.transport = true;
         q.transportWeight = q.sdfWeight = q.chamferWeight = 1.0f;
         q.semanticWeight = 0.0f;
         Loss check(mesh, q);
@@ -147,16 +168,23 @@ int main(int argc, char** argv) {
                "%d hollows, %.1f%% of the surface carved\n", n, none, outside, two, k.Hollows(), r.score.surfaceCarved * 100.0f);
     }
     {
-        // the result checked for overlaps the same way whatever the run used: 32 poses between, evenly over the motion
-        AutoParams q = p;
-        q.collisionWeight = 1.0f;
-        q.motionChecks = 32;
-        q.motionCheckBias = 0.0f;
-        q.semanticWeight = 0.0f;
-        Loss check(mesh, q);
-        AutoScore e = check.Evaluate(r.carving, t);
-        printf("checked: overlapping %.2f%% open, worst between %.2f%% at t=%.2f\n", e.clashOpen * 100.0f, e.clashMotion * 100.0f,
-               e.clashMotionT);
+        // the finished design's motion checked for overlaps the same way whatever the run used: 48 poses in every
+        // hinge's turn, at two phases, on a fine grid
+        const double sphere = 4.0 / 3.0 * PI * pow(r.score.radius, 3.0);
+        for (float phase : { 0.5f, 0.0f }) {
+            MotionOverlap m = MeasureMotion(r.design, 48, r.score.radius / 12.0f, phase);
+            printf("checked (%d poses): overlapping %.3f%% open, worst on the way %.3f%% at t=%.2f, up to %.2f mm deep\n", m.poses,
+                   100.0 * m.openVolume / sphere, 100.0 * m.worstVolume / sphere, m.worstT, m.deepest);
+        }
+        // which hinges are held shut, closed (the first to open should be the only one that isn't, with dependencies)
+        std::vector<int> order = OpeningOrder(r.design);
+        printf("opening order:");
+        for (int h : order) {
+            double v = 0.0;
+            bool held = HeldShut(r.design, h, 0.5f, &v);
+            printf(" %s%s", r.design.hinges[h].name.c_str(), held ? " (held)" : " (free)");
+        }
+        printf("\n");
     }
     FILE* f = fopen((out + "_design.txt").c_str(), "w");
     fputs(r.design.Serialize().c_str(), f);

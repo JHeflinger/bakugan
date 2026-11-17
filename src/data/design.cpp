@@ -171,6 +171,12 @@ namespace Bakugan {
     }
 
     std::vector<Rigid> Design::Transforms(float t, bool ease, Motion m) const {
+        std::vector<float> angles(hinges.size());
+        for (int h = 0; h < (int)hinges.size(); h++) angles[h] = HingeAngle(h, t, ease, m);
+        return TransformsAt(angles);
+    }
+
+    std::vector<Rigid> Design::TransformsAt(const std::vector<float>& angles) const {
         int n = (int)groups.size();
         std::vector<Rigid> body(n);
         std::vector<char> state(n, 0);
@@ -185,7 +191,7 @@ namespace Bakugan {
                 int p = GroupIndex(hg.parent);
                 Rigid parent = p >= 0 ? solve(p) : Rigid{};
                 Vector3 axis = Vector3Length(hg.axis) > 1e-6f ? hg.axis : Vector3{ 1, 0, 0 };
-                r = Rigid::AboutAxis(hg.pivot, axis, HingeAngle(h, t, ease, m)).Then(parent);
+                r = Rigid::AboutAxis(hg.pivot, axis, h < (int)angles.size() ? angles[h] : 0.0f).Then(parent);
             }
             state[g] = 2;
             body[g] = r;
