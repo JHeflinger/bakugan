@@ -473,6 +473,12 @@ namespace {
 }
 
 int main(int argc, char** argv) {
+    if (argc <= 1){
+        Bakugan::App app;
+        app.Run();
+        return 0;
+    }
+
     Args a;
     std::string err;
     if (!ParseArgs(argc, argv, &a, &err)) { fprintf(stderr, "%s\n", err.c_str()); return 2; }
