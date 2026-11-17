@@ -10,6 +10,7 @@
 #include <tbb/global_control.h>
 #include "cli/config.hpp"
 #include "util/utils.hpp"
+#include "core/app.hpp"
 #include <raymath.h>
 #include <algorithm>
 #include <atomic>
