@@ -64,7 +64,7 @@ allowed range. To check the validity of a config file, run `foldaball config -c 
 
 ## UI Application
 
-If the application is run with no arguments the application will open rather than the cli.
+If the command is run with no arguments the visual design space will open rather than the cli.
 
 ### Views
 
