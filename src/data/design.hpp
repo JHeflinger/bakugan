@@ -83,10 +83,35 @@ namespace Bakugan {
         float inner = 0.0f;          // smallest coil inner diameter (fits over the pin)
     };
 
+    // Room one body leaves another as they move: `body` less everything `tool` passes through on its way through
+    // `poses` (relative to `body`), grown by `margin`. A pose has every hinge in `hinges` at its angle (any other
+    // hinge closed); between two poses the hinge angles change evenly. The sweep is sampled no more than `step` apart
+    // (as the tool moves, seen from `body`) and grown by half a step more, so nothing between samples is missed.
+    // The tool is only what it had when the clearance was made (shapes, features and hinges with ids below `upTo`):
+    // something added to it later, a latch, say, carves nothing. Nothing ever cuts `body`'s hinge hardware, or its
+    // material next to its own knuckles (out to a leaf's length and 1 mm): the knuckles stay joined to their body.
+    // Nor what `body` gets later, from `upTo` on (shapes and features at its top level: a latch's rocker, say).
+    // What runs into those instead gives way: a `hingeOnly` clearance cuts `body` by just that much of `tool` (its
+    // hardware and its material next to its own knuckles). The tool of an ordinary clearance is the whole body, less
+    // what its own hingeOnly clearances took.
+    struct Clearance {
+        int id = 0;
+        int body = -1;               // body ids
+        int tool = -1;
+        bool hingeOnly = false;
+        float margin = 0.3f;         // mm
+        float step = 0.1f;           // mm
+        int upTo = 0;
+        std::vector<int> hinges;     // hinge ids, the order of each pose's angles
+        std::vector<std::vector<float>> poses;
+        bool operator==(const Clearance& o) const;
+    };
+
     struct Design {
         std::vector<Shape> shapes;
         std::vector<Group> groups;
         std::vector<Hinge> hinges;
+        std::vector<Clearance> clearances;
         int nextId = 1;
 
         int ShapeIndex(int id) const;
@@ -113,6 +138,8 @@ namespace Bakugan {
         std::vector<Rigid> TransformsAt(const std::vector<float>& angles) const;
         std::vector<Rigid> PoseTransforms(ExportPose pose, bool ease) const;
         void HingeInWorld(int hinge, const std::vector<Rigid>& xf, Vector3* pivot, Vector3* axis) const;
+        // Every hinge's angle (indexed like `hinges`) at one of a clearance's poses: closed where it has none.
+        std::vector<float> ClearanceAngles(const Clearance& c, int pose) const;
         Vector3 LeafDirection(int hinge, bool child) const;   // unit, perpendicular to the axis, design pose
         float AutoLeafAngle(int hinge, bool child) const;
         std::vector<Knuckle> Knuckles(int hinge) const;

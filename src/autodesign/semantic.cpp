@@ -12,6 +12,7 @@
 // fixed number of them, drawn by how much they matter (|slope|) and weighted to stay unbiased. Edges are all kept.
 #include "loss.hpp"
 #include "dino.hpp"
+#include "util/box.hpp"
 #include <raymath.h>
 #include <algorithm>
 #include <atomic>
@@ -40,13 +41,6 @@ namespace Bakugan {
 
         // A pixel's layers: the bodies its ray reaches, nearest first (at most this many are kept).
         constexpr int MaxLayers = 4;
-        struct Layer {
-            int field;
-            float c, s, depth;
-            float along;                         // d distance / d t at q (< 0: the ray enters there); 0: an edge
-            Vector3 at;                          // where the ray comes closest (the edge's point)
-            Vector3 q;                           // the point shaded
-        };
     }
 
     // ---- setting up ---------------------------------------------------------------------------------------------------
@@ -230,41 +224,66 @@ namespace Bakugan {
         return Look(w, xf.Apply(p), n);
     }
 
-    // ---- the loss ---------------------------------------------------------------------------------------------------------
+    // ---- drawing ---------------------------------------------------------------------------------------------------------
+    //
+    // Per pixel and body: the ray traced against it (the least distance it comes to the body, where, and where it
+    // enters it), on the GPU (the tracer's everyPiece) or here (Trace); then, here either way, a layer of what that
+    // shows: its coverage, the shade where the ray enters (or, on an edge, comes closest), the slope along the ray.
 
-    void Loss::Semantics(const Bodies& b, AutoScore& s, Slopes& slopes, Shades& shades) {
-        const int S = m_SemRes, nv = (int)m_Views.size(), px = S * S;
-        const float bg = Background(), tau = m_SemTau, weight = m_P.semanticWeight / nv;
+    bool Loss::DrawSemantic(const Bodies& b, std::vector<SemLayer>& layers, std::vector<unsigned char>& count, bool useGpu) {
+        const int S = m_SemRes, nv = (int)m_Views.size(), px = S * S, nb = (int)b.fields.size();
+        const float bg = Background(), tau = m_SemTau;
         const int pose = 0;                                     // the open pose
-        std::vector<Layer> layers((size_t)nv * px * MaxLayers, Layer{});
-        std::vector<unsigned char> count((size_t)nv * px, 0);
-        struct Candidate {
-            int field;
-            Shade shade;
-        };
-        std::vector<Candidate> candidates;
-        std::vector<float> gRender(px), gTarget(px);
-        s.worstSemantic = 0.0f;
+        layers.assign((size_t)nv * px * MaxLayers, SemLayer{});
+        count.assign((size_t)nv * px, 0);
         m_SemDrawn.assign((size_t)nv * px, bg);
-        m_SemGradTarget.assign((size_t)nv * px, 0.0f);
 
-        // drawing: every row of every view
+        TraceResult r;
+        bool traced = false;
+        if (useGpu && m_P.gpu && nb > 0) {
+            TraceRequest rq;
+            rq.centre = m_Centre;
+            rq.half = m_Half;
+            rq.res = S;
+            rq.tau = tau;
+            rq.everyPiece = true;
+            for (const View& w : m_Views) rq.views.push_back({ w.dir, w.u, w.v });
+            for (int i = 0; i < nb; i++) {
+                TracePiece piece;
+                piece.code = b.fields[i].Glsl(&piece.params);
+                piece.box = b.box[i];
+                piece.xf = b.xf[pose][b.group[i]];
+                rq.pieces.push_back(std::move(piece));
+            }
+            const size_t n = (size_t)nb * nv * px;
+            traced = m_P.gpu->Trace(rq, &r) && r.nearest.size() == n && r.along.size() == n && r.enter.size() == n && r.piece.size() == n;
+        }
+
         ParallelFor(nv * S, [&](int task) {
             int v = task / S, y = task % S;
             const View& w = m_Views[v];
             for (int x = 0; x < S; x++) {
                 size_t k = (size_t)v * px + (size_t)y * S + x;
-                Layer* L = &layers[k * MaxLayers];
+                SemLayer* L = &layers[k * MaxLayers];
                 int n = 0;
-                for (size_t i = 0; i < b.fields.size(); i++) {
+                for (int i = 0; i < nb; i++) {
                     const Rigid& xf = b.xf[pose][b.group[i]];
                     Vector3 at, hit = { NAN, NAN, NAN };
-                    float dmin = Trace(b.fields[i], b.box[i], xf, w, FrameX(x, S), FrameY(y, S), tau, &at, &hit);
+                    float dmin;
+                    if (traced) {
+                        const size_t g = ((size_t)i * nv + v) * px + (size_t)y * S + x;
+                        if (r.piece[g] < 0) continue;
+                        const Vector3 o = RayStart(b.box[i], w, FrameX(x, S), FrameY(y, S));
+                        dmin = r.nearest[g];
+                        at = Vector3Add(o, Vector3Scale(w.dir, r.along[g]));
+                        if (r.enter[g] >= 0.0f) hit = Vector3Add(o, Vector3Scale(w.dir, r.enter[g]));
+                    } else
+                        dmin = Trace(b.fields[i], b.box[i], xf, w, FrameX(x, S), FrameY(y, S), tau, &at, &hit);
                     float c = std::clamp(0.5f - dmin / (2.0f * tau), 0.0f, 1.0f);
                     if (c <= 0.0f) continue;
                     bool enters = !std::isnan(hit.x);
-                    Layer l;
-                    l.field = (int)i;
+                    SemLayer l;
+                    l.field = i;
                     l.c = c;
                     l.at = at;
                     l.q = enters ? hit : at;
@@ -291,6 +310,54 @@ namespace Bakugan {
                 m_SemDrawn[k] = value + T * bg;
             }
         });
+        return traced;
+    }
+
+    std::vector<float> Loss::SemanticPictures(const Carving& c, int res, bool gpu, bool* traced) {
+        std::vector<int> bodyOf;
+        Design d = c.Build(&bodyOf);
+        Bodies b;
+        for (size_t k = 0; k < c.pieces.size(); k++) {
+            b.fields.push_back(BodyField::Body(d, bodyOf[k]));
+            b.box.push_back(Grow(c.PieceBounds(c.pieces[k]), 0.002f * m_L));
+            b.group.push_back(d.GroupIndex(bodyOf[k]));
+        }
+        b.times = { 0.0f };
+        b.hinge = { -1 };
+        b.xf.push_back(d.Transforms(0.0f, true));
+        const int keepRes = m_SemRes;
+        const float keepTau = m_SemTau;
+        m_SemRes = res;
+        m_SemTau = 2.0f * m_Half / res;
+        std::vector<SemLayer> layers;
+        std::vector<unsigned char> count;
+        bool t = DrawSemantic(b, layers, count, gpu);
+        if (traced) *traced = t;
+        std::vector<float> out = m_SemDrawn;
+        m_SemRes = keepRes;
+        m_SemTau = keepTau;
+        return out;
+    }
+
+    // ---- the loss ---------------------------------------------------------------------------------------------------------
+
+    void Loss::Semantics(const Bodies& b, AutoScore& s, Slopes& slopes, Shades& shades) {
+        const int S = m_SemRes, nv = (int)m_Views.size(), px = S * S;
+        const float bg = Background(), tau = m_SemTau, weight = m_P.semanticWeight / nv;
+        const int pose = 0;                                     // the open pose
+        std::vector<SemLayer> layers;
+        std::vector<unsigned char> count;
+        struct Candidate {
+            int field;
+            Shade shade;
+        };
+        std::vector<Candidate> candidates;
+        std::vector<float> gRender(px), gTarget(px);
+        s.worstSemantic = 0.0f;
+        m_SemGradTarget.assign((size_t)nv * px, 0.0f);
+
+        // drawing
+        s.semanticTraced = DrawSemantic(b, layers, count, true);
 
         // each view against the placed mesh's picture, by DINOv3; its slopes back through the pixels
         double sum = 0.0;
@@ -309,7 +376,7 @@ namespace Bakugan {
                 float g = weight * gRender[p];
                 if (g == 0.0f) continue;
                 size_t k = (size_t)v * px + p;
-                const Layer* L = &layers[k * MaxLayers];
+                const SemLayer* L = &layers[k * MaxLayers];
                 int n = count[k];
                 // behind[j]: what shows behind layer j; front[j]: how much of layer j shows
                 float behind[MaxLayers], front[MaxLayers];

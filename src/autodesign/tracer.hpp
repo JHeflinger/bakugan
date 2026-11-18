@@ -2,6 +2,7 @@
 // Drawing the silhouettes somewhere else than on this thread's cores: the GPU (ui/gputrace.cpp implements this with
 // the editor's OpenGL context). The loss hands over every piece's field as GLSL and gets back, per pixel of every view,
 // the piece that covers it most, how near its ray comes to it and where: exactly what Loss::Trace finds on the CPU.
+// Or (everyPiece, for the semantic pictures) the same for every piece, and where the ray enters it.
 #include "util/structs.hpp"
 #include <string>
 #include <vector>
@@ -25,13 +26,16 @@ namespace Bakugan {
         float half = 1.0f;               // the frame is 2 half across
         int res = 64;                    // pixels across a view
         float tau = 1.0f;                // a pixel, in mm
+        bool everyPiece = false;         // every piece's own results, not just the one covering a pixel most
     };
 
-    // Per pixel (views x res x res; rows from the top, as the loss keeps them):
+    // Per pixel (views x res x res; rows from the top, as the loss keeps them). With everyPiece, per piece and pixel
+    // (pieces x views x res x res), and `piece` is the piece itself where it covers the pixel at all, else -1.
     struct TraceResult {
         std::vector<float> nearest;      // the least distance its ray comes to the piece that covers it most (< 0: inside)
         std::vector<float> along;        // ... and how far along the ray that is (from the ray's start: see Loss::Trace)
         std::vector<int> piece;          // that piece (index), or -1 when none covers the pixel at all
+        std::vector<float> enter;        // everyPiece: how far along the ray it enters the piece (-1: it doesn't)
     };
 
     class SilhouetteTracer {

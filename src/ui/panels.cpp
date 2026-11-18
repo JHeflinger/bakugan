@@ -64,7 +64,7 @@ namespace Bakugan {
     // Things the tree asks for, applied after it is drawn (the tree reads the design while it draws).
     struct TreeAction {
         enum Kind { None, MoveShape, MoveGroup, NewBodyFrom, NewBodyFromGroup, ToggleShapeCut, ToggleGroupCut, MakeBody, AddFeature,
-                    Delete, Duplicate, Ungroup } kind = None;
+                    Delete, Duplicate, Ungroup, DeleteClearance, DeleteClearances } kind = None;
         int id = -1;
         int target = -1;
     };
@@ -345,6 +345,28 @@ namespace Bakugan {
                 if (open) {
                     for (int c : d.ChildGroups(grp.id)) groupNode(c);
                     for (int s : d.DirectShapes(grp.id)) shapeNode(s);
+                    // room it leaves for other bodies as they move (Carve collisions away)
+                    for (const Clearance& c : d.clearances) {
+                        if (c.body != grp.id) continue;
+                        int ti = d.GroupIndex(c.tool);
+                        ImGui::PushID(c.id);
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                        ImGui::TreeNodeEx("clearance", ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_SpanAvailWidth,
+                                          "room for %s%s   [clearance, %.2f mm]", ti >= 0 ? d.groups[ti].name.c_str() : "?",
+                                          c.hingeOnly ? "'s hinge" : "", c.margin);
+                        ImGui::PopStyleColor();
+                        ImGui::SetItemTooltip("Cut away: everything %s%s passes through on its way between %zu poses of the motion, and %.2f mm\n"
+                                              "more where it moves past (none where the two just touch, closed). It follows the shapes:\n"
+                                              "edit either body and it cuts the new shape. Carve collisions away again to redo them all.",
+                                              ti >= 0 ? d.groups[ti].name.c_str() : "?", c.hingeOnly ? "'s hinge (and what is next to its knuckles)" : "",
+                                              c.poses.size(), c.margin);
+                        if (ImGui::BeginPopupContextItem()) {
+                            if (ImGui::MenuItem("Delete this clearance")) act = { TreeAction::DeleteClearance, c.id };
+                            if (ImGui::MenuItem("Delete every clearance")) act = { TreeAction::DeleteClearances, -1 };
+                            ImGui::EndPopup();
+                        }
+                        ImGui::PopID();
+                    }
                     ImGui::TreePop();
                 }
                 ImGui::PopID();
@@ -398,6 +420,11 @@ namespace Bakugan {
                 break;
             }
             case TreeAction::Delete: DeleteSelection(); break;
+            case TreeAction::DeleteClearance:
+                d.clearances.erase(std::remove_if(d.clearances.begin(), d.clearances.end(), [&](const Clearance& c) { return c.id == act.id; }),
+                                   d.clearances.end());
+                break;
+            case TreeAction::DeleteClearances: d.clearances.clear(); break;
             case TreeAction::Duplicate: DuplicateSelection(); break;
             case TreeAction::Ungroup: UngroupSelection(); break;
             default: break;

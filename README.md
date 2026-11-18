@@ -49,10 +49,13 @@ has the details). For something that can be printed and played with:
 - **Hinges**: *Build the hinges when done* gives every hinge the smallest barrel that prints (three knuckles on a
   printed-in-place pin), under the sphere's surface so the closed sphere stays round, and has the search keep each
   axis where one fits. *Add hinges* does the same on the current design (the selected hinge, or all).
-- **Finishing**: *Carve collisions away* cuts out whatever still overlaps on the way; *Latch* puts a press latch, flush
-  with the sphere, on the first hinge. Both run when a search is done, or on the current design with the buttons.
-- **Draw the silhouettes on the GPU** (Optimizer): the search's views are raymarched by the graphics card. The editor
-  redraws only a dozen times a second while it runs.
+- **Finishing**: *Carve collisions away* cuts one of every two pieces that run into each other by the other's whole
+  sweep on the way (a clean boolean cut kept with the design, listed under the piece in the outliner, not added
+  shapes), with room where they move past each other; *Latch* puts a press latch, flush with the sphere, on the first
+  hinge. Both run when a search is done, or on the current design with the buttons. Carve before adding a latch: the
+  catch is meant to stand in the lid's way, and carving again afterwards would cut it out of the way.
+- **Draw the views on the GPU** (Optimizer): the search's views, silhouettes and the pictures DINOv3 is shown alike,
+  are raymarched by the graphics card. The editor redraws only a dozen times a second while it runs.
 
 ## Keys
 

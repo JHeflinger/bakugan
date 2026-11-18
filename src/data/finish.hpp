@@ -1,9 +1,11 @@
 #pragma once
 // Finishing passes: what makes a carved sphere something that can be printed and played with. Each takes a design and
-// gives back a changed one (ordinary shapes and groups: it saves, shows, checks and exports as any design does).
+// gives back a changed one (ordinary shapes, groups and clearances: it saves, shows, checks and exports as any design
+// does).
 //
-//   CarveCollisions   wherever two bodies still run into each other on the way between open and closed, the overlap
-//                     is cut out of one of them (the one it shows less on, closed).
+//   CarveCollisions   wherever two bodies still run into each other on the way between open and closed, one is cut
+//                     by everything the other passes through on its way (a Clearance: its whole sweep, not samples
+//                     of it), with room around what that cuts into. Which: the one that loses less, closed.
 //   AddHinges         the hinges themselves: each axis gets the smallest barrel that can be printed (three knuckles on
 //                     a printed-in-place pin), put where both of its bodies are along the axis and, for a carved
 //                     sphere, far enough under the surface to be inside it.
@@ -32,8 +34,10 @@ namespace Bakugan {
 
     struct CarveParams {
         int checksPerHinge = 32;         // poses looked at in every hinge's turn (and the open pose)
-        float clearance = 0.3f;          // mm left around what is carved away
-        int rounds = 4;                  // carve, check again (between the last poses), carve what is left, ...
+        float clearance = 0.3f;          // mm left around what is carved away, where it moves past (none where the two
+                                         // just touch closed, nor at the edge of a face the other only slides past)
+        int rounds = 4;                  // find where bodies meet (checksPerHinge poses), carve, look again between
+                                         // those poses, carve anything left, ...
     };
 
     struct LedgeParams {
@@ -61,7 +65,7 @@ namespace Bakugan {
         float leafLength = 0.0f, leafThickness = 0.0f;
         float pivotRadius = 0.0f;        // flush: the farthest from the sphere's centre the middle of the axis can be
         float relief = 0.0f;             // flush: within this of the axis, its two bodies are in each other's way as
-                                         // they turn (the axis being under the seam); AddHinges cuts that room
+                                         // they turn (the axis being under the seam); AddHinges makes them room
     };
     HingeSizes PlanHinge(float sphereRadius, const HingeParams& p);
 
@@ -77,7 +81,7 @@ namespace Bakugan {
         Design design;                   // the changed design (the given one when !ok)
         std::string message;
         // CarveCollisions
-        int cuts = 0;                    // shapes added
+        int cuts = 0;                    // clearances made
         double before = 0.0, after = 0.0;    // mm^3 inside two bodies at once, at the worst pose
         // AddLedges
         int dependents = 0;              // hinges that should be held (every moving one but the first to open)
@@ -86,7 +90,7 @@ namespace Bakugan {
         std::vector<std::string> unheld; // the names of the rest
         // AddHinges
         int built = 0;                   // hinges that got hardware
-        int relieved = 0;                // cuts that make room next to them
+        int relieved = 0;                // clearances that give their two bodies room to turn
         float moved = 0.0f;              // the farthest an axis was moved (mm)
     };
 
