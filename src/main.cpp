@@ -217,7 +217,6 @@ namespace {
         t += Utils::Format("  loss                 %.4f\n", s.total);
         t += Utils::Format("  outline covered      %.1f%%   extra %.1f%%   worst view %.1f%%\n", s.viewCover * 100.0f, s.viewExtra * 100.0f, s.worstView * 100.0f);
         t += Utils::Format("  overlap, open        %.3f%% of the sphere   worst on the way %.3f%%\n", s.clashOpen * 100.0f, s.clashMotion * 100.0f);
-        t += Utils::Format("  surface carved       %.1f%%\n", s.surfaceCarved * 100.0f);
         t += Utils::Format("  hinges off pieces    %.4f   (farthest a piece is from an axis: %.2f mm)\n", s.hinges, s.hingeGap);
         if (s.dependents > 0) t += Utils::Format("  held hinges          %d of %d have a holder in reach\n", s.holdable, s.dependents);
         if (s.semantic > 0.0f) t += Utils::Format("  DINOv3               %.4f   (worst view %.4f)\n", s.semantic, s.worstSemantic);
@@ -227,10 +226,10 @@ namespace {
 
     std::string ScoreJson(const AutoScore& s) {
         return Utils::Format("{\"loss\": %.6g, \"fit\": %.6g, \"cover\": %.6g, \"extra\": %.6g, \"worst_view\": %.6g, \"collision\": %.6g, "
-                             "\"overlap_open\": %.6g, \"overlap_motion\": %.6g, \"surface_carved\": %.6g, \"hinges\": %.6g, "
+                             "\"overlap_open\": %.6g, \"overlap_motion\": %.6g, \"hinges\": %.6g, "
                              "\"dependency\": %.6g, \"semantic\": %.6g, \"mesh_scale\": %.6g, \"mesh_moved_mm\": %.6g}",
                              s.total, s.fit, s.viewCover, s.viewExtra, s.worstView, s.collision, s.clashOpen, s.clashMotion,
-                             s.surfaceCarved, s.hinges, s.dependency, s.semantic, s.target.scale, Vector3Length(s.target.offset));
+                             s.hinges, s.dependency, s.semantic, s.target.scale, Vector3Length(s.target.offset));
     }
 
     // Nearest neighbour enlargement, so a 64 pixel view is something to look at.
@@ -319,6 +318,9 @@ namespace {
             t += "\nScore\n" + ScoreLines(r.score);
             t += Utils::Format("\nMotion, checked at %d poses\n  overlap open %.2f mm^3, worst on the way %.2f mm^3 (up to %.2f mm deep)\n", r.checked.poses,
                                r.checked.openVolume, r.checked.worstVolume, r.checked.deepest);
+            if (p.buildHinges)
+                t += Utils::Format("\nPrinting\n  %s\n  %d pieces, %d of %d hinges hold, %d loose parts (%.1f mm^3)\n", r.printable.message.c_str(),
+                                   r.printable.bodies, r.printable.held, r.printable.hinges, r.printable.loose, r.printable.looseVolume);
             if (Write(file(".report.txt"), t)) written.push_back(file(".report.txt").string());
         }
         {
@@ -329,6 +331,10 @@ namespace {
               << ",\n  \"score\": " << ScoreJson(r.score) << ",\n  \"motion_check\": "
               << Utils::Format("{\"poses\": %d, \"overlap_open_mm3\": %.6g, \"overlap_worst_mm3\": %.6g, \"deepest_mm\": %.6g}", r.checked.poses,
                                r.checked.openVolume, r.checked.worstVolume, r.checked.deepest)
+              << ",\n  \"printable\": "
+              << Utils::Format("{\"checked\": %s, \"ok\": %s, \"pieces\": %d, \"hinges\": %d, \"hinges_held\": %d, \"loose_parts\": %d, \"loose_mm3\": %.6g}",
+                               p.buildHinges ? "true" : "false", r.printable.ok ? "true" : "false", r.printable.bodies, r.printable.hinges,
+                               r.printable.held, r.printable.loose, r.printable.looseVolume)
               << ",\n  \"message\": " << Json(r.message) << "\n}\n";
             if (Write(file(".result.json"), j.str())) written.push_back(file(".result.json").string());
         }
@@ -406,6 +412,15 @@ namespace {
         if (MakeDir(outDir, &err)) {
             const std::string name = cfg.output.name.empty() ? fs::path(a.positional[0]).stem().string() : cfg.output.name;
             Write(outDir / (name + ".score.txt"), r.message + "\n\nScore\n" + ScoreLines(r.score));
+            if (const char* place = getenv("FOLDABALL_PLACE")) {      // "x y z scale": where a search placed the mesh, for the picture
+                float x = 0, y = 0, z = 0, k = 1;
+                if (sscanf(place, "%f %f %f %f", &x, &y, &z, &k) == 4) { r.score.target.offset = { x, y, z }; r.score.target.scale = k; }
+            }
+            if (cfg.output.preview) {
+                std::string perr;
+                if (!WritePreviewPng(design, Placed(mesh, r.score.target), cfg.output.previewSize, (outDir / (name + ".png")).string(), &perr))
+                    fprintf(stderr, "no picture: %s\n", perr.c_str());
+            }
         }
         return 0;
     }

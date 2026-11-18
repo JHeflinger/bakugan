@@ -69,6 +69,9 @@ namespace Bakugan {
             ImGui::SetItemTooltip("Share of every view's target outline the design must cover. Each view short of it costs\n"
                                   "steeply (10 per whole share missing), so no single view can be given up.");
         }
+        ImGui::SliderFloat("Reach", &p.reachWeight, 0.0f, 5.0f, p.reachWeight > 0.0f ? "%.2f" : "ignored");
+        ImGui::SetItemTooltip("What parts of the mesh's outline being far from the design's cost: every missed pixel counts by how\n"
+                              "far it is from the nearest covered one, so a limb nothing is near pulls the nearest piece toward it.");
         ImGui::SliderFloat("Collisions", &p.collisionWeight, 0.0f, 5.0f, p.collisionWeight > 0.0f ? "%.2f" : "ignored");
         ImGui::SetItemTooltip("What pieces overlapping each other costs: in the open pose, and in every hinge's turn.\n"
                               "Closed, the pieces fill the sphere side by side.");
@@ -109,9 +112,6 @@ namespace Bakugan {
                               "the length a hinge's barrel takes up there, beyond half of what a leaf can bridge (Finishing: Hinge reach).\n"
                               "A real hinge sits where its pieces meet. It is also what limits the search most: with it ignored,\n"
                               "axes go wherever the pieces swing clear of each other, which no hinge could be built on.");
-        ImGui::SliderFloat("Keep the surface", &p.surfaceWeight, 0.0f, 10.0f, p.surfaceWeight > 0.0f ? "%.2f" : "ignored");
-        ImGui::SetItemTooltip("What hollows carving into the sphere's surface cost (about the share of the surface carved away).\n"
-                              "Hollows take material out from inside the sphere; this keeps its outside whole, closed.");
         ImGui::SliderFloat("No thin pieces", &p.thinWeight, 0.0f, 10.0f, p.thinWeight > 0.0f ? "%.2f" : "ignored");
         ImGui::SetItemTooltip("What a piece thinner than the minimum costs: 1 - its thickness / the minimum, for each such piece.\n"
                               "A piece's thickness is the largest ball that fits inside it, across: slivers, thin caps and flat\n"
@@ -120,33 +120,16 @@ namespace Bakugan {
         ImGui::DragFloat("Min thickness", &p.minThickness, 0.1f, 0.5f, 50.0f, "%.1f mm");
         ImGui::SetItemTooltip("The thinnest a piece may be. About 3 mm prints and handles well; a hinge's barrel needs about 4 mm.");
         ImGui::EndDisabled();
-        ImGui::SeparatorText("In 3D");
-        ImGui::Checkbox("Optimal transport", &p.transport);
-        ImGui::SetItemTooltip("Optimal transport: how far the sphere's material has to travel, opened, to fill the mesh.\n"
-                              "Every bit of material is paired with a bit of the mesh it should fill, however far away, so a\n"
-                              "piece opened to the wrong place is pulled to where it's needed.");
-        ImGui::BeginDisabled(!p.transport);
-        ImGui::SliderFloat("Transport", &p.transportWeight, 0.0f, 5.0f, p.transportWeight > 0.0f ? "%.2f" : "off");
-        ImGui::SetItemTooltip("Its share of the loss");
-        ImGui::SliderInt("Transport points", &p.transportPoints, 256, 4096);
-        ImGui::SetItemTooltip("Points of the sphere's material, and points filling the mesh: more is finer and slower (its\n"
-                              "cost grows with the square)");
-        ImGui::EndDisabled();
-        ImGui::SliderFloat("3D SDF", &p.sdfWeight, 0.0f, 5.0f, p.sdfWeight > 0.0f ? "%.2f" : "off");
-        ImGui::SetItemTooltip("The open design's signed distance against the mesh's, at points in and around the mesh: inside\n"
-                              "where the mesh is, outside where it isn't. Sees dents and hollows outlines miss.");
-        ImGui::SliderFloat("Chamfer", &p.chamferWeight, 0.0f, 5.0f, p.chamferWeight > 0.0f ? "%.2f" : "off");
-        ImGui::SetItemTooltip("The Chamfer distance: how far the mesh's surface is from the design's, and the design's from the\n"
-                              "mesh's. Carved pieces can't follow fine surface detail, so it's best light, beside the others.");
-        ImGui::BeginDisabled(p.sdfWeight <= 0.0f && p.chamferWeight <= 0.0f);
-        ImGui::SliderInt("3D points", &p.shapeSamples, 300, 20000);
-        ImGui::SetItemTooltip("The mesh's points for the SDF and Chamfer terms (a third on its surface)");
-        ImGui::EndDisabled();
         ImGui::Checkbox("Mesh can move", &p.moveTarget);
         ImGui::SetItemTooltip("The mesh the open design is compared with may be moved, to wherever the design fits it best\n"
                               "(it stays where the views can see all of it). Off, it stays where it is.");
         ImGui::SameLine();
         ImGui::Checkbox("Match volumes", &p.scaleTarget);
+        ImGui::SameLine();
+        ImGui::Checkbox("Free size", &p.freeScale);
+        ImGui::SetItemTooltip("The mesh's scale is optimized too, from the matched volume: the search may shrink the mesh it's\n"
+                              "compared with, so the sphere has more material than it needs. Easier to match the shape; the open\n"
+                              "design comes out bulkier than the mesh.");
         ImGui::SetItemTooltip("The mesh is scaled to the sphere's volume, so the sphere's material fills it exactly (with the\n"
                               "sphere sized from the mesh, that's its own size; set a sphere size to make the design bigger or\n"
                               "smaller). Off, it's compared at its own size. The reference mesh shows the placement found.");
@@ -219,6 +202,14 @@ namespace Bakugan {
         ImGui::DragFloat("Sphere size", &p.sphereDiameter, 0.5f, 0.0f, 500.0f, p.sphereDiameter > 0.0f ? "%.1f mm across" : "auto");
         ImGui::SetItemTooltip("The sphere that's carved, at the mesh's centre of volume. Auto: the mesh's volume (the open\n"
                               "design then has the mesh's volume too: pieces only move).");
+        ImGui::SliderFloat("Shell first", &p.shellFirst, 0.0f, 1.0f, p.shellFirst > 0.0f ? "%.2f of the steps" : "both at once");
+        ImGui::SetItemTooltip("With a core: for this share of the steps the core stays shut and only the shell is cut, so its pieces\n"
+                              "make the outline. Then the core is free too, and its material is handed to the shell's pieces where\n"
+                              "the shape needs depth (\"thicken a panel\").");
+        ImGui::SliderFloat("Core", &p.core, 0.0f, 0.95f, p.core > 0.0f ? "%.2f of the sphere" : "whole sphere");
+        ImGui::SetItemTooltip("Start from a shell and a core inside it, this share of the sphere across. The shell's pieces make\n"
+                              "thin parts (wings, a tail), the core's chunky ones (a head); the core comes out once the shell's\n"
+                              "pieces have swung out of its way. The shell is kept thick enough for a hinge.");
     }
 
     void App::GenerateOptimizer() {
@@ -242,8 +233,6 @@ namespace Bakugan {
                               "something may do (a simpler design that does about as well is better)");
         ImGui::SliderInt("Max pieces", &p.maxPieces, 2, 512);
         ImGui::SetItemTooltip("Adding a cut makes one more piece: no more than this");
-        ImGui::SliderInt("Max hollows", &p.maxHollows, 0, 512);
-        ImGui::SetItemTooltip("Hollows: material taken out of the sphere (from every piece) without making a piece");
         ImGui::BeginDisabled(!m_Gpu->Ok());
         ImGui::Checkbox("Draw the silhouettes on the GPU", &m_AutoUseGpu);
         ImGui::EndDisabled();
@@ -461,27 +450,14 @@ namespace Bakugan {
         ImVec4 pivotColor = s.hingeGap > 0.02f * Vector3Distance(ReferenceBounds().min, ReferenceBounds().max) ? Amber
                                                                                                              : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
         ImGui::TextColored(pivotColor, "Farthest hinge %.1f mm off one of its pieces", fmaxf(s.hingeGap, 0.0f));
-        ImGui::TextColored(s.surfaceCarved > 0.02f ? Amber : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled), "Sphere surface carved: %.1f%%",
-                           s.surfaceCarved * 100.0f);
-        ImGui::SetItemTooltip("The share of the sphere's surface hollows reach (closed, it shows there)");
         ImGui::TextColored(m_AutoParams.thinWeight > 0.0f && s.thinnest < m_AutoParams.minThickness ? Amber : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled),
                            "Thinnest piece: %.1f mm", s.thinnest);
         ImGui::SetItemTooltip("The largest ball that fits in the thinnest piece, across");
-        if (m_AutoParams.TransportOn()) {
-            ImGui::TextDisabled("Transport: the material travels %.1f mm (rms); %.0f%% of the mesh unfilled", s.transportMove,
-                                s.transportUnfilled * 100.0f);
-            ImGui::SetItemTooltip("How far, root mean square, the open design's material is from the part of the mesh it's paired with");
-        }
-        if (m_AutoParams.sdfWeight > 0.0f || m_AutoParams.chamferWeight > 0.0f) {
-            ImGui::TextDisabled("3D: mesh %.1f mm from the design, design %.1f mm from the mesh (on average)", s.meshGap, s.designGap);
-            ImGui::SetItemTooltip("Mean distance from the mesh's surface to the open design's, and back");
-        }
-        ImGui::TextDisabled("loss %.3f (fit %.3f, coverage %.3f, semantic %.3f, collisions %.3f x %.0f, hinges %.3f, surface %.3f, holding %.3f, "
-                            "thin %.3f, transport %.3f, sdf %.3f, chamfer %.3f)", s.total, s.fit, s.coveragePenalty, s.semantic, s.collision,
-                            s.collisionScale, s.hinges, s.surface, s.dependency, s.thin, s.transport, s.sdf, s.chamfer);
+        ImGui::TextDisabled("loss %.3f (fit %.3f, reach %.3f, coverage %.3f, semantic %.3f, collisions %.3f x %.0f, hinges %.3f, holding %.3f, "
+                            "thin %.3f)", s.total, s.fit, s.reach, s.coveragePenalty, s.semantic, s.collision,
+                            s.collisionScale, s.hinges, s.dependency, s.thin);
         ImGui::SetItemTooltip("Lower is better: silhouettes * (fit + coverage penalty) + semantic * its weight\n"
-                              "+ collisions * their weight + hinges * their weight + surface * its weight\n"
-                              "+ transport, sdf and chamfer * theirs.\n"
+                              "+ collisions * their weight + hinges * their weight.\n"
                               "Fit: the mean over the views of the share of the mesh missed plus the share of extra pixels.\n"
                               "Collisions: overlap depth over its volume, against the sphere's volume (times how far the\n"
                               "search had raised their cost when this was scored).\n"

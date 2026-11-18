@@ -8,7 +8,7 @@
 //
 // Its gradient: the deepest point is a maximum, so (the envelope theorem) only the field there moves the cost:
 // d cost / d D(x*) = 1 / (minThickness / 2). That depends on the piece's shape, not its pose, so it goes in as an
-// Anchor with a mass slope (what the cutters' parameters see; the joints' don't move it).
+// Anchor (what the cutters' parameters see; the joints' don't move it).
 #include "loss.hpp"
 #include "data/field.hpp"
 #include <raymath.h>
@@ -68,7 +68,7 @@ namespace Bakugan {
                     if (both > shallowest) { shallowest = both; across = u; }
                 }
                 for (float side : { 1.0f, -1.0f })
-                    anchors->push_back({ (int)k, Vector3Add(best, Vector3Scale(across, side * r)), { 0, 0, 0 }, 0.5f * w / half });
+                    anchors->push_back({ (int)k, Vector3Add(best, Vector3Scale(across, side * r)), 0.5f * w / half });
             }
         }
         s.thinnest = b.fields.empty() ? 0.0f : thinnest;

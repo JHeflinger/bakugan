@@ -9,6 +9,11 @@
 //   loss    = (1 - covered) + extra,         plus 10 per whole share a view is covered less than minViewCoverage
 // fit is the mean over the views.
 //
+// Reach (reachWeight). The fit only changes where the design's outline is: a part of the mesh nothing is near (an arm,
+// a wing) pulls on nothing, and a blob over the body scores well enough to stay. So every missed pixel also counts by
+// how far it is from the nearest pixel the design covers (beyond one pixel, over 0.1 of the mesh's size), and that
+// slope goes to the piece covering that nearest pixel: it is pulled toward what is missing, however far away.
+//
 // Semantics (when semanticWeight > 0; semantic.cpp). The same views, drawn as pictures (silhouette, depth, or shaded
 // grey: SemanticLook) at the size the DINOv3 model was exported for, each compared with the placed mesh's picture by
 // DINOv3's embeddings (global, patch, or a mix). DINOv3 gives d loss / d pixel; a pixel depends on the design through
@@ -32,17 +37,6 @@
 // mean of the three, added up over the joints, relative to the mesh's size. With buildHinges and hinges.flush, also
 // how far the pivot is from being deep enough under the surface for the barrel.
 //
-// Surface. Hollows should take material from inside the sphere, not its surface: over a thousand points just under the
-// surface, the mean of d / (d + 1% of the mesh's size), d how deep the point is inside a hollow. About the share of the
-// surface carved away, going up smoothly as hollows reach it.
-//
-// Shape in 3D (shape.cpp; chamferWeight, sdfWeight). The open design against the placed mesh in 3D: the Chamfer
-// distance between their surfaces (both ways), and their signed distances at points in and around the mesh.
-//
-// Transport (transport.cpp; transportWeight). Optimal transport between the sphere's material, opened (points through
-// the sphere, each moving with its piece), and points filling the placed mesh: how far the material has to travel.
-// It pulls a piece toward where it's needed even from far away.
-//
 // The silhouettes and collisions depend on the carving only through the pieces' distances at a set of points: the
 // silhouettes' at the points where edge pixels' rays come closest to a piece, the collisions' at the points sampled
 // inside overlaps. So the gradient is the loss's slope against each such distance (known from the loss), times how the
@@ -53,11 +47,11 @@
 #include "data/field.hpp"
 #include <cmath>
 #include <memory>
+#include <random>
 #include <string>
 
 namespace Bakugan {
     class Dino;
-    class TriangleTree;                  // shape.cpp
 
     class Loss {
     public:
@@ -93,20 +87,11 @@ namespace Bakugan {
         // The placement kept where the views see all of the mesh, and its scale within 0.3x .. 3.3x.
         Placement KeepTargetInFrame(Placement t) const;
 
-        // Where the last carving scored showed outside the placed mesh: a piece (index) and the point of it there, in
-        // the closed pose's frame, and the view's direction there (in that frame too). For aiming new hollows.
-        struct Spot {
-            int piece;
-            Vector3 at, dir;
-        };
-        const std::vector<Spot>& ExtraSpots() const { return m_Extra; }
-        // The sphere's material as transport saw it last (when it's on): a point (closed frame), its piece (index),
-        // where the open pose put it and where the plan sends it (world). For aiming new cuts.
-        struct Grain {
-            int piece;
-            Vector3 local, at, to;
-        };
-        const std::vector<Grain>& Grains() const { return m_Grains; }
+        // A part of the mesh the open design doesn't reach, for aiming new cuts: a point inside the placed mesh (its
+        // visual hull over the views) outside every piece, drawn at random, likelier the farther it is from the design.
+        // Gives the piece nearest to it (index), the point in that piece's own (closed) frame, and how much of the mesh
+        // around it (within 0.2 of the mesh's size) nothing covers (mm^3). False: there is none.
+        bool FarTarget(const Carving& c, std::mt19937& rng, int* piece, Vector3* local, float* missing) const;
 
         // The silhouettes scored last against their targets, as an RGBA picture.
         void Picture(std::vector<unsigned char>* rgba, int* w, int* h) const;
@@ -114,6 +99,7 @@ namespace Bakugan {
         void SemanticPicture(std::vector<unsigned char>* rgba, int* w, int* h) const;
 
         float L() const { return m_L; }
+        const Placement& Placed() const { return m_Placed; }     // where the mesh was placed when last scored
         // How far from the axis a piece may be and still count as at the hinge: half of what a knuckle's leaf can
         // bridge (so AddHinges can join it with room to spare; a new lid's hinge, along its rim, is about within that).
         float HingeSlack() const { return 0.5f * (m_Hinge.leafLength - m_Hinge.radius); }
@@ -121,6 +107,16 @@ namespace Bakugan {
         // axis along it. A joint whose pieces don't touch any more is hung from a piece that touches its child (and
         // isn't hung from it), so every piece stays joined to the rest. Returns how many joints found no seam at all.
         int SnapJoints(Carving& c) const;
+        // Whether every piece can be printed and hinged (data/finish.hpp's MeasureSolidity): taken 0.4 of the least
+        // thickness in from its surface, it is still one solid (no more than half a percent of the sphere in parts not
+        // joined to the rest of their piece, so no two parts of a piece hang together by a neck thinner than about the
+        // least thickness), its hinges are on that solid, and there is enough of it to carry them (PieceVolume for
+        // each). Material that isn't joined to its piece can't be printed with it, however well it fills the mesh's
+        // silhouette, and a sliver can't carry a barrel; the optimizer takes no step and no rewrite that leaves
+        // either (autodesign.cpp).
+        bool Solid(const Carving& c) const;
+        // The least a piece may be, per hinge on it (mm^3): twice the box around a hinge's barrel.
+        float PieceVolume() const { return 2.0f * 4.0f * m_Hinge.radius * m_Hinge.radius * m_Hinge.length; }
         std::vector<Vector3> ViewDirections() const;     // the way each view looks
     private:
         struct View {
@@ -152,22 +148,14 @@ namespace Bakugan {
             float weight;                        // d loss / d shade
         };
         using Shades = std::vector<std::vector<Shade>>;   // per field
-        // A point of the sphere's material (in the closed pose's frame, which the pieces' fields are in) and the loss's
-        // slopes against it: against where its piece's open pose puts it (grad, world), and against its piece's
-        // distance there (massSlope: the cutters hand material from piece to piece). See transport.cpp.
+        // A point of a piece (in the closed pose's frame, which the pieces' fields are in) and the loss's slope against
+        // the piece's distance there (thickness.cpp).
         struct Anchor {
             int field;
             Vector3 local;
-            Vector3 grad;
-            float massSlope;
+            float slope;
         };
         using Anchors = std::vector<Anchor>;
-        // A point of the design's surface, open: its piece, where it is, and the piece's outward normal there.
-        struct DesignPoint {
-            int field;
-            Vector3 at, normal;
-        };
-
         AutoScore Score(const Design& d, Bodies& b, const Placement& target, Slopes* slopes, Shades* shades, float phase);
         void Silhouettes(const Bodies& b, AutoScore& s, Slopes& slopes);
         // The open pose drawn: per pixel the piece that covers it most (-1: none), its coverage, and where its ray
@@ -176,10 +164,11 @@ namespace Bakugan {
         bool DrawTraced(const Bodies& b, std::vector<int>& who, std::vector<Vector3>& at);
         Vector3 RayStart(const BoundingBox& box, const View& w, float sx, float sy) const;
         float FitLoss(const std::vector<std::vector<float>>& target) const;   // the silhouettes' part, against these targets
+        float ReachLoss(const std::vector<std::vector<float>>& target) const; // the reach term for the last drawing, likewise
         void Collisions(const Design& d, const Bodies& b, AutoScore& s, Slopes& slopes, float phase);
         // What one sample inside two pieces costs, and its slope against its depth.
         float ClashCost(float depth, float* slope) const;
-        // Which piece (field) every point just under the sphere's surface belongs to (-1: none, a hollow).
+        // Which piece (field) every point just under the sphere's surface belongs to (-1: none).
         std::vector<int> SurfaceOwners(const Bodies& b) const;
         // The nearest piece that could hold hinge h shut, given the hinges that open before it: how far along the
         // surface (mm; FLT_MAX: there is none), and the two surface points (indices) it is measured between.
@@ -191,7 +180,6 @@ namespace Bakugan {
         // One hinge against its two pieces (see Hinges); farthest: the most either is from the axis along the barrel.
         float HingeCost(const Hinge& h, const BodyField& parent, const BodyField& child, float* farthest = nullptr) const;
         float HingeWeight() const { return m_P.hingeWeight; }
-        float SurfaceTerm(const Carving& c, float* carved = nullptr) const;
         // thickness.cpp: pieces thinner than minThickness (unweighted; sets s.thinnest); with anchors, its slopes
         float Thickness(const Bodies& b, AutoScore& s, Anchors* anchors) const;
         void Gradient(const Carving& c, const Placement& target, const std::vector<int>& bodyOf, const Bodies& b, const Slopes& slopes,
@@ -216,15 +204,6 @@ namespace Bakugan {
         float Background() const;
         Vector3 Normal(const BodyField& f, Vector3 local) const;    // the field's (local) normal
         float ShadeAt(const BodyField& f, const Rigid& xf, const Shade& sh) const;
-        // shape.cpp
-        void SetUpShape(const TriMesh& mesh);
-        void SampleDesignSurface(const Bodies& b);
-        float Shape(const Bodies& b, const Placement& t, AutoScore* s, Slopes* slopes) const;   // its weighted share of the loss
-        float DesignDistance(const Bodies& b, int pose, Vector3 p, int* who, int skip = -1) const;   // the nearest piece's distance
-        // transport.cpp: its weighted share of the loss; with anchors, the material's slopes; and the placement's slopes
-        void SetUpTransport(const TriMesh& mesh);
-        float Transport(const Carving& c, const Bodies& b, const Placement& t, AutoScore& s, Anchors* anchors, Vector3* gradOffset,
-                        float* gradLogScale);
     private:
         AutoParams m_P;
         float m_CollisionScale = 1.0f;
@@ -246,21 +225,10 @@ namespace Bakugan {
         HingeSizes m_Hinge;              // the hardware a hinge would get (data/finish.hpp)
         std::vector<Vector3> m_PairUnit;  // fixed points in [0, 1]^3, mapped into where two bodies' boxes meet
         std::vector<Vector3> m_SurfaceDirs;   // points spread evenly over the sphere (unit directions), for its surface
-        std::vector<Spot> m_Extra;
         std::vector<float> m_Cover;       // the last silhouettes (open): views × pixels
-        // the 3D shape (shape.cpp)
-        std::shared_ptr<TriangleTree> m_Tree;          // the mesh's triangles, for the nearest point of it
-        std::vector<Vector3> m_ShapeSurface;           // points on the mesh, where it is ...
-        std::vector<Vector3> m_ShapeVolume;            // ... in and around it ...
-        std::vector<float> m_ShapeTarget;              // ... and its signed distance at each of those
-        std::vector<Vector3> m_DesignUnit;             // fixed points in a unit box, pulled onto each piece's surface
-        std::vector<DesignPoint> m_DesignSurface;      // the last evaluated design's surface points
-        // transport (transport.cpp)
-        std::vector<Vector3> m_BallUnit;               // points through the unit ball: the sphere's material
-        std::vector<Vector3> m_MeshFill;               // points filling the mesh, where it is
-        std::vector<float> m_TransportG;               // Sinkhorn's mesh potentials, from the last evaluation (a warm start)
-        bool m_TransportWarm = false;
-        std::vector<Grain> m_Grains;                   // the material as the last evaluation saw it
+        std::vector<float> m_Reach;       // ... and each pixel's distance (mm) to the nearest covered one, beyond a pixel
+        std::vector<Vector3> m_Hull;      // points inside the mesh's visual hull (where the mesh is), for FarTarget
+        float m_HullStep = 1.0f;          // ... on a grid this far apart
         // the semantic loss
         std::string m_Error;
         std::unique_ptr<Dino> m_Dino;

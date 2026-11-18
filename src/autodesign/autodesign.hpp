@@ -30,13 +30,27 @@ namespace Bakugan {
     struct AutoParams {
         // what is wanted
         float sphereDiameter = 0.0f;     // mm; 0: a sphere of the mesh's volume (it sits at the mesh's centre of volume)
+        float core = 0.9f;               // the search starts from a shell and a core inside it, this share of the sphere
+                                         // across (Carving::ShellAndCore), as far as the shell stays thick enough for a
+                                         // hinge's barrel (so by default the shell is as thin as a hinge allows);
+                                         // 0: from the whole sphere
+        float shellFirst = 0.5f;         // with a core: this share of the steps the core stays shut and only the shell
+                                         // is cut (its pieces make the outline); then the core is free too, and "thicken
+                                         // a panel" hands its material to the shell's pieces where the shape needs depth
         bool moveTarget = true;          // the mesh it's compared with may be moved, to wherever suits the design best
         bool scaleTarget = true;         // the mesh is scaled (about its centre of volume) to the sphere's volume, so the
                                          // sphere's material fills it exactly; off, it's compared at its own size. The scale
                                          // isn't optimized: a free one let the optimizer shrink the mesh (to ~0.6x) so the
                                          // sphere covered it easily, with ~4x the material it should have
+        bool freeScale = false;          // the mesh's scale is optimized too (from the sphere's volume, 0.3x .. 3.3x):
+                                         // free, the search can shrink the mesh it's compared with, so the sphere has
+                                         // more material than the mesh needs and matching its shape is easier (the
+                                         // open design is then bulkier than the mesh, at the mesh's scale)
         int views = 6;                   // directions the silhouettes are compared from
         int viewResolution = 64;         // pixels across each view
+        float reachWeight = 1.0f;        // what the mesh's outline being far from the design's costs (0: ignored): each
+                                         // missed pixel counts by how far it is from the nearest covered one, so a limb
+                                         // nothing is near still pulls on the nearest piece (loss.hpp: Reach)
         float minViewCoverage = 0.6f;    // every view's target must be covered at least this much (steep cost below)
         float collisionWeight = 1.0f;    // what pieces overlapping each other cost (0: ignored) ...
         float collisionRamp = 20.0f;     // ... times this by the end of the search: it rises steadily from the weight to
@@ -44,7 +58,6 @@ namespace Bakugan {
                                          // them clear of each other by the end (1: the same throughout)
         float hingeWeight = 2.0f;        // what a hinge being away from its two pieces costs (0: ignored): how far each
                                          // piece is from the axis, over the length a hinge's barrel takes up along it
-        float surfaceWeight = 1.0f;      // what hollows carving into the sphere's surface cost (0: ignored)
         float thinWeight = 1.0f;         // what a piece thinner than minThickness costs (0: ignored; thickness.cpp)
         float minThickness = 3.0f;       // mm: the thinnest a piece may be (the largest ball that fits in it, across)
         int hingeChecks = 6;             // poses checked for overlaps in every hinge's turn, spread evenly over its angle
@@ -58,22 +71,16 @@ namespace Bakugan {
         float dependencyWeight = 1.0f;   // what a hinge with nothing near enough to hold it costs
         LedgeParams ledges;              // the ledges that do the holding, added when the search is done
         // finishing, when the search is done (the same passes the editor offers on any design: data/finish.hpp)
-        bool buildHinges = false;        // the hinges' hardware (AddHinges). The search then keeps every axis where that
-                                         // fits: with hinges.flush, far enough under the surface for the barrel
+        bool buildHinges = true;         // the hinges' hardware (AddHinges). The search then keeps every axis where that
+                                         // fits: with hinges.flush, far enough under the surface for the barrel. A piece
+                                         // whose hinge can't be built is joined to the one it hung from, loose crumbs
+                                         // are cut away, and the result is checked: every piece one solid, on a hinge
         HingeParams hinges;
-        bool carveWhenDone = false;      // carve away whatever still overlaps on the way
+        bool carveWhenDone = true;       // carve away whatever still overlaps on the way
         CarveParams carve;
         bool latchWhenDone = false;      // a press latch on the hinge that opens first
         LatchParams latch;
         float silhouetteWeight = 1.0f;   // the silhouette comparison's share of the loss (0: only the semantic one)
-        // in 3D (shape.cpp, transport.cpp): the open design against the placed mesh
-        float chamferWeight = 0.0f;      // the Chamfer distance between their surfaces, both ways (0: off)
-        float sdfWeight = 0.0f;          // their signed distances agreeing at points in and around the mesh (0: off)
-        int shapeSamples = 3000;         // the mesh's points for those two (a third on its surface)
-        bool transport = false;          // optimal transport on: how far the sphere's material travels to fill the mesh
-        float transportWeight = 1.0f;    // ... its share of the loss, when on (0: off too)
-        bool TransportOn() const { return transport && transportWeight > 0.0f; }
-        int transportPoints = 1024;      // points of material, and points filling the mesh, for it
         // the semantic loss: the views drawn and compared by DINOv3's embeddings (see dino.hpp, semantic.cpp)
         float semanticWeight = 0.0f;     // its share of the loss (0: off)
         std::string semanticModel;       // the .onnx tools/autodesign/export_dinov3.py writes (it sets the views' size)
@@ -85,28 +92,32 @@ namespace Bakugan {
         // the silhouettes drawn on the GPU instead of every core (tracer.hpp); null: on the CPU
         std::shared_ptr<SilhouetteTracer> gpu;
         // the optimizer
-        int steps = 1500;                // gradient evaluations in all (the budget), rewrite lookaheads included
+        int steps = 6000;                // gradient evaluations in all (the budget), rewrite lookaheads included
         float learningRate = 1.0f;       // Adam's step, in each parameter's own unit (see carving.cpp)
         int stepsPerRound = 60;          // Adam steps between rewrite rounds
         int rewritesPerRound = 3;        // rewrites tried in a round
-        int lookahead = 12;              // Adam steps each tried rewrite (and the unchanged design) gets before comparing
+        int lookahead = 50;              // Adam steps each tried rewrite (and the unchanged design) gets before comparing:
+                                         // long enough for a new limb to settle where it helps (with 12 most were
+                                         // turned down while still in the way)
         float rewriteMargin = 0.005f;    // a rewrite is kept only if its loss is this much (a share) below the unchanged design's
-        int maxPieces = 8;
-        int maxHollows = 8;
+        int maxPieces = 12;
         std::vector<float> ruleWeights;  // how often each grammar rule is drawn, in AutoRules() order (empty: their defaults)
         unsigned seed = 1;
     };
 
     struct AutoScore {
         bool valid = false;
-        float total = 0.0f;              // the loss: silhouette weight * (fit + coverage penalty) + semantic weight * semantic
+        float total = 0.0f;              // the loss: silhouette weight * (fit + coverage penalty) + reach weight * reach
+                                         //           + semantic weight * semantic
                                          //           + collision weight * collision + hinge weight * hinges
-                                         //           + surface weight * surface + dependency weight * dependency
-                                         //           + chamfer, sdf, transport weights * theirs + thin weight * thin
+                                         //           + dependency weight * dependency
+                                         //           + thin weight * thin
         float fit = 0.0f;                // open pose against the placed mesh: mean over views of (1 - covered) + extra
         float coveragePenalty = 0.0f;    // 10 per whole share a view is covered less than minViewCoverage
         float viewCover = 0.0f, viewExtra = 0.0f;              // means over the views
         float worstView = 0.0f;          // least covered view
+        float reach = 0.0f;              // mean over the views of sum(missed * its distance to the design's outline) /
+                                         // sum(T), the distance over 0.1 of the mesh's size
         float collision = 0.0f;          // overlaps: the open pose's + every hinge's turn's (the mean of its poses; loss.cpp)
         float collisionScale = 1.0f;     // what the collision weight was multiplied by when this was scored (the ramp)
         float clashOpen = 0.0f;          // volume inside two pieces at once, open, as a share of the sphere's
@@ -122,18 +133,8 @@ namespace Bakugan {
         float hinges = 0.0f;             // hinges away from their pieces: per hinge, how far each of its two pieces is
                                          // from its axis (the mean over the barrel's length, beyond a small slack), plus how far it is from fitting under the surface; over the mesh's size
         float hingeGap = 0.0f;           // the farthest a piece is from its hinge's axis, anywhere along the barrel (mm)
-        float surface = 0.0f;            // hollows into the sphere's surface: over points just under it, the mean of
-                                         // d / (d + 1% of the mesh's size), d how deep inside a hollow it is
-        float surfaceCarved = 0.0f;      // the share of those points inside a hollow
         float thin = 0.0f;               // pieces thinner than minThickness: the sum of 1 - thickness / minThickness
         float thinnest = 0.0f;           // the thinnest piece (mm): the largest ball that fits in it, across
-        float chamfer = 0.0f;            // mesh -> design + design -> mesh, each a mean distance over 0.1 of the mesh's size
-        float sdf = 0.0f;                // the signed distances' disagreement, likewise
-        float meshGap = 0.0f;            // mean distance from the mesh's surface to the design's (mm)
-        float designGap = 0.0f;          // ... from the design's surface to the mesh's (mm)
-        float transport = 0.0f;          // optimal transport's cost (squared distances, over (0.1 L)^2)
-        float transportMove = 0.0f;      // how far the material travels, root mean square (mm)
-        float transportUnfilled = 0.0f;  // the share of the placed mesh's volume the material doesn't reach
         float semantic = 0.0f;           // DINOv3: mean over the views of the open pose's loss against the placed mesh
         float worstSemantic = 0.0f;      // the worst single view's
         Placement target;                // where the mesh was placed when this was scored
@@ -174,6 +175,7 @@ namespace Bakugan {
         Carving carving;                 // (before finishing: ledges, carving and a latch are in the design only)
         AutoScore score;
         MotionOverlap checked;           // the finished design's motion, checked densely for overlaps
+        PrintCheck printable;            // with buildHinges: every piece one solid, on a hinge that was built
         std::string message;
     };
 

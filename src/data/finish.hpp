@@ -94,6 +94,40 @@ namespace Bakugan {
     FinishResult AddHinges(const Design& d, const HingeParams& p, JobControl* c = nullptr);
     FinishResult AddLedges(const Design& d, const LedgeParams& p, JobControl* c = nullptr);
     FinishResult AddLatch(const Design& d, const LatchParams& p, JobControl* c = nullptr);
+    // How solid a design's bodies are, on a grid of `cell` mm. Each body is taken `erode` mm in from its surface first,
+    // so two parts of it joined only by a neck thinner than about twice that count as apart (a cut made later, for
+    // a hinge or a collision, would part them): the material not joined to its body's largest part, the hinges whose
+    // pivot isn't at the largest part of both of its bodies (a hinge on a crumb holds nothing), and how much there is
+    // of each body's largest part (what is left of it, that far in).
+    struct Solidity {
+        double loose = 0.0;              // mm^3
+        int offHinges = 0;
+        std::vector<double> volume;      // per group index: its largest part's, mm^3 (0: not a body)
+    };
+    Solidity MeasureSolidity(const Design& d, float cell, float erode = 0.0f);
+    // Every body that nothing would hold becomes part of the body it hangs from: one whose hinge got no hardware (its
+    // two bodies don't meet along the axis), and one whose hinge doesn't turn (it only sits there). The hinges of
+    // what hung from it go with it. So what is left is a tree of bodies, every one on a hinge that was built.
+    FinishResult FuseUnheld(const Design& d);
+    // Whatever of a body isn't joined to the rest of it (a crumb a cut left behind) is cut away: it would fall out of
+    // the print. The body is its largest part.
+    FinishResult RemoveLoose(const Design& d, JobControl* c = nullptr);
+
+    // Whether a design can be printed and stays in one piece: every body one solid, and every body but the root on a
+    // hinge whose hardware is part of both of its bodies' solids.
+    struct PrintCheck {
+        bool ok = false;
+        int bodies = 0;
+        int loose = 0;                   // parts of bodies not joined to the rest of their body ...
+        double looseVolume = 0.0;        // ... and their volume, mm^3
+        int hinges = 0;                  // hinges between bodies
+        int held = 0;                    // ... of them, those with hardware that is part of both bodies
+        std::vector<std::string> floating;   // the bodies nothing holds, and why
+        std::vector<int> unheld;         // the hinges (ids) that don't hold their child: no hardware, or hardware
+                                         // that isn't part of both bodies' solids
+        std::string message;
+    };
+    PrintCheck CheckPrintable(const Design& d);
 
     // Whether a hinge is held shut: with everything closed, starting to open it runs into something (more than
     // `tolerance` mm^3 of overlap by the time it has turned a few degrees).

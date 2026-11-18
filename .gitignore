@@ -14,3 +14,4 @@ tools/autodesign/checktimes
 tools/autodesign/rulecheck
 *.so.*
 foldaball_out/*
+tools/autodesign/printcheck

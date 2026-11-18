@@ -7,6 +7,7 @@
 #   ./adamtest                Adam's memory as parameters come and go
 #   ./checktimes              where the collision checks between open and closed go, for a few hinge timings
 #   ./rulecheck mesh.obj      adding a cut changes nothing; closed, the pieces are always the sphere
+#   ./printcheck design.txt ...   whether saved designs print: every piece one solid, on a hinge that was built
 # The semantic loss (DINOv3) is on in autotest and gradcheck with SEM=model.onnx ORT=path/to/libonnxruntime (see
 # semantic_env.hpp); export_dinov3.py makes the model. Linking needs nothing more: ONNX Runtime is loaded at run time
 # (on glibc older than 2.34, add -ldl).
@@ -22,3 +23,4 @@ g++ $FLAGS "$HERE/gradcheck.cpp" $CODE -lpthread -o "$HERE/gradcheck"
 g++ $FLAGS "$HERE/adamtest.cpp" -o "$HERE/adamtest"
 g++ $FLAGS "$HERE/checktimes.cpp" $CODE -lpthread -o "$HERE/checktimes"
 g++ $FLAGS "$HERE/rulecheck.cpp" $CODE -lpthread -o "$HERE/rulecheck"
+g++ $FLAGS "$HERE/printcheck.cpp" $CODE -lpthread -o "$HERE/printcheck"

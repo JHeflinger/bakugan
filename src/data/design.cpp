@@ -614,6 +614,7 @@ namespace Bakugan {
     std::string Design::Serialize() const {
         std::ostringstream s;
         s.precision(9);
+        s.precision(9);                  // floats as they are: a design read back is the design that was written
         s << "bakugan-hinges 1\n";
         s << "# lengths in millimetres, angles in radians, poses are the design pose\n";
         s << "nextid " << nextId << "\n";

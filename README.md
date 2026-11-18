@@ -92,11 +92,15 @@ has the details). For something that can be printed and played with:
   one at a time, the freest first. *... by the end* is how much more overlaps cost at the end of the search.
 - **Hinges hold each other shut**: every hinge but the first to open is held by a piece that moves away before its
   turn (small ledges cut from the sphere's surface). One hinge then keeps the design closed.
-- **Hinges**: *Build the hinges when done* gives every hinge the smallest barrel that prints (three knuckles on a
+- **Hinges**: *Build the hinges when done* (on by default) gives every hinge the smallest barrel that prints (three knuckles on a
   printed-in-place pin), under the sphere's surface so the closed sphere stays round, and has the search keep each
   axis where one fits. *Add hinges* does the same on the current design (the selected hinge, or all).
-- **Finishing**: *Carve collisions away* cuts out whatever still overlaps on the way; *Latch* puts a press latch, flush
-  with the sphere, on the first hinge. Both run when a search is done, or on the current design with the buttons.
+- **Finishing**: *Carve collisions away* (on by default) cuts out whatever still overlaps on the way; *Latch* puts a
+  press latch, flush with the sphere, on the first hinge. Both run when a search is done, or on the current design
+  with the buttons.
+- **It prints**: the search never leaves a piece in parts that aren't joined, or too small for its hinges. With hinges
+  built, a piece whose hinge can't be built is joined to the piece it hung from, loose crumbs are cut away, and the
+  status line ends with the check: every piece one solid, on a built hinge.
 - **Draw the silhouettes on the GPU** (Optimizer): the search's views are raymarched by the graphics card. The editor
   redraws only a dozen times a second while it runs.
 

@@ -101,6 +101,24 @@ namespace Bakugan {
             for (size_t k = 0; k < hit.size(); k++) m_MeshFine[v][k] = hit[k];
         });
 
+        // points inside the mesh, for aiming cuts: a grid over its box, kept where every view's silhouette covers it
+        {
+            const float step = fmaxf(hi.x - lo.x, fmaxf(hi.y - lo.y, hi.z - lo.z)) / 28.0f;
+            m_HullStep = step;
+            for (float x = lo.x + 0.5f * step; x < hi.x; x += step)
+                for (float y = lo.y + 0.5f * step; y < hi.y; y += step)
+                    for (float z = lo.z + 0.5f * step; z < hi.z; z += step) {
+                        Vector3 q = Vector3Subtract({ x, y, z }, m_Centre);
+                        bool in = true;
+                        for (int v = 0; v < n && in; v++) {
+                            int px = (int)floorf((Vector3DotProduct(q, m_Views[v].u) / m_Half + 1.0f) * 0.5f * m_Fine);
+                            int py = (int)floorf((1.0f - Vector3DotProduct(q, m_Views[v].v) / m_Half) * 0.5f * m_Fine);
+                            in = px >= 0 && py >= 0 && px < m_Fine && py < m_Fine && m_MeshFine[v][(size_t)py * m_Fine + px] > 0.5f;
+                        }
+                        if (in) m_Hull.push_back({ x, y, z });
+                    }
+        }
+
         // the collisions' sample points
         std::mt19937 rng(p.seed * 31u + 7u);
         std::uniform_real_distribution<float> u01(0.0f, 1.0f);
@@ -109,8 +127,6 @@ namespace Bakugan {
             float y = 1.0f - (i + 0.5f) / 512.0f, r = sqrtf(fmaxf(0.0f, 1.0f - y * y)), phi = i * 2.39996323f;
             m_SurfaceDirs.push_back({ r * cosf(phi), y, r * sinf(phi) });
         }
-        if (p.chamferWeight > 0.0f || p.sdfWeight > 0.0f) SetUpShape(mesh);
-        if (p.TransportOn()) SetUpTransport(mesh);
         if (p.semanticWeight > 0.0f) SetUpSemantic(mesh);
         m_Target = TargetSilhouettes(m_Placed);
         if (m_Dino) m_SemTarget = SemanticTargets(m_Placed);
@@ -244,20 +260,13 @@ namespace Bakugan {
         Slopes slopes(b.fields.size());
         Shades shades(b.fields.size());
         AutoScore s = Score(d, b, target, &slopes, &shades, phase);
-        s.surface = SurfaceTerm(c, &s.surfaceCarved);
-        s.total += m_P.surfaceWeight * s.surface;
         Anchors anchors;
         if (s.valid) {
             s.thin = Thickness(b, s, grad ? &anchors : nullptr);
             if (m_P.thinWeight > 0.0f) s.total += m_P.thinWeight * s.thin;
         }
-        Vector3 otOffset = { 0, 0, 0 };
-        float otLogScale = 0.0f;
-        if (m_P.TransportOn() && s.valid)
-            s.total += Transport(c, b, target, s, grad ? &anchors : nullptr, grad ? &otOffset : nullptr, grad ? &otLogScale : nullptr);
         if (!grad || ps.empty() || !s.valid) return s;
         Gradient(c, target, bodyOf, b, slopes, shades, anchors, ps, *grad);
-        const bool shape = m_P.chamferWeight > 0.0f || m_P.sdfWeight > 0.0f;
 
         // the placement: the targets drawn again with it nudged two units either way, against the design as drawn
         const float silhouette = std::max(0.0f, m_P.silhouetteWeight);
@@ -270,8 +279,9 @@ namespace Bakugan {
                 Placement t = target;
                 Set(cc, t, ps[j], Get(c, target, ps[j]) + (side == 0 ? 2.0f : -2.0f) * ps[j].unit, m_L);   // (2 units: the silhouettes wiggle finer)
                 value[side] = Get(cc, t, ps[j]);
-                if (silhouette > 0.0f) loss[side] += silhouette * FitLoss(TargetSilhouettes(t));
-                if (shape) loss[side] += Shape(b, t, nullptr, nullptr);     // the mesh's points moved with it
+                const std::vector<std::vector<float>> targets = TargetSilhouettes(t);
+                if (silhouette > 0.0f) loss[side] += silhouette * FitLoss(targets);
+                if (m_P.reachWeight > 0.0f) loss[side] += m_P.reachWeight * ReachLoss(targets);
                 if (m_Dino && m_SemGradTarget.size() == m_SemDrawn.size()) {
                     std::vector<std::vector<float>> pictures = SemanticTargets(t);
                     const size_t px = (size_t)m_SemRes * m_SemRes;
@@ -281,8 +291,6 @@ namespace Bakugan {
             }
             float step = value[0] - value[1];
             if (step > 0.0f) (*grad)[j] = (float)((loss[0] - loss[1]) / step) * ps[j].unit;
-            // transport's, exactly (each mesh point's slope, through the offset or the log scale)
-            (*grad)[j] += (ps[j].field < 3 ? (&otOffset.x)[ps[j].field] : otLogScale) * ps[j].unit;
         }
         return s;
     }
@@ -335,14 +343,8 @@ namespace Bakugan {
         if (m_P.collisionWeight > 0.0f) Collisions(d, b, s, slopes, phase);
         Hinges(d, b, s);
         if (m_P.dependencies) Dependencies(d, b, s, slopes);
-        float shape = 0.0f;
-        if (m_P.chamferWeight > 0.0f || m_P.sdfWeight > 0.0f) {
-            SampleDesignSurface(b);
-            shape = Shape(b, target, &s, &slopes);
-        }
-        s.total = std::max(0.0f, m_P.silhouetteWeight) * (s.fit + s.coveragePenalty) + (m_Dino ? m_P.semanticWeight * s.semantic : 0.0f) +
-                  CollisionWeight() * s.collision + HingeWeight() * s.hinges + (m_P.dependencies ? m_P.dependencyWeight * s.dependency : 0.0f) +
-                  shape;
+        s.total = std::max(0.0f, m_P.silhouetteWeight) * (s.fit + s.coveragePenalty) + std::max(0.0f, m_P.reachWeight) * s.reach + (m_Dino ? m_P.semanticWeight * s.semantic : 0.0f) +
+                  CollisionWeight() * s.collision + HingeWeight() * s.hinges + (m_P.dependencies ? m_P.dependencyWeight * s.dependency : 0.0f);
         s.collisionScale = m_CollisionScale;
         s.valid = true;
         if (slopesOut) *slopesOut = std::move(slopes);
@@ -428,24 +430,6 @@ namespace Bakugan {
 
         const float minCover = std::clamp(m_P.minViewCoverage, 0.0f, 1.0f), silhouette = std::max(0.0f, m_P.silhouetteWeight);
         const float weight = 1.0f / nv;
-        // where the design shows outside the mesh: a spread of such pixels, as points of their pieces, closed
-        m_Extra.clear();
-        {
-            std::vector<size_t> extra;
-            for (int v = 0; v < nv; v++)
-                for (int k = 0; k < px; k++) {
-                    size_t kk = (size_t)v * px + k;
-                    if (who[kk] >= 0 && m_Cover[kk] - m_Target[v][k] > 0.5f) extra.push_back(kk);
-                }
-            size_t stride = std::max<size_t>(1, extra.size() / 256);
-            for (size_t e = 0; e < extra.size(); e += stride) {
-                size_t kk = extra[e];
-                int i = who[kk];
-                const Rigid& xf = b.xf[0][b.group[i]];
-                Quaternion inv = { -xf.rotation.x, -xf.rotation.y, -xf.rotation.z, xf.rotation.w };
-                m_Extra.push_back({ i, xf.ApplyInverse(at[kk]), Vector3RotateByQuaternion(m_Views[kk / px].dir, inv) });
-            }
-        }
         s.worstView = 1.0f;
         double lossSum = 0.0, coverSum = 0.0, extraSum = 0.0;
         for (int v = 0; v < nv; v++) {
@@ -478,6 +462,98 @@ namespace Bakugan {
         s.fit = (float)(lossSum / nv);
         s.viewCover = (float)(coverSum / nv);
         s.viewExtra = (float)(extraSum / nv);
+
+        // reach: every missed pixel's distance to the nearest covered one; its slope goes to that pixel's piece
+        m_Reach.assign((size_t)nv * px, 0.0f);
+        if (m_P.reachWeight <= 0.0f) return;
+        for (int v = 0; v < nv; v++) {
+            const float* D = m_Cover.data() + (size_t)v * px;
+            const std::vector<float>& T = m_Target[v];
+            auto covered = [&](int x, int y) { return x >= 0 && y >= 0 && x < m_Res && y < m_Res && D[y * m_Res + x] >= 0.5f && who[(size_t)v * px + y * m_Res + x] >= 0; };
+            std::vector<int> rim;                            // covered pixels next to one that isn't
+            double tsum = 0.0;
+            for (int y = 0; y < m_Res; y++)
+                for (int x = 0; x < m_Res; x++) {
+                    tsum += T[y * m_Res + x];
+                    if (covered(x, y) && !(covered(x - 1, y) && covered(x + 1, y) && covered(x, y - 1) && covered(x, y + 1))) rim.push_back(y * m_Res + x);
+                }
+            if (rim.empty() || tsum <= 0.0) continue;
+            std::vector<float> pull(rim.size(), 0.0f);
+            for (int k = 0; k < px; k++) {
+                float miss = T[k] - D[k];
+                if (miss <= 0.05f) continue;
+                int x = k % m_Res, y = k / m_Res, best = 0, bestD = INT32_MAX;
+                for (size_t r = 0; r < rim.size(); r++) {
+                    int dx = rim[r] % m_Res - x, dy = rim[r] / m_Res - y, dd = dx * dx + dy * dy;
+                    if (dd < bestD) { bestD = dd; best = (int)r; }
+                }
+                float dist = (sqrtf((float)bestD) - 1.0f) * m_Tau;
+                if (dist <= 0.0f) continue;
+                m_Reach[(size_t)v * px + k] = dist;
+                pull[best] += miss;
+            }
+            for (size_t r = 0; r < rim.size(); r++) {
+                if (pull[r] <= 0.0f) continue;
+                size_t kk = (size_t)v * px + rim[r];
+                // (the piece's distance there going up by e moves its outline e further from what it is nearest to)
+                slopes[who[kk]].push_back({ 0, at[kk], (float)(m_P.reachWeight * pull[r] / (tsum * 0.1 * m_L * nv)) });
+            }
+        }
+        s.reach = ReachLoss(m_Target);
+    }
+
+    float Loss::ReachLoss(const std::vector<std::vector<float>>& target) const {
+        const int nv = (int)m_Views.size(), px = m_Res * m_Res;
+        if (m_Cover.size() != (size_t)nv * px || m_Reach.size() != m_Cover.size()) return 0.0f;
+        double loss = 0.0;
+        for (int v = 0; v < nv; v++) {
+            double tsum = 0.0, far = 0.0;
+            for (int k = 0; k < px; k++) {
+                float t = target[v][k];
+                tsum += t;
+                far += fmaxf(0.0f, t - m_Cover[(size_t)v * px + k]) * m_Reach[(size_t)v * px + k];
+            }
+            if (tsum > 0.0) loss += far / (tsum * 0.1 * m_L) / nv;
+        }
+        return (float)loss;
+    }
+
+    bool Loss::FarTarget(const Carving& c, std::mt19937& rng, int* piece, Vector3* local, float* missing) const {
+        if (m_Hull.empty() || c.pieces.empty()) return false;
+        std::vector<int> bodyOf;
+        Design d = c.Build(&bodyOf);
+        std::vector<Rigid> xf = d.Transforms(0.0f, true);
+        std::vector<BodyField> fields;
+        std::vector<int> group;
+        for (size_t k = 0; k < c.pieces.size(); k++) {
+            fields.push_back(BodyField::Body(d, bodyOf[k]));
+            group.push_back(d.GroupIndex(bodyOf[k]));
+        }
+        std::vector<double> weight(m_Hull.size(), 0.0);
+        std::vector<int> who(m_Hull.size(), 0);
+        std::vector<Vector3> at(m_Hull.size());
+        const float near = 0.04f * m_L;                  // nearer than this the outline's own slope does the work
+        ParallelFor((int)m_Hull.size(), [&](int k) {
+            Vector3 p = Vector3Add(Vector3Add(m_MeshCentre, m_Placed.offset), Vector3Scale(Vector3Subtract(m_Hull[k], m_MeshCentre), m_Placed.scale));
+            float best = FLT_MAX;
+            for (size_t i = 0; i < fields.size(); i++) {
+                Vector3 q = xf[group[i]].ApplyInverse(p);
+                float dist = fields[i].Distance(q);
+                if (dist < best) { best = dist; who[k] = (int)i; at[k] = q; }
+            }
+            if (best > near) weight[k] = (double)best * best;
+        });
+        double total = 0.0;
+        for (double w : weight) total += w;
+        if (total <= 0.0) return false;
+        size_t pick = std::discrete_distribution<size_t>(weight.begin(), weight.end())(rng);
+        *piece = who[pick];
+        *local = at[pick];
+        // what is missing around it: the uncovered points near it, each its cell of the placed mesh
+        int count = 0;
+        for (size_t k = 0; k < m_Hull.size(); k++) count += weight[k] > 0.0 && Vector3Distance(m_Hull[k], m_Hull[pick]) < 0.2f * m_L;
+        *missing = count * powf(m_HullStep * m_Placed.scale, 3.0f);
+        return true;
     }
 
     // The silhouettes' part of the loss (fit + coverage penalty) for the last drawing, against other targets.
@@ -795,30 +871,6 @@ namespace Bakugan {
         return sum / m_L;
     }
 
-    // ---- the surface --------------------------------------------------------------------------------------------------------
-
-    // Points just under the sphere's surface, each against the hollows (the union of them): how deep inside one it is,
-    // d, counts d / (d + 1% of the mesh's size): nothing until a hollow reaches it, nearly 1 once well inside.
-    float Loss::SurfaceTerm(const Carving& c, float* carved) const {
-        const float scale = 0.01f * m_L, under = c.radius * 0.997f;
-        double sum = 0.0;
-        int in = 0;
-        bool any = false;
-        for (const Cutter& k : c.cutters) any |= k.hollow;
-        if (any)
-            for (Vector3 dir : m_SurfaceDirs) {
-                Vector3 p = Vector3Add(c.centre, Vector3Scale(dir, under));
-                float d = FLT_MAX;
-                for (const Cutter& k : c.cutters)
-                    if (k.hollow) d = fminf(d, k.sf.Distance(p));
-                if (d >= 0.0f) continue;
-                in++;
-                sum += -d / (-d + scale);
-            }
-        if (carved) *carved = (float)in / m_SurfaceDirs.size();
-        return (float)(sum / m_SurfaceDirs.size());
-    }
-
     // ---- the gradient -------------------------------------------------------------------------------------------------------
 
     // d loss / d parameter = sum over the slopes of (slope · d distance / d parameter). To first order a distance only
@@ -873,21 +925,9 @@ namespace Bakugan {
                         sum[side] += sh.weight * ShadeAt(field(i), after, sh);
                     }
                 }
-                // the sphere's material (transport): moved by its piece's open pose, handed between pieces by a cutter
-                for (const Anchor& a : anchors) {
-                    const Rigid& before = b.xf[0][b.group[a.field]];
-                    const Rigid& after = xf[0][b.group[a.field]];
-                    if (a.massSlope == 0.0f) {
-                        if (memcmp(&before, &after, sizeof(Rigid)) != 0) sum[side] += Vector3DotProduct(a.grad, after.Apply(a.local));
-                    } else if (changedOf[a.field] >= 0) {
-                        sum[side] += a.massSlope * field(a.field).Distance(a.local);
-                    }
-                }
-                // the surface term, for a hollow's parameter
-                if (p.kind == Param::Cutter && m_P.surfaceWeight > 0.0f) {
-                    int k = e.CutterIndex(p.id);
-                    if (k >= 0 && e.cutters[k].hollow) sum[side] += m_P.surfaceWeight * SurfaceTerm(e);
-                }
+                // the thickness term: the field at the points it depends on, for a cutter that shapes their piece
+                for (const Anchor& a : anchors)
+                    if (changedOf[a.field] >= 0) sum[side] += a.slope * field(a.field).Distance(a.local);
                 // the hinge term, for the joints this parameter touches: a pivot it moves, or a piece whose field it changes
                 if (m_P.hingeWeight > 0.0f)
                     for (const Hinge& h : de.hinges) {

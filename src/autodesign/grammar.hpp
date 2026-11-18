@@ -9,7 +9,7 @@
 
 namespace Bakugan {
     struct RuleContext {
-        const Loss& loss;            // the mesh's size
+        Loss& loss;                  // the mesh's size, what the design misses, and a rewrite's score
         const AutoParams& p;
         std::mt19937& rng;
     };

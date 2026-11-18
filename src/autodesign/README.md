@@ -12,27 +12,25 @@ The editor and the test suite call one function, `AutoDesign`, declared in `auto
 | `carving.hpp/.cpp` | what's designed: the sphere, its cutters, pieces and joints; building it into a `Design`; its parameters |
 | `adam.hpp` | Adam, with memory kept per parameter key, so parameters can come and go |
 | `loss.hpp/.cpp` | the loss (the open pose against the placed mesh, collisions, holding, pivots) and its gradient; the opening order |
-| `transport.cpp` | the transport part of the loss: optimal transport between the sphere's material, opened, and the placed mesh |
-| `shape.cpp` | the 3D shape part of the loss: the Chamfer distance and signed distances against the placed mesh |
+| `thickness.cpp` | the thickness part of the loss: no piece thinner than can be printed |
+| `snap.cpp` | what keeps a carving buildable at every step: hinges on their seams, every piece one solid big enough for its hinges |
 | `tracer.hpp` | the silhouettes drawn somewhere else than on the CPU's cores (the editor's GPU: `ui/gputrace.cpp`) |
 | `../data/clash.hpp/.cpp` | overlaps between bodies on their exact fields, and where in the motion to look for them |
-| `../data/finish.hpp/.cpp` | the finishing passes: ledges, carving collisions away, the press latch |
+| `../data/finish.hpp/.cpp` | the finishing passes: hinges, carving collisions away, ledges, the press latch; and the check that the result prints |
 | `semantic.cpp` | the semantic part of the loss: the views drawn as pictures and compared by DINOv3 |
 | `dino.hpp/.cpp` | DINOv3 through ONNX Runtime, loaded at run time (its C API header is in `src/vendor/onnxruntime`) |
-| `grammar.hpp/.cpp` | the rewrite rules: add or remove a cut (and its hinge), add or remove a hollow |
+| `grammar.hpp/.cpp` | the rewrite rules: add a cut or split a piece (with its hinge), remove a cut |
 | `suite*.cpp/hpp` | the test suite: every mesh in a folder, into one video |
 
 ## The carving
 
 A carving (`carving.hpp`) is a sphere and a set of **cutters**, superfrustums. Each cutter split one piece in two when it was added: the part inside the cutter and the part outside it. So every **piece** is the sphere, inside some cutters and outside others. Together the pieces fill the sphere exactly, and no two share any material, for any shape or position of the cutters: closed, the design is the sphere.
 
-**Hollows** are cutters too, but they only take material away: from every piece, without making one. Closed, the pieces then fill the sphere less its hollows. The loss's surface term keeps hollows inside the sphere, so from outside it stays a whole sphere (some leeway: what hollows may cost is `surfaceWeight`).
-
 Pieces are joined by **joints**, one per cut. A joint turns its child piece about an axis through a pivot, from 0 (closed: in the sphere) to its open angle, during its share `t0..t1` of the motion. The joints form a tree, and the piece the first cut left is its root.
 
 `Carving::Build` makes it an ordinary `Design`, which the loss scores and the editor shows and exports:
 - a body per piece, holding the sphere (an exact one: a speck rounded out to the radius);
-- a cut for every cutter the piece is outside of, and for every hollow;
+- a cut for every cutter the piece is outside of;
 - a cut feature "outside this cutter" for every cutter it's inside of: a box around the sphere, less the cutter (the piece is the sphere less everything outside the cutter);
 - a hinge per joint, with closed angle 0.
 
@@ -45,18 +43,19 @@ Pieces are joined by **joints**, one per cut. A joint turns its child piece abou
 2. **Start.** The sphere, whole: one piece.
 3. **Steps.** Until the step budget runs out:
    - Every step is one Adam step on every parameter: the cutters', the joints' and the placement's.
+   - After each step every hinge is put back on the seam between its two pieces, and the carving has to stay buildable (below): a cutter whose move would break that stays where it is for that step.
    - What overlaps cost rises steadily over the run, from `collisionWeight` to `collisionRamp` times it: early on the search may try things, by the end the pieces have to be clear of each other. Carvings from different times are compared as they'd score at the end of the ramp.
    - Every `stepsPerRound` steps there is a rewrite round. First the opening order is looked at again (below). Then rewrites are drawn from the grammar. Each rewritten carving, and the unchanged one, gets `lookahead` Adam steps of its own. Whichever has the lowest loss afterwards carries on, with its Adam memory.
 4. **Result.** The best carving seen during the run, built into a design (`AutoResult::design`; the carving itself is in `AutoResult::carving`). The editor shows the reference mesh where it was placed for it.
-5. **Finishing**, as asked (below): the hinges' hardware, ledges, carving, a latch. They change the design only, not the carving. Then the finished design's motion is checked once more, at 24 poses in every hinge's turn on a finer grid than the search could afford (`AutoResult::checked`).
+5. **Finishing** (below): the hinges' hardware and carving by default, ledges and a latch when asked. They change the design only, not the carving. With hinges built, the result is checked for printing (`AutoResult::printable`). Then the finished design's motion is checked once more, at 24 poses in every hinge's turn on a finer grid than the search could afford (`AutoResult::checked`).
 
 With 0 steps it only scores the editor's design as it is: its open pose against the mesh where it is.
 
 ## The rules
 
 - **Add a cut** (adds). A small cap sliced off a piece where it meets the sphere's surface: a box whose inner face is a little under the surface. The cap is hinged to the rest of the piece along the edge of that face, like a lid. The joint's open angle starts at 0, so nothing looks different (`rulecheck`: the open pose's field is unchanged to 0.0000 mm) until Adam opens it. The joints the piece had go with whichever part their pivot is in. No more than `maxPieces` pieces.
-- **Add a hollow** (adds). At a pixel where the open design shows outside the placed mesh (`Loss::ExtraSpots`, from the last evaluation), a rounded bar through its piece along the view that saw it, as long as the piece is deep there, so the pixel clears at once. Where the bar reaches the sphere's surface the surface term weighs it, and Adam reshapes and moves it from there. No more than `maxHollows`. A hollow inside the sphere only changes the silhouettes where an opened piece shows the sphere's inside (a cut face); the outline of the sphere's own surface only shrinks by carving through it, which the surface term charges for. In the runs so far (robot, creature) hollows were kept now and then, carving under 2% of the surface, without making the fit better on average than carving with cuts alone, which is why they're drawn half as often by default.
-- **Remove a hollow** (simplifies). Any hollow.
+- **Reach for the mesh** (adds). Aimed, where the others are random. `Loss::FarTarget` draws a point inside the placed mesh (its visual hull over the views) that the open design is far from, likelier the farther. From the piece nearest to it, at that piece's point nearest to it, a strip is cut back along the piece's surface (a box along a chord of the surface, everything above its floor), sized by how much of the mesh is missing around the point, and hinged at that point across the strip. Unlike the other rules it changes the open pose at once: of the three opening angles that swing the strip's far end nearest the point, the one the design scores best with is taken, and only if that beats the design as it is. Cut from the sphere it makes a limb; cut from a limb's end, the next segment of a chain.
+- **Split a piece** (adds). A plane through a random point of a piece, facing a random way, cuts it in two; the halves are hinged along the edge of the cut face, closed, the axis turned so that opening lifts the new half off the rest. Big parts in one rewrite. Under the rules for staying buildable (below) most small caps are turned down, and most pieces come from here.
 - **Remove a cut** (simplifies). Two pieces that one cutter split, and that no later cut has split since, joined by a joint (likelier the less it opens), become one piece again; the cutter and the joint go. The joints of the piece that hung from the other go to it.
 
 How often each rule is drawn is its weight (`AutoParams::ruleWeights`, in `AutoRules()` order; empty means the table's defaults). The Grammar section of the Generate tab sets them, and a running job picks up changes at its next rewrite round (through `AutoLive::ruleWeights`). A weight of 0 switches a rule off.
@@ -68,33 +67,47 @@ A rewrite is judged against leaving the carving alone, after both have had the s
 Only the open pose and the motion are scored. Closed, the pieces are the sphere.
 
 - **Silhouettes.** Per view, with T the placed mesh's coverage of a pixel and D the design's: covered = Σ min(T, D) / Σ T, extra = Σ max(0, D − T) / Σ T, and the view's loss is (1 − covered) + extra. `fit` is the mean over the views. A view covered less than `minViewCoverage` costs 10 per whole share short.
+- **Reach**, weighted by `reachWeight`. The fit only changes where the design's outline is, so a part of the mesh nothing is near pulls on nothing, and a blob over the body scores well enough to stay. Every missed pixel therefore also counts by how far it is from the nearest covered pixel (beyond one pixel, over 10% of the mesh's size), and that slope goes to the piece covering that nearest pixel: it is pulled toward what is missing, however far away.
 - **Semantics** (below), when `semanticWeight` > 0.
 - **Collisions**, weighted by `collisionWeight` (times the ramp).
 - **Holding** (with `dependencies`): hinges nothing could hold shut, weighted by `dependencyWeight`.
 - **Hinges**: pivots away from their pieces, weighted by `hingeWeight`.
-- **Surface**: hollows reaching the sphere's surface, weighted by `surfaceWeight`. Over 1024 points spread just under the surface, the mean of d / (d + 1% of the mesh's size), d how deep the point is inside a hollow: about the share of the surface carved away, rising smoothly as a hollow reaches it (so it has a gradient). Its gradient is measured directly, by nudging the hollows' parameters.
+- **Thickness**: pieces thinner than `minThickness` (the largest ball that fits in them), weighted by `thinWeight`.
 
-total = `silhouetteWeight` · (fit + coverage penalty) + `semanticWeight` · semantic + `collisionWeight` · collision + `hingeWeight` · hinges + `surfaceWeight` · surface + `dependencyWeight` · holding.
+total = `silhouetteWeight` · (fit + coverage penalty) + `reachWeight` · reach + `semanticWeight` · semantic + `collisionWeight` · collision + `hingeWeight` · hinges + `thinWeight` · thin + `dependencyWeight` · holding.
 
-## The 3D terms
+## Staying buildable
 
-All off by default (transport is a switch; SDF and Chamfer are off at weight 0). They compare the open design with the placed mesh in 3D, not as outlines from a few views.
+The loss alone doesn't keep a carving printable. Left to it, a cutter that moves through a piece leaves part of it cut off from the rest: material that still moves with the piece in the open pose (and fills the mesh's silhouette nicely) but that nothing joins to it, and pieces shrink to slivers too small for the hinge they hang from. So every Adam step and every rewrite has to leave the carving buildable (`Loss::SnapJoints`, `Loss::Solid`, both in `snap.cpp`):
 
-**Transport** (`transport` switches it on; `transportWeight`, `transportPoints`; `transport.cpp`). In the Generate tab it's the *Optimal transport* checkbox; in the CLI `transport = true`; in `autotest`/`gradcheck` `OT=1` (or `OTW=...`). The carving can't grow or shrink, only rearrange the sphere's material, so the question is where that material goes. Silhouettes, the SDF and the Chamfer distance only see mistakes near the mesh: a piece opened to the wrong place, far from where it's needed, gets no pull from them. Optimal transport (the earth mover's distance) pairs every bit of material with a bit of the mesh it should fill, however far away, and pulls it there.
-- *The material*: fixed points spread evenly through the sphere, in its frame. Each belongs to the piece it's inside (a point in a hollow: to none) and moves rigidly with that piece's open pose, so there's nothing to sample again.
-- *The mesh*: fixed points filling it (winding number over ½), moved with the placement.
-- *The masses*, in shares of the sphere's volume: a material point weighs its share of the sphere, a mesh point its share of the placed mesh's volume (over the sphere's). The transport is unbalanced: mass left unmatched costs ρ = (the mesh's size)² a unit, so moving material is always cheaper than dropping it and only a real difference in amount goes unmatched. A mesh with less room than the sphere's material can't take all of it, and material taken by hollows leaves part of the mesh unfilled (`transportUnfilled`): both cost.
-- *The cost*: entropic unbalanced optimal transport with squared distances (Sinkhorn in the log domain, ε = (5% of the mesh's size)², warm started from the last evaluation), over (10% of the mesh's size)². With ρ that large, plain Sinkhorn settles the balance between the two sides (a constant shared by both potentials) only ε/ρ of the way a round, so after every half-round the best such shift is made exactly (translation invariant Sinkhorn, Séjourné et al. 2022). Without it the mass terms' slopes came out half what they should.
-- *Its gradient*, with the plan held fixed. A material point's slope is 2r(x − T), r the mass it sends and T where; the joints move it (`Anchor.grad`). A mesh point's is 2c(y − S) likewise, which gives the placement's slope exactly (through the scale its mass changes too). A cutter hands material from one piece to another along its face, and a hollow takes it away: mass added at x changes the cost by φ(x) = ρ(1 − e^(−f(x)/ρ)) − ε(e^(−f(x)/ρ) − B), f(x) the dual potential there, and near a piece's surface its share of a point is taken as ½ − D/(2τ), τ = 2% of the mesh's size (`Anchor.massSlope`).
-- Against brute force (`ONLY3D=1 OTW=1 gradcheck` on `assets/zard.obj`): cosine 0.992 over all 64 parameters, 0.92 over the carving's own. The joints' and the placement's (scale included) agree to a few parts in a thousand. The cutters' are rougher, because brute force there is itself a step function (points change piece one at a time).
-- *Cost*: about 5× the silhouettes' a step at 1024 points (34 ms against 7 ms); it grows with the square of `transportPoints`.
+- **Hinges on seams.** Each joint's pivot is projected back onto the seam its two pieces share, its axis along it (and, with hinges built under the surface, deep enough for the barrel).
+- **One solid.** Each piece, taken 0.4 · `minThickness` in from its surface, is still one part (on a grid a quarter of `minThickness`; `MeasureSolidity` in `data/finish.hpp`): no more than half a percent of the sphere may be in parts not joined to the rest of their piece. Taking the piece in first means two parts joined only by a thin neck count as apart, since the cuts made later for hinges and collisions would part them.
+- **Hinges on the solid.** Each pivot is at the largest part of both of its pieces.
+- **Big enough.** Each piece has at least twice the volume of the box around a hinge's barrel, for every hinge on it (`Loss::PieceVolume`; a new cap starts at least that big).
 
-**SDF** (`sdfWeight`) and **Chamfer** (`chamferWeight`) (`shape.cpp`, the mesh's points: `shapeSamples`).
-- *SDF*: points in and around the mesh, whose signed distance T to it is known. The design's D should match it within 5% of the mesh's size of its surface; deeper inside, D only has to be that far inside too, and farther out, that far outside. So it tells inside from outside and says which way to move.
-- *Chamfer*: points on the mesh's surface each cost the design's |D| there, and points on the design's surface (fixed points in each piece's box pulled onto it by Newton steps, where no other piece covers them) each cost the distance to the mesh (a box tree over its triangles). Carved pieces can't follow fine surface detail, so it's best light.
-- Both depend on the design only through the pieces' distances at world points. A design-surface point's slope is −(∂u/∂x · n) against its piece's distance there: raising the distance by e moves the surface back by e along its normal n. Against brute force: cosine 0.97 (SDF), 0.95 (Chamfer).
+A rewrite that breaks any of these isn't tried. An Adam step that does is taken again cutter by cutter: each cutter moves only if the carving is still buildable with it moved, so the one cutter that would break it stays put for that step and everything else carries on. The result's message says in how many steps that happened.
 
-`autotest` takes them as `OTW`, `OTN`, `SDFW`, `CHAMW`, `SHAPEN`, and measures every result with all three, whatever the run used.
+## What was measured, and removed
+
+Each part was switched off in turn over four meshes (`zard`, `cow`, `human`, `teapot`, 80 mm long) and two seeds, 1500 steps, and the fit (share of the silhouettes missed + share extra) compared with all of it on (0.51). Differences under about 0.02 are noise at eight runs.
+
+| part | fit without it | verdict |
+|---|---|---|
+| hollows (cutters that only remove material) | 0.50 | no gain, and they cut pieces apart: removed |
+| "aim a cut" (needed transport) | 0.50 | did nothing with transport off, a quarter of all rewrite draws: removed |
+| "split a piece" | 0.49 | no gain then, but that was before the rules for staying buildable: with them, runs without it ended with 2 pieces and 62% cover instead of 72%. Kept (without its transport-aimed hinge placement) |
+| optimal transport (on) | 0.50 | no gain, 4× slower: removed |
+| 3D SDF / Chamfer (on) | 0.49 | no gain: removed |
+| "remove a cut" | 0.51 | without it 6 pieces instead of 4, 3× slower, more overlap: kept |
+| thickness | 0.50 | without it the thinnest piece is 1.6 mm instead of 3.3: kept |
+| coverage penalty | 0.50 | without it cover drops from 72% to 63%: kept |
+| the mesh may move | 0.51 | without it cover drops from 72% to 69%: kept |
+| collision ramp | 0.47 | without it 4× the overlap left on the way: kept |
+| opening order | 0.49 | no clear effect on fit; kept (dependencies need it) |
+
+With what was kept, and the rules for staying buildable, the same eight runs fit a little better than before (0.49; 71% of the silhouettes covered, 20% extra) and all eight print: every piece one solid, every hinge built. Before, none did (every design had loose crumbs, and two had pieces nothing held).
+
+The semantic loss, dependencies, ledges and the latch are off by default and weren't measured (the semantic loss needs a model that isn't in the repository).
 
 ## The semantic loss
 
@@ -153,7 +166,13 @@ With `dependencies`, every hinge but the first to open should be held shut by a 
 
 ## Finishing
 
-The same passes the Generate tab's Finishing section runs on any design (`data/finish.hpp`):
+The same passes the Generate tab's Finishing section runs on any design (`data/finish.hpp`). After a search, hinges and carving are on by default, and with hinges built the result has to print:
+
+- **Join what nothing holds** (`FuseUnheld`). A piece whose hinge couldn't be built (its two pieces don't meet along the axis), or whose hinge doesn't turn, becomes part of the piece it hung from.
+- **Cut loose crumbs away** (`RemoveLoose`). Whatever of a body isn't joined to the part its hinge is on would fall out of the print: it is cut away.
+- **Check it prints** (`CheckPrintable`, `tools/autodesign/printcheck` for saved designs). Every body is one solid, and every body but the root hangs from a hinge whose knuckles are part of both bodies' solids. The cuts that make room around a hinge can leave its knuckles on a stub nothing joins to the piece; then the finishing is done again with leaves twice, then three times as long (they reach further into the piece, and no cut reaches hardware). A hinge that still doesn't hold is given up and its piece joined to the one it hung from. The message ends with the verdict.
+
+The passes themselves:
 
 - **Carve collisions away** (`CarveCollisions`). The motion is checked at `checksPerHinge` poses of every hinge's turn. Whatever is inside two bodies is covered with rounded boxes (the overlap's own box along its principal axes, split while it is mostly empty), `clearance` larger all round, and cut from the body it shows less on when closed. Then it checks again between those poses and carves what is left, up to `rounds` times. It works on any design; nothing is added anywhere, so nothing sticks out of the sphere.
 - **Add hinges** (`AddHinges`): each hinge's hardware; see Hinges.
@@ -204,9 +223,9 @@ For each of those pixels:
 - the pixel's slope with respect to its ray's nearest distance is the edge's slope;
 - that distance changes, to first order, only through the piece's field and pose at the ray's nearest point (the envelope theorem).
 
-The last part is measured by nudging one parameter either way, building the carving again, and re-evaluating the distances at those points: for a cutter, the fields of the pieces it shapes (a hollow's: every piece's); for a joint, the poses. Collision samples work the same way: each sample's slope goes to the piece whose distance sets the overlap depth there. The times of the poses between are held fixed while the gradient is taken.
+The last part is measured by nudging one parameter either way, building the carving again, and re-evaluating the distances at those points: for a cutter, the fields of the pieces it shapes; for a joint, the poses. Collision samples work the same way: each sample's slope goes to the piece whose distance sets the overlap depth there. The times of the poses between are held fixed while the gradient is taken.
 
-`tools/autodesign/gradcheck` compares this gradient against brute-force differences of the whole loss, for a carving of three pieces and a hollow. Over the cutters' and joints' 64 parameters it points the same way: cosine 0.995. The placement's four are themselves differences of the targets, so they agree with brute force at the same step. Run with `MINCOVER=0` to leave out the coverage penalty's kink, which brute force with a large step jumps across.
+`tools/autodesign/gradcheck` compares this gradient against brute-force differences of the whole loss, for a carving of three pieces. Over the cutters' and joints' parameters it points the same way (cosine 0.995 when last measured). The placement's four are themselves differences of the targets, so they agree with brute force at the same step. Run with `MINCOVER=0` to leave out the coverage penalty's kink, which brute force with a large step jumps across.
 
 ## Extending it
 

@@ -1257,4 +1257,275 @@ namespace Bakugan {
         r.message = "No latch on " + hg.name + ": " + why + ".";
         return r;
     }
+
+    // ---- one solid per body, every body held ----------------------------------------------------------------------------------
+
+    namespace {
+        // A body's material on a grid, as connected parts (cells that share a face).
+        struct Parts {
+            Vector3 lo = { 0, 0, 0 };
+            float cell = 1.0f;
+            int n[3] = { 0, 0, 0 };
+            std::vector<int> label;              // per cell: its part, or -1 (no material)
+            std::vector<double> volume;          // per part, mm^3
+            Vector3 Centre(size_t i) const {
+                int x = (int)(i % n[0]), y = (int)((i / n[0]) % n[1]), z = (int)(i / ((size_t)n[0] * n[1]));
+                return { lo.x + (x + 0.5f) * cell, lo.y + (y + 0.5f) * cell, lo.z + (z + 0.5f) * cell };
+            }
+            // The part at a point (or in a cell next to it); -1: none.
+            int At(Vector3 p) const {
+                int c[3] = { (int)floorf((p.x - lo.x) / cell), (int)floorf((p.y - lo.y) / cell), (int)floorf((p.z - lo.z) / cell) };
+                for (int ring = 0; ring <= 1; ring++)
+                    for (int dz = -ring; dz <= ring; dz++)
+                        for (int dy = -ring; dy <= ring; dy++)
+                            for (int dx = -ring; dx <= ring; dx++) {
+                                int x = c[0] + dx, y = c[1] + dy, z = c[2] + dz;
+                                if (x < 0 || y < 0 || z < 0 || x >= n[0] || y >= n[1] || z >= n[2]) continue;
+                                int l = label[((size_t)z * n[1] + y) * n[0] + x];
+                                if (l >= 0) return l;
+                            }
+                return -1;
+            }
+            int Largest() const { return volume.empty() ? -1 : (int)(std::max_element(volume.begin(), volume.end()) - volume.begin()); }
+            // Whether `part` has a cell within `ring` cells of a point.
+            bool Near(Vector3 p, int part, int ring) const {
+                int c[3] = { (int)floorf((p.x - lo.x) / cell), (int)floorf((p.y - lo.y) / cell), (int)floorf((p.z - lo.z) / cell) };
+                for (int z = std::max(0, c[2] - ring); z <= std::min(n[2] - 1, c[2] + ring); z++)
+                    for (int y = std::max(0, c[1] - ring); y <= std::min(n[1] - 1, c[1] + ring); y++)
+                        for (int x = std::max(0, c[0] - ring); x <= std::min(n[0] - 1, c[0] + ring); x++)
+                            if (label[((size_t)z * n[1] + y) * n[0] + x] == part) return true;
+                return false;
+            }
+        };
+
+        // The parts of a body (of what is at least `erode` mm inside it: what a neck thinner than twice that joins
+        // counts as apart).
+        Parts FindParts(const BodyField& f, BoundingBox box, float cell, float erode = 0.0f) {
+            Parts p;
+            Vector3 e = Vector3Subtract(box.max, box.min);
+            cell = fmaxf(cell, fmaxf(e.x, fmaxf(e.y, e.z)) / 160.0f);
+            p.cell = cell;
+            p.lo = box.min;
+            for (int k = 0; k < 3; k++) p.n[k] = std::max(1, (int)ceilf((&e.x)[k] / cell));
+            const size_t total = (size_t)p.n[0] * p.n[1] * p.n[2];
+            std::vector<char> in(total, 0);
+            ParallelFor(p.n[2], [&](int z) {
+                // (a field bounds the distance: far from the surface, cells are skipped by it)
+                for (int y = 0; y < p.n[1]; y++)
+                    for (int x = 0; x < p.n[0];) {
+                        size_t i = ((size_t)z * p.n[1] + y) * p.n[0] + x;
+                        float d = f.Distance(p.Centre(i)) + erode;
+                        in[i] = d < 0.0f;
+                        int skip = std::max(1, (int)floorf(fabsf(d) / cell));
+                        for (int k = 1; k < skip && x + k < p.n[0]; k++) in[i + k] = in[i];
+                        x += skip;
+                    }
+            });
+            p.label.assign(total, -1);
+            std::vector<size_t> stack;
+            const size_t sx = 1, sy = p.n[0], sz = (size_t)p.n[0] * p.n[1];
+            for (size_t start = 0; start < total; start++) {
+                if (!in[start] || p.label[start] >= 0) continue;
+                const int id = (int)p.volume.size();
+                size_t count = 0;
+                p.label[start] = id;
+                stack.push_back(start);
+                while (!stack.empty()) {
+                    size_t i = stack.back();
+                    stack.pop_back();
+                    count++;
+                    int x = (int)(i % p.n[0]), y = (int)((i / p.n[0]) % p.n[1]), z = (int)(i / sz);
+                    auto visit = [&](bool ok, size_t j) {
+                        if (ok && in[j] && p.label[j] < 0) { p.label[j] = id; stack.push_back(j); }
+                    };
+                    visit(x > 0, i - sx);
+                    visit(x + 1 < p.n[0], i + sx);
+                    visit(y > 0, i - sy);
+                    visit(y + 1 < p.n[1], i + sy);
+                    visit(z > 0, i - sz);
+                    visit(z + 1 < p.n[2], i + sz);
+                }
+                p.volume.push_back((double)count * cell * cell * cell);
+            }
+            return p;
+        }
+
+        // A point in the wall of one of the knuckles a body carries on a hinge (on its leaf's side); false: it has none.
+        bool KnucklePoint(const Design& d, int h, bool child, Vector3* at) {
+            const Hinge& hg = d.hinges[h];
+            if (!hg.hardware) return false;
+            const Vector3 a = Vector3Normalize(hg.axis), leaf = d.LeafDirection(h, child);
+            for (const Knuckle& k : d.Knuckles(h)) {
+                if (k.removed || k.child != child) continue;
+                *at = Vector3Add(hg.pivot, Vector3Add(Vector3Scale(a, 0.5f * (k.lo + k.hi)),
+                                                      Vector3Scale(leaf, 0.5f * (hg.pinRadius + hg.clearance + hg.radius))));
+                return true;
+            }
+            return false;
+        }
+
+        // Less than this (mm^3) not joined to its body is dust: a slicer drops it, or it is a speck to brush off.
+        const double Dust = 0.5;
+
+        float PartCell(const Design& d) {
+            BoundingBox bounds = d.Bounds();
+            return std::clamp(Vector3Distance(bounds.min, bounds.max) / 200.0f, 0.25f, 0.6f);
+        }
+
+        // A body's parts, and which of them is the body: the largest. (Not the one its hinge's knuckles are on: when
+        // those are on a stub, the stub is what is loose, and the hinge is one that doesn't hold.)
+        struct BodyParts {
+            Parts parts;
+            int main = -1;
+        };
+        std::vector<BodyParts> AllParts(const BodySet& set, float cell, float erode = 0.0f) {
+            std::vector<BodyParts> out(set.fields.size());
+            for (size_t i = 0; i < set.fields.size(); i++) {
+                out[i].parts = FindParts(set.fields[i], set.boxes[i], cell, erode);
+                out[i].main = out[i].parts.Largest();
+            }
+            return out;
+        }
+    }
+
+    Solidity MeasureSolidity(const Design& d, float cell, float erode) {
+        Solidity s;
+        BodySet set = MakeBodySet(d, 0.0f);
+        std::vector<Parts> parts(set.fields.size());
+        s.volume.assign(d.groups.size(), 0.0);
+        for (size_t i = 0; i < set.fields.size(); i++) {
+            parts[i] = FindParts(set.fields[i], set.boxes[i], cell, erode);
+            const int main = parts[i].Largest();
+            if (main >= 0) s.volume[set.group[i]] = parts[i].volume[main];
+            for (size_t k = 0; k < parts[i].volume.size(); k++)
+                if ((int)k != main) s.loose += parts[i].volume[k];
+        }
+        for (const Hinge& hg : d.hinges) {
+            const int pg = d.GroupIndex(hg.parent), cg = d.GroupIndex(hg.child);
+            const int pf = pg >= 0 ? set.fieldOf[pg] : -1, cf = cg >= 0 ? set.fieldOf[cg] : -1;
+            if (pf < 0 || cf < 0) continue;
+            const int ring = 2 + (int)ceilf(erode / fmaxf(parts[pf].cell, 1e-6f));
+            if (!parts[pf].Near(hg.pivot, parts[pf].Largest(), ring) || !parts[cf].Near(hg.pivot, parts[cf].Largest(), ring)) s.offHinges++;
+        }
+        return s;
+    }
+
+    FinishResult FuseUnheld(const Design& in) {
+        FinishResult r;
+        r.design = in;
+        Design d = in;
+        std::vector<std::string> fused;
+        for (bool again = true; again;) {
+            again = false;
+            for (size_t h = 0; h < d.hinges.size(); h++) {
+                const Hinge hg = d.hinges[h];
+                const bool still = fabsf(hg.end - hg.start) < 0.05f;      // under 3 degrees: it doesn't open
+                if (hg.hardware && !still) continue;
+                const int pg = d.GroupIndex(hg.parent), cg = d.GroupIndex(hg.child);
+                if (pg < 0 || cg < 0) continue;
+                fused.push_back(d.groups[cg].name + (still ? " (it didn't move)" : " (no hinge could be built for it)"));
+                // the parent as it was becomes its core, so that its cuts don't cut what joins it
+                WrapCore(d, hg.parent);
+                for (Hinge& o : d.hinges)
+                    if (o.parent == hg.child) o.parent = hg.parent;
+                d.MoveGroup(d.GroupIndex(hg.child), hg.parent);       // (drops the hinge between the two)
+                again = true;
+                break;
+            }
+        }
+        if (fused.empty()) return r;
+        r.ok = true;
+        r.design = d;
+        r.message = Utils::Format("%d piece%s joined to the piece %s hung from:", (int)fused.size(), fused.size() == 1 ? "" : "s",
+                                  fused.size() == 1 ? "it" : "they");
+        for (size_t k = 0; k < fused.size(); k++) r.message += (k ? ", " : " ") + fused[k];
+        r.message += ".";
+        return r;
+    }
+
+    FinishResult RemoveLoose(const Design& in, JobControl* c) {
+        FinishResult r;
+        r.design = in;
+        Design d = in;
+        // Pass after pass (a cut can leave new crumbs) until two in a row find none.
+        const float cell = PartCell(in);
+        double removed = 0.0;
+        int crumbs = 0, clean = 0;
+        for (int round = 0; round < 8 && clean < 2; round++) {
+            if (c && c->Cancelled()) { r.cancelled = true; r.message = "Stopped."; return r; }
+            const float hair = 0.0f;
+            BodySet set = MakeBodySet(d, 1.0f);
+            std::vector<BodyParts> all = AllParts(set, cell, hair);
+            bool any = false;
+            for (size_t i = 0; i < all.size(); i++) {
+                const Parts& p = all[i].parts;
+                if (p.volume.size() < 2) continue;
+                std::vector<Spot> pts;
+                for (size_t k = 0; k < p.label.size(); k++)
+                    if (p.label[k] >= 0 && p.label[k] != all[i].main) pts.push_back({ p.Centre(k), cell * cell * cell });
+                if (pts.empty()) continue;
+                any = true;
+                crumbs += (int)p.volume.size() - 1;
+                removed += (double)pts.size() * cell * cell * cell;
+                for (const SuperFrustum& s : CoverPatches(pts, cell, 0.75f * cell + hair)) {
+                    d.AddShape(s, d.groups[set.group[i]].id, "Loose", Op::Cut);
+                    r.cuts++;
+                }
+            }
+            clean = any ? 0 : clean + 1;
+        }
+        if (r.cuts == 0) return r;
+        r.ok = true;
+        r.design = d;
+        r.message = Utils::Format("Cut away %d loose crumb%s (%.1f mm3) that nothing joined to their pieces.", crumbs, crumbs == 1 ? "" : "s", removed);
+        return r;
+    }
+
+    PrintCheck CheckPrintable(const Design& d) {
+        PrintCheck r;
+        BodySet set = MakeBodySet(d, 1.0f);
+        std::vector<BodyParts> all = AllParts(set, PartCell(d));
+        r.bodies = (int)set.fields.size();
+        for (const BodyParts& b : all)
+            for (size_t k = 0; k < b.parts.volume.size(); k++)
+                if ((int)k != b.main && b.parts.volume[k] >= Dust) { r.loose++; r.looseVolume += b.parts.volume[k]; }
+        std::vector<char> hung(d.groups.size(), 0);
+        for (size_t h = 0; h < d.hinges.size(); h++) {
+            const Hinge& hg = d.hinges[h];
+            const int pg = d.GroupIndex(hg.parent), cg = d.GroupIndex(hg.child);
+            const int pf = pg >= 0 ? set.fieldOf[pg] : -1, cf = cg >= 0 ? set.fieldOf[cg] : -1;
+            if (pf < 0 || cf < 0) continue;
+            r.hinges++;
+            Vector3 qp, qc;
+            std::string why;
+            if (!KnucklePoint(d, (int)h, false, &qp) || !KnucklePoint(d, (int)h, true, &qc)) why = "has no hardware";
+            else if (all[pf].parts.At(qp) != all[pf].main) why = "isn't joined to " + d.groups[pg].name;
+            else if (all[cf].parts.At(qc) != all[cf].main) why = "isn't joined to " + d.groups[cg].name;
+            if (why.empty()) { r.held++; hung[cg] = 1; }
+            else {
+                r.floating.push_back(d.groups[cg].name + " (" + hg.name + " " + why + ")");
+                r.unheld.push_back(hg.id);
+            }
+        }
+        // every body but one (the root) hangs from a hinge that holds
+        int roots = 0;
+        for (size_t i = 0; i < set.group.size(); i++) {
+            if (hung[set.group[i]]) continue;
+            if (d.ParentHinge(d.groups[set.group[i]].id) >= 0) continue;        // (named above)
+            if (++roots > 1) r.floating.push_back(d.groups[set.group[i]].name + " (no hinge)");
+        }
+        r.ok = r.loose == 0 && r.floating.empty();
+        if (r.ok) {
+            r.message = Utils::Format("Printable: %d piece%s, each one solid, on %d built hinge%s.", r.bodies, r.bodies == 1 ? "" : "s", r.held, r.held == 1 ? "" : "s");
+        } else {
+            r.message = "Not printable as it is:";
+            if (r.loose > 0) r.message += Utils::Format(" %d loose crumb%s (%.1f mm3).", r.loose, r.loose == 1 ? "" : "s", r.looseVolume);
+            if (!r.floating.empty()) {
+                r.message += " Nothing holds";
+                for (size_t k = 0; k < r.floating.size(); k++) r.message += (k ? ", " : " ") + r.floating[k];
+                r.message += ".";
+            }
+        }
+        return r;
+    }
 }

@@ -60,7 +60,6 @@ int main(int argc, char** argv) {
     if (!LoadObj(argv[1], &mesh, &err)) { printf("can't load %s: %s\n", argv[1], err.c_str()); return 1; }
     AutoParams p;
     p.maxPieces = 12;
-    p.transport = true;                // (so "aim a cut" has transport's material to aim with)
     Loss loss(mesh, p);
     std::mt19937 rng(7);
     RuleContext ctx{ loss, p, rng };
@@ -68,11 +67,11 @@ int main(int argc, char** argv) {
     std::vector<Vector3> pts;
     std::uniform_real_distribution<float> u(-1.0f, 1.0f);
     for (int k = 0; k < 40000; k++) pts.push_back(Vector3Add(c.centre, Vector3Scale({ u(rng), u(rng), u(rng) }, 2.5f * c.radius)));
-    const Rule* adders[] = { Find("add a cut"), Find("aim a cut"), Find("split a piece") };
+    const Rule* adders[] = { Find("add a cut"), Find("split a piece") };
     const Rule* remove = Find("remove a cut");
 
     for (int k = 0; k < 9; k++) {
-        const Rule* add = adders[k % 3];
+        const Rule* add = adders[k % 2];
         float before = loss.Evaluate(c, Placement{}).total;
         std::vector<float> open = Pose(c, 0.0f, pts);
         bool applied = false;

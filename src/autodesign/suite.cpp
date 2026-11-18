@@ -146,8 +146,7 @@ namespace Bakugan {
         std::vector<std::string> ScoreWords(const AutoScore& s) {
             std::vector<std::string> w = { Utils::Format("score %.3f", s.total) };
             w.insert(w.end(), { "outline " + Pct(s.viewCover), "extra " + Pct(s.viewExtra), "worst view " + Pct(s.worstView),
-                                Utils::Format("overlap %.1f%%", s.clashOpen * 100.0f), Utils::Format("moving %.1f%%", s.clashMotion * 100.0f),
-                                Utils::Format("surface %.0f%%", s.surfaceCarved * 100.0f) });
+                                Utils::Format("overlap %.1f%%", s.clashOpen * 100.0f), Utils::Format("moving %.1f%%", s.clashMotion * 100.0f) });
             return w;
         }
 
@@ -423,7 +422,7 @@ namespace Bakugan {
         // summary.csv: one row per mesh, written as each finishes (a stopped run keeps what it has)
         std::ofstream summary(outDir / "summary.csv");
         summary << "mesh,status,seconds,pieces,joints,loss,fit,cover,extra,worst_view,collision,overlap_open,overlap_motion,"
-                   "surface_carved,mesh_scale,mesh_moved_mm\n";
+                   "mesh_scale,mesh_moved_mm\n";
         auto csv = [](const std::string& s) {
             if (s.find_first_of(",\"\n") == std::string::npos) return s;
             std::string q = "\"";
@@ -473,9 +472,9 @@ namespace Bakugan {
             }
             {
                 const AutoScore& s = r.score;
-                summary << csv(e.name) << ",ok," << Utils::Format("%.1f,%d,%d,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.6f,%.6f,%.5f,%.4f,%.3f",
+                summary << csv(e.name) << ",ok," << Utils::Format("%.1f,%d,%d,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.6f,%.6f,%.4f,%.3f",
                            seconds(), (int)r.carving.pieces.size(), (int)r.carving.joints.size(), s.total, s.fit, s.viewCover, s.viewExtra,
-                           s.worstView, s.collision, s.clashOpen, s.clashMotion, s.surfaceCarved, s.target.scale,
+                           s.worstView, s.collision, s.clashOpen, s.clashMotion, s.target.scale,
                            Vector3Length(s.target.offset)) << "\n" << std::flush;
             }
             entries.push_back(std::move(e));

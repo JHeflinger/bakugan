@@ -1,10 +1,12 @@
 // Headless run of the generator: ./autotest mesh.obj [steps] [seed] [outPrefix]
-// Env: MAXSECONDS (stop after, keeping the best), SNAPSHOT (seconds between progress files), SURFW, THINW (thin pieces), MINTHICK (mm), MAXHOLLOWS, OT (transport on), OTW (its weight; set: on), OTN (its points), SDFW, CHAMW, SHAPEN (3D terms; 0: off),
-// VIEWS, VRES, LR, ROUND (steps per round), REWRITES, LOOKAHEAD, MARGIN, MAXPIECES, WEIGHTS (the rules', e.g. 1,0.5),
-// FIXTARGET (the mesh stays put), NOSCALE (it may move but not scale), HINGEW, COLW, CHECKS (per hinge), FREETIMING (the
-// hinges' timing is Adam's, not an opening order), DEPS (hinges hold each other shut: ledges), DEPW, CARVE (carve what
-// still collides when done), LATCH (a press latch on the first hinge), RAMP (what overlaps cost by the end, times COLW),
-// HINGES (build the hinges' hardware; PROUD: on the axis as it is, not moved under the surface; REACH: mm a leaf may bridge).
+// Env: MESHSIZE (the mesh centred, its longest side this many mm), SPHERE (the sphere's diameter, mm; 0: the mesh's
+// volume), MAXSECONDS (stop after, keeping the best), SNAPSHOT (seconds between progress files), THINW (thin pieces),
+// MINTHICK (mm), MINCOVER, REACHW (the reach term), VIEWS, VRES, LR, ROUND (steps per round), REWRITES, LOOKAHEAD, MARGIN, MAXPIECES, WEIGHTS
+// (the rules', e.g. 1,0.5), FIXTARGET (the mesh stays put), NOSCALE (it may move but not scale), HINGEW, COLW, CHECKS
+// (per hinge), FREETIMING (the hinges' timing is Adam's, not an opening order), DEPS (hinges hold each other shut:
+// ledges), DEPW, LATCH (a press latch on the first hinge), RAMP (what overlaps cost by the end, times COLW), NOHINGES
+// (don't build the hinges' hardware), NOCARVE (don't carve what still collides when done), PROUD (hinges on the axis
+// as it is, not moved under the surface), REACH (mm a leaf may bridge).
 // Semantic loss: semantic_env.hpp.
 // Writes <outPrefix>_design.txt (open it in the editor) and <outPrefix>_views.ppm (silhouettes against targets).
 #include "autodesign/autodesign.hpp"
@@ -26,6 +28,12 @@ int main(int argc, char** argv) {
     TriMesh mesh;
     std::string err;
     if (!LoadObj(argv[1], &mesh, &err)) { printf("can't load %s: %s\n", argv[1], err.c_str()); return 1; }
+    if (const char* ms = getenv("MESHSIZE")) {          // centred, its longest side this many mm (as the CLI's mesh_size)
+        Vector3 lo = { 1e30f, 1e30f, 1e30f }, hi = { -1e30f, -1e30f, -1e30f };
+        for (Vector3 q : mesh.positions) { lo = Vector3Min(lo, q); hi = Vector3Max(hi, q); }
+        float k = (float)atof(ms) / fmaxf(fmaxf(hi.x - lo.x, hi.y - lo.y), fmaxf(hi.z - lo.z, 1e-9f));
+        for (Vector3& q : mesh.positions) q = Vector3Scale(Vector3Subtract(q, Vector3Scale(Vector3Add(lo, hi), 0.5f)), k);
+    }
     AutoParams p;
     if (argc > 2) p.steps = atoi(argv[2]);
     if (argc > 3) p.seed = (unsigned)atoi(argv[3]);
@@ -33,18 +41,18 @@ int main(int argc, char** argv) {
     auto env = [](const char* name, auto& value) { if (const char* s = getenv(name)) value = (std::remove_reference_t<decltype(value)>)atof(s); };
     env("VIEWS", p.views); env("VRES", p.viewResolution); env("LR", p.learningRate); env("ROUND", p.stepsPerRound);
     env("REWRITES", p.rewritesPerRound); env("LOOKAHEAD", p.lookahead); env("MAXPIECES", p.maxPieces); env("MARGIN", p.rewriteMargin);
+    env("SPHERE", p.sphereDiameter); env("CORE", p.core); env("SHELLFIRST", p.shellFirst);
     if (getenv("FIXTARGET")) p.moveTarget = p.scaleTarget = false;
     if (getenv("NOSCALE")) p.scaleTarget = false;
-    env("HINGEW", p.hingeWeight); env("SURFW", p.surfaceWeight); env("THINW", p.thinWeight); env("MINTHICK", p.minThickness); env("MAXHOLLOWS", p.maxHollows);
-    if (getenv("OT") || getenv("OTW")) p.transport = true;
-    env("OTW", p.transportWeight); env("OTN", p.transportPoints); env("SDFW", p.sdfWeight); env("CHAMW", p.chamferWeight); env("SHAPEN", p.shapeSamples);
+    if (getenv("FREESCALE")) p.freeScale = true;
+    env("REACHW", p.reachWeight); env("MINCOVER", p.minViewCoverage); env("HINGEW", p.hingeWeight); env("THINW", p.thinWeight); env("MINTHICK", p.minThickness);
     env("COLW", p.collisionWeight); env("CHECKS", p.hingeChecks); env("DEPW", p.dependencyWeight); env("RAMP", p.collisionRamp);
-    if (getenv("HINGES")) p.buildHinges = true;
+    if (getenv("NOHINGES")) p.buildHinges = false;
     if (getenv("PROUD")) p.hinges.flush = false;
     env("REACH", p.hinges.reach);
     if (getenv("FREETIMING")) p.orderHinges = false;
     if (getenv("DEPS")) p.dependencies = true;
-    if (getenv("CARVE")) p.carveWhenDone = true;
+    if (getenv("NOCARVE")) p.carveWhenDone = false;
     if (getenv("LATCH")) p.latchWhenDone = true;
     SemanticFromEnv(p);
     if (const char* w = getenv("WEIGHTS"))          // the grammar's weights, comma separated, in AutoRules() order
@@ -80,9 +88,9 @@ int main(int argc, char** argv) {
             }
             if (FILE* f = fopen((out + "_progress.log").c_str(), "a")) {
                 const AutoScore& sc = live->score;
-                fprintf(f, "%6.0f min  step %d/%d  pieces %d  loss %.4f  covered %.0f%% (+%.0f%%)  transport %.1f mm  kept %d of %d rewrite rounds\n",
+                fprintf(f, "%6.0f min  step %d/%d  pieces %d  loss %.4f  covered %.0f%% (+%.0f%%)  kept %d of %d rewrite rounds\n",
                         el / 60.0, live->iteration, live->iterations, (int)live->bestCarving.pieces.size(), sc.total, sc.viewCover * 100.0f,
-                        sc.viewExtra * 100.0f, sc.transportMove, live->accepted, live->rounds);
+                        sc.viewExtra * 100.0f, live->accepted, live->rounds);
                 fclose(f);
             }
         }
@@ -131,17 +139,7 @@ int main(int argc, char** argv) {
     printf("pieces: thinnest %.1f mm across (min %.1f mm)\n", r.score.thinnest, p.minThickness);
     const Placement& t = r.score.target;
     printf("mesh: moved %.1f %.1f %.1f mm, scaled %.3fx; sphere %.1f mm across\n", t.offset.x, t.offset.y, t.offset.z, t.scale, 2.0f * r.score.radius);
-    {
-        // the result measured in 3D the same way whatever the run used: transport, and the surfaces' gaps
-        AutoParams q = p;
-        q.transport = true;
-        q.transportWeight = q.sdfWeight = q.chamferWeight = 1.0f;
-        q.semanticWeight = 0.0f;
-        Loss check(mesh, q);
-        AutoScore e = check.Evaluate(r.carving, r.score.target);
-        printf("3D: material travels %.2f mm (rms) to fill the mesh, %.0f%% of it unfilled; mesh surface %.2f mm from the design, design %.2f mm "
-               "from the mesh; sdf %.3f\n", e.transportMove, e.transportUnfilled * 100.0f, e.meshGap, e.designGap, e.sdf);
-    }
+    printf("SUMMARY pieces %d cover %.3f extra %.3f reach %.3f\n", (int)r.carving.pieces.size(), r.score.viewCover, r.score.viewExtra, r.score.reach);
     {
         // closed, the pieces should be the sphere exactly: points in none of them inside it, in one outside, in two
         const Carving& k = r.carving;
@@ -155,17 +153,13 @@ int main(int argc, char** argv) {
             Vector3 q = Vector3Add(k.centre, Vector3Scale({ u(), u(), u() }, 1.2f * k.radius));
             float ds = Vector3Distance(q, k.centre) - k.radius;
             if (fabsf(ds) < 0.002f * k.radius) continue;
-            bool hollowed = false;                      // (hollows take material away: no piece there is right)
-            for (const Cutter& h : k.cutters) hollowed |= h.hollow && h.sf.Distance(q) < 0.0f;
-            if (hollowed) continue;
             int in = 0;
             for (auto& [f, g] : pieces) in += f.Distance(xf[g].ApplyInverse(q)) < 0.0f;
             none += ds < 0.0f && in == 0;
             outside += ds > 0.0f && in > 0;
             two += in > 1;
         }
-        printf("closed: of %d points, %d in the sphere (less its hollows) but no piece, %d outside it in a piece, %d in two pieces; "
-               "%d hollows, %.1f%% of the surface carved\n", n, none, outside, two, k.Hollows(), r.score.surfaceCarved * 100.0f);
+        printf("closed: of %d points, %d in the sphere but no piece, %d outside it in a piece, %d in two pieces\n", n, none, outside, two);
     }
     {
         // the finished design's motion checked for overlaps the same way whatever the run used: 48 poses in every
@@ -185,6 +179,12 @@ int main(int argc, char** argv) {
             printf(" %s%s", r.design.hinges[h].name.c_str(), held ? " (held)" : " (free)");
         }
         printf("\n");
+    }
+    {
+        PrintCheck pc = CheckPrintable(r.design), raw = CheckPrintable(r.carving.Build());
+        printf("CARVING loose %d loosevol %.1f\n", raw.loose, raw.looseVolume);
+        printf("PRINT ok %d bodies %d loose %d loosevol %.1f hinges %d held %d\n%s\n", (int)pc.ok, pc.bodies, pc.loose, pc.looseVolume, pc.hinges, pc.held,
+               pc.message.c_str());
     }
     FILE* f = fopen((out + "_design.txt").c_str(), "w");
     fputs(r.design.Serialize().c_str(), f);

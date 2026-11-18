@@ -10,7 +10,7 @@
 //   - with hinges built flush (buildHinges, hinges.flush), the pivot is also kept deep enough for the barrel.
 // A joint whose two pieces no longer touch anywhere near (a later cut came between them) is hung from another piece
 // that touches its child and doesn't hang from it, so the joints stay a tree and every piece stays joined. When no piece
-// touches it at all (a hollow cut through the seam, leaving a gap), the joint is counted as floating: the optimizer
+// touches it at all, the joint is counted as floating: the optimizer
 // doesn't take a step or a rewrite that leaves one (autodesign.cpp), so the pieces stay joined throughout.
 #include "loss.hpp"
 #include "data/field.hpp"
@@ -161,5 +161,44 @@ namespace Bakugan {
             j.axis = a;
         }
         return floating;
+    }
+
+    bool Loss::Solid(const Carving& c) const {
+        if (c.pieces.size() < 2) return true;
+        const float R = c.radius, cell = std::clamp(0.25f * m_P.minThickness, R / 32.0f, R / 12.0f), erode = 0.4f * m_P.minThickness;
+        const double allowed = 0.005 * 4.0 / 3.0 * PI * R * R * R;
+        // A piece of several regions (a thickened panel) is measured region by region: their joined field is ~0 all
+        // along the face they share (each is at its own edge there), so taken in from its surface it would come
+        // apart there, though as printed it's one solid. Each region on its own must hold together, and the piece as
+        // it is (not taken in) must be one solid.
+        Carving apart = c;
+        bool joined = false;
+        for (Piece& p : apart.pieces) {
+            for (const Region& r : p.extra) {
+                Piece q;
+                q.id = apart.nextId++;
+                q.inside = r.inside;
+                q.outside = r.outside;
+                apart.pieces.push_back(q);
+                joined = true;
+            }
+        }
+        for (Piece& p : apart.pieces) p.extra.clear();
+        std::vector<int> bodyOf;
+        Design d = apart.Build(&bodyOf);
+        Solidity s = MeasureSolidity(d, cell, erode);
+        if (s.offHinges > 0 || s.loose > allowed) return false;
+        for (size_t k = 0; k < c.pieces.size(); k++) {
+            int hinges = 0;
+            for (const Joint& j : c.joints) hinges += j.parent == c.pieces[k].id || j.child == c.pieces[k].id;
+            // (a quarter: about what taking it `erode` in leaves of a compact piece that size)
+            if (s.volume[d.GroupIndex(bodyOf[k])] < 0.25f * PieceVolume() * std::max(1, hinges)) return false;
+        }
+        if (joined) {                                       // (the joined pieces alone: slivers elsewhere were let through above)
+            Carving only = c;
+            only.pieces.erase(std::remove_if(only.pieces.begin(), only.pieces.end(), [](const Piece& p) { return p.extra.empty(); }), only.pieces.end());
+            if (MeasureSolidity(only.Build(), cell, 0.0f).loose > allowed) return false;
+        }
+        return true;
     }
 }

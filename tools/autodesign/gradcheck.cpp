@@ -1,5 +1,5 @@
 // The envelope-theorem gradient against brute force central differences of the whole loss, for a carving of three
-// pieces and a hollow (cutters', joints' and the mesh placement's parameters).
+// pieces (cutters', joints' and the mesh placement's parameters).
 // With the semantic loss on (see semantic_env.hpp; ONNX Runtime and a model needed), its gradient too; ONLYSEM=1 checks
 // it alone. Its shade samples are a random draw, so set SAMPLES high (e.g. 1000000: all of them) for a fair check.
 #include "autodesign/loss.hpp"
@@ -18,11 +18,8 @@ int main(int argc, char** argv) {
     SemanticFromEnv(p);
     if (const char* m = getenv("MINCOVER")) p.minViewCoverage = (float)atof(m);   // 0: no coverage penalty (its kink)
     auto envf = [](const char* n, float& v) { if (const char* s = getenv(n)) v = (float)atof(s); };
-    if (getenv("OT") || getenv("OTW")) p.transport = true;
-    envf("OTW", p.transportWeight); envf("SDFW", p.sdfWeight); envf("CHAMW", p.chamferWeight);
     envf("THINW", p.thinWeight); envf("MINTHICK", p.minThickness);
-    if (getenv("ONLYTHIN")) { p.silhouetteWeight = p.collisionWeight = p.hingeWeight = p.surfaceWeight = 0.0f; p.thinWeight = 1.0f; }
-    if (getenv("ONLY3D")) p.silhouetteWeight = p.collisionWeight = p.hingeWeight = p.surfaceWeight = 0.0f;   // the 3D terms' gradient alone
+    if (getenv("ONLYTHIN")) { p.silhouetteWeight = p.collisionWeight = p.hingeWeight = 0.0f; p.thinWeight = 1.0f; }
     if (getenv("ONLYSEM")) p.silhouetteWeight = p.collisionWeight = p.hingeWeight = 0.0f;     // the semantic gradient alone
     Loss loss(mesh, p);
     if (!loss.Error().empty()) { printf("%s\n", loss.Error().c_str()); return 1; }
@@ -58,16 +55,6 @@ int main(int argc, char** argv) {
             j.t1 = j.t0 + 0.5f;
             cv.joints.push_back(j);
         }
-    }
-    {   // and a hollow, reaching through the surface a little
-        Cutter h;
-        h.id = cv.nextId++;
-        h.hollow = true;
-        h.sf.size = { 0.25f * cv.radius, 0.3f * cv.radius, 0.9f * cv.radius };
-        h.sf.rotation = QuaternionFromAxisAngle({ 1, 0, 0 }, 0.3f);
-        h.sf.position = Vector3Add(cv.centre, { 0.1f * cv.radius, -0.65f * cv.radius, 0.2f * cv.radius });
-        h.sf.rounding = 0.5f;
-        cv.cutters.push_back(h);
     }
     Placement target;
     target.offset = { 0.03f * loss.L(), -0.02f * loss.L(), 0.01f * loss.L() };

@@ -13,6 +13,35 @@ namespace Bakugan {
         return c;
     }
 
+    Carving Carving::ShellAndCore(Vector3 centre, float radius, float core) {
+        Carving c = Sphere(centre, radius);
+        const float r = 0.5f * core;
+        Cutter k;
+        k.id = c.nextId++;
+        k.core = true;
+        k.sf.position = centre;
+        k.sf.size = { 0.1f * r, 0.1f * r, 0.1f * r };    // a speck rounded out to the radius: a ball (so the shell is as
+        k.sf.rounding = 1.0f;                             // thick everywhere), which Adam can grow, move and stretch
+        k.sf.dilation = 0.95f * r;
+        c.cutters.push_back(k);
+        Piece shell = c.pieces[0];
+        shell.outside.push_back(k.id);
+        Piece inner;
+        inner.id = c.nextId++;
+        inner.inside.push_back(k.id);
+        c.pieces = { shell, inner };
+        Joint j;
+        j.id = c.nextId++;
+        j.parent = shell.id;
+        j.child = inner.id;
+        j.pivot = Vector3Add(centre, { r, 0, 0 });
+        j.axis = { 0, 0, 1 };
+        j.open = 0.0f;
+        j.order = 0;
+        c.joints.push_back(j);
+        return c;
+    }
+
     int Carving::PieceIndex(int id) const {
         for (size_t i = 0; i < pieces.size(); i++)
             if (pieces[i].id == id) return (int)i;
@@ -56,39 +85,73 @@ namespace Bakugan {
         }
     }
 
-    int Carving::Hollows() const {
-        int n = 0;
-        for (const Cutter& k : cutters) n += k.hollow;
-        return n;
+    namespace {
+        bool Has(const std::vector<int>& v, int x) { return std::find(v.begin(), v.end(), x) != v.end(); }
     }
 
     std::vector<int> Carving::PiecesUsing(int cutterId) const {
         std::vector<int> out;
-        int k = CutterIndex(cutterId);
-        if (k >= 0 && cutters[k].hollow) {
-            for (size_t i = 0; i < pieces.size(); i++) out.push_back((int)i);
-            return out;
-        }
         for (size_t i = 0; i < pieces.size(); i++) {
             const Piece& p = pieces[i];
-            if (std::find(p.inside.begin(), p.inside.end(), cutterId) != p.inside.end() ||
-                std::find(p.outside.begin(), p.outside.end(), cutterId) != p.outside.end())
-                out.push_back((int)i);
+            bool uses = Has(p.inside, cutterId) || Has(p.outside, cutterId);
+            for (const Region& r : p.extra) uses |= Has(r.inside, cutterId) || Has(r.outside, cutterId);
+            if (uses) out.push_back((int)i);
         }
         return out;
     }
 
+    int Carving::Split(int pi, int cutterId) {
+        Piece part;
+        part.id = nextId++;
+        part.inside = pieces[pi].inside;
+        part.outside = pieces[pi].outside;
+        part.inside.push_back(cutterId);
+        for (Region r : pieces[pi].extra) {
+            r.inside.push_back(cutterId);
+            part.extra.push_back(r);
+        }
+        pieces[pi].outside.push_back(cutterId);
+        for (Region& r : pieces[pi].extra) r.outside.push_back(cutterId);
+        pieces.push_back(part);
+        return (int)pieces.size() - 1;
+    }
+
+    bool Carving::InCore(const Piece& p) const {
+        for (const Cutter& k : cutters) {
+            if (!k.core) continue;
+            if (Has(p.inside, k.id)) return true;
+            for (const Region& r : p.extra)
+                if (Has(r.inside, k.id)) return true;
+        }
+        return false;
+    }
+
+    bool Carving::CoreJoint(const Joint& j) const {
+        int a = PieceIndex(j.parent), b = PieceIndex(j.child);
+        return (a >= 0 && InCore(pieces[a])) || (b >= 0 && InCore(pieces[b]));
+    }
+
     BoundingBox Carving::PieceBounds(const Piece& p) const {
         Vector3 r = { radius, radius, radius };
-        BoundingBox b = { Vector3Subtract(centre, r), Vector3Add(centre, r) };
-        for (int id : p.inside) {
-            int k = CutterIndex(id);
-            if (k < 0) continue;
-            BoundingBox w = cutters[k].sf.WorldBounds();
-            b.min = Vector3Max(b.min, w.min);
-            b.max = Vector3Min(b.max, w.max);
+        const BoundingBox sphere = { Vector3Subtract(centre, r), Vector3Add(centre, r) };
+        auto region = [&](const std::vector<int>& inside) {
+            BoundingBox b = sphere;
+            for (int id : inside) {
+                int k = CutterIndex(id);
+                if (k < 0) continue;
+                BoundingBox w = cutters[k].sf.WorldBounds();
+                b.min = Vector3Max(b.min, w.min);
+                b.max = Vector3Min(b.max, w.max);
+            }
+            b.max = Vector3Max(b.max, b.min);           // an empty region: a point
+            return b;
+        };
+        BoundingBox b = region(p.inside);
+        for (const Region& e : p.extra) {
+            BoundingBox w = region(e.inside);
+            b.min = Vector3Min(b.min, w.min);
+            b.max = Vector3Max(b.max, w.max);
         }
-        b.max = Vector3Max(b.max, b.min);               // an empty piece: a point
         return b;
     }
 
@@ -96,7 +159,7 @@ namespace Bakugan {
         Design d;
         // the sphere: a speck rounded out to the radius (an exact sphere, to a thousandth of it)
         SuperFrustum sphere;
-        const float speck = 0.002f * radius;
+        const float speck = fmaxf(0.002f * radius, 0.05f);     // (0.05: the smallest size a saved design keeps)
         sphere.position = centre;
         sphere.size = { speck, speck, speck };
         sphere.rounding = 1.0f;
@@ -106,27 +169,36 @@ namespace Bakugan {
         box.position = centre;
         box.size = Vector3Scale({ 1, 1, 1 }, 2.2f * radius);
 
-        std::vector<int> body(pieces.size());
-        for (size_t k = 0; k < pieces.size(); k++) {
-            const Piece& p = pieces[k];
-            body[k] = d.groups[d.AddGroup("Piece " + std::to_string(k + 1), -1)].id;
-            d.AddShape(sphere, body[k], "Sphere");
-            for (int id : p.outside) {
+        // a region into a group: the sphere, cut by the cutters it's outside of and by "outside" each it's inside of
+        auto addRegion = [&](int group, const std::vector<int>& inside, const std::vector<int>& outside) {
+            d.AddShape(sphere, group, "Sphere");
+            for (int id : outside) {
                 int c = CutterIndex(id);
-                if (c >= 0) d.AddShape(cutters[c].sf, body[k], "Cutter " + std::to_string(id), Op::Cut);
+                if (c >= 0) d.AddShape(cutters[c].sf, group, "Cutter " + std::to_string(id), Op::Cut);
             }
-            for (const Cutter& h : cutters)
-                if (h.hollow) d.AddShape(h.sf, body[k], "Hollow " + std::to_string(h.id), Op::Cut);
-            for (int id : p.inside) {
+            for (int id : inside) {
                 int c = CutterIndex(id);
                 if (c < 0) continue;
-                int g = d.AddGroup("Outside cutter " + std::to_string(id), body[k]);
+                int g = d.AddGroup("Outside cutter " + std::to_string(id), group);
                 Group& grp = d.groups[g];
                 grp.op = Op::Cut;
                 int gid = grp.id;
                 d.AddShape(box, gid, "Around");
                 d.AddShape(cutters[c].sf, gid, "Cutter " + std::to_string(id), Op::Cut);
             }
+        };
+        std::vector<int> body(pieces.size());
+        for (size_t k = 0; k < pieces.size(); k++) {
+            const Piece& p = pieces[k];
+            body[k] = d.groups[d.AddGroup("Piece " + std::to_string(k + 1), -1)].id;
+            if (p.extra.empty()) {
+                addRegion(body[k], p.inside, p.outside);
+                continue;
+            }
+            // several regions: each a feature of the body, joined (a cut in one mustn't reach the others)
+            addRegion(d.groups[d.AddGroup("Region 1", body[k])].id, p.inside, p.outside);
+            for (size_t e = 0; e < p.extra.size(); e++)
+                addRegion(d.groups[d.AddGroup("Region " + std::to_string(e + 2), body[k])].id, p.extra[e].inside, p.extra[e].outside);
         }
         for (const Joint& j : joints) {
             int a = PieceIndex(j.parent), b = PieceIndex(j.child);
@@ -230,13 +302,17 @@ namespace Bakugan {
 
     std::vector<Param> CarvingParams(const Carving& c, float L) {
         std::vector<Param> out;
-        for (const Cutter& k : c.cutters)
+        for (const Cutter& k : c.cutters) {
+            if (k.core && c.coreLocked) continue;
             for (int f = 0; f < CutterCount; f++) out.push_back({ Param::Cutter, k.id, f, CutterFields[f].unit * (CutterFields[f].length ? L : 1.0f) });
-        for (const Joint& j : c.joints)
+        }
+        for (const Joint& j : c.joints) {
+            if (c.coreLocked && c.CoreJoint(j)) continue;
             for (int f = 0; f < JointCount; f++) {
                 if (c.ordered && f >= 7) continue;       // timing comes from the opening order
                 out.push_back({ Param::Joint, j.id, f, JointFields[f].unit * (JointFields[f].length ? L : 1.0f) });
             }
+        }
         return out;
     }
 

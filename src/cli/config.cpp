@@ -194,6 +194,7 @@ namespace Bakugan::Cli {
         section = "goal";
         Int("views", p.views, 1, 64, "Directions the outlines are compared from, spread over a half sphere. (The slider: 1..16)");
         Int("view_pixels", p.viewResolution, 8, 1024, "Pixels across each view: finer is more exact and slower. (The slider: 32..192)");
+        Float("reach_weight", p.reachWeight, 0, 1000, "What parts of the mesh's outline being far from the design's cost: a limb nothing is near pulls the nearest piece toward it.", "ignored");
         Float("min_view_coverage", p.minViewCoverage, 0, 1,
               "Share of every view's target outline the design must cover; each view short of it costs steeply.");
         Float("collision_weight", p.collisionWeight, 0, 1000, "What pieces overlapping each other costs, in the open pose and in every hinge's turn.", "ignored");
@@ -206,16 +207,15 @@ namespace Bakugan::Cli {
         Float("ledge_size", p.ledges.size, 0, 1000, "mm a ledge reaches over the piece it holds (dependencies).", "auto: 12% of the sphere's radius");
         Float("ledge_reach", p.ledges.reach, 0, 1000, "mm of another piece's surface a ledge may cross to get there (dependencies).", "auto: 35% of the radius");
         Float("hinge_weight", p.hingeWeight, 0, 1000, "What a hinge being away from the two pieces it joins costs. It is also what limits the search most.", "ignored");
-        Float("surface_weight", p.surfaceWeight, 0, 1000, "What hollows carving into the sphere's surface cost.", "ignored");
         Float("thin_weight", p.thinWeight, 0, 1000, "What a piece thinner than min_thickness costs (1 - its thickness / the minimum).", "ignored");
         Float("min_thickness", p.minThickness, 0.5, 1000, "mm: the thinnest a piece may be (the largest ball that fits in it, across).");
-        Bool("transport", p.transport, "Optimal transport: the sphere's material, opened, paired with the mesh it should fill, however far away, and pulled there.");
-        Float("transport_weight", p.transportWeight, 0, 1000, "What optimal transport costs, when it's on.", "off");
-        Int("transport_points", p.transportPoints, 128, 8192, "Points of material, and points filling the mesh, for transport: its cost grows with the square.");
+        Bool("free_scale", p.freeScale, "The mesh's scale is optimized too: the search may shrink the mesh it's compared with (easier to match, bulkier result).");
         Bool("move_target", p.moveTarget, "The mesh the design is compared with may be moved to wherever suits it best.");
         Bool("scale_target", p.scaleTarget, "... and scaled (0.3x .. 3.3x) about its centre of volume.");
 
         section = "start";
+        Float("core", p.core, 0, 0.95, "Start from a shell and a core inside it, this share of the sphere across: the shell makes thin parts, the core chunky ones.", "whole sphere");
+        Float("shell_first", p.shellFirst, 0, 1, "With a core: this share of the steps only the shell is cut (the outline); then the core is free and thickens the shell's pieces.", "both at once");
         Float("sphere_diameter", p.sphereDiameter, 0, 100000, "The sphere that's carved, mm across, at the mesh's centre of volume.", "auto: the mesh's volume");
 
         section = "semantic";
@@ -239,7 +239,6 @@ namespace Bakugan::Cli {
         Float("rewrite_margin", p.rewriteMargin, 0, 1,
               "How much better (a share of the loss) a rewrite that adds something must do to be kept; how much worse one that removes may.");
         Int("max_pieces", p.maxPieces, 2, 4096, "Adding a cut makes one more piece: no more than this.");
-        Int("max_hollows", p.maxHollows, 0, 4096, "Hollows: material taken out of the sphere without making a piece.");
         Int("seed", p.seed, 0, 4294967295LL, "Same seed and settings, same result.");
 
         section = "grammar";
