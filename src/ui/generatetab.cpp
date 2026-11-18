@@ -60,10 +60,10 @@ namespace Bakugan {
         Hint("A sphere is cut into pieces and hinged, so that open it looks like the mesh. Closed, the pieces are the sphere "
              "again, always: only the open pose and the motion are scored.");
         {
-            ImGui::SliderInt("Views", &p.views, 1, 16);
+            ImGui::SliderInt("Views", &p.views, 6, 128);
             ImGui::SetItemTooltip("Directions the outlines are compared from, spread over a half sphere (from the other\n"
                                   "half they would only be mirror images)");
-            ImGui::SliderInt("View pixels", &p.viewResolution, 32, 192);
+            ImGui::SliderInt("View pixels", &p.viewResolution, 64, 4000);
             ImGui::SetItemTooltip("Pixels across each view: finer is more exact and slower");
             ImGui::SliderFloat("Min coverage", &p.minViewCoverage, 0.0f, 1.0f, "%.2f");
             ImGui::SetItemTooltip("Share of every view's target outline the design must cover. Each view short of it costs\n"
@@ -76,7 +76,7 @@ namespace Bakugan {
         ImGui::SliderFloat("... by the end", &p.collisionRamp, 1.0f, 100.0f, "x %.0f", ImGuiSliderFlags_Logarithmic);
         ImGui::SetItemTooltip("Overlaps cost this many times as much by the end of the search as at its start, rising steadily:\n"
                               "the search may try things early on, and has to have the pieces clear of each other when it ends.");
-        ImGui::SliderInt("Checks per hinge", &p.hingeChecks, 1, 24);
+        ImGui::SliderInt("Checks per hinge", &p.hingeChecks, 6, 64);
         ImGui::SetItemTooltip("Poses checked for overlaps in every hinge's turn, spread evenly over its angle, however long or\n"
                               "short the turn is: turning faster hides nothing. Each step looks between the last step's poses.");
         bool order = p.orderHinges || p.dependencies;
@@ -214,12 +214,13 @@ namespace Bakugan {
         ImGui::SliderInt("Max hollows", &p.maxHollows, 0, 512);
         ImGui::SetItemTooltip("Hollows: material taken out of the sphere (from every piece) without making a piece");
         ImGui::BeginDisabled(!m_Gpu->Ok());
-        ImGui::Checkbox("Draw the silhouettes on the GPU", &m_AutoUseGpu);
+        ImGui::Checkbox("Draw the views on the GPU", &m_AutoUseGpu);
         ImGui::EndDisabled();
-        ImGui::SetItemTooltip("%s", m_Gpu->Ok() ? "Every step's views of the open design are raymarched by the graphics card instead of the\n"
-                                                  "CPU's cores (the comparison with the mesh, and the gradient, stay on the CPU). The editor's\n"
-                                                  "window is drawn with the same card: it redraws only a dozen times a second while a search\n"
-                                                  "runs, between the search's steps. The DINOv3 views are still drawn on the CPU."
+        ImGui::SetItemTooltip("%s", m_Gpu->Ok() ? "Every step's views of the open design (the silhouettes, and the pictures DINOv3 is shown) are\n"
+                                                  "raymarched by the graphics card instead of the CPU's cores. The comparison with the mesh, the\n"
+                                                  "shading of the semantic pictures and the gradient stay on the CPU; DINOv3 itself runs where\n"
+                                                  "its own CUDA option says. The editor's window is drawn with the same card: it redraws only a\n"
+                                                  "dozen times a second while a search runs, between the search's steps."
                                                 : m_Gpu->Error().c_str());
         int seed = (int)p.seed;
         ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
@@ -292,12 +293,15 @@ namespace Bakugan {
                                   "cut from the pin's end out of the sphere).");
         }
         ImGui::Checkbox("Carve collisions away when done", &p.carveWhenDone);
-        ImGui::SetItemTooltip("Wherever two pieces still run into each other between open and closed, cut the overlap out of\n"
-                              "one of them: the one it shows less on when the design is closed");
+        ImGui::SetItemTooltip("Wherever two pieces still run into each other between open and closed, one of them is cut by\n"
+                              "everything the other passes through on its way (its whole sweep, not samples of it): the one that\n"
+                              "loses less, counting what shows on the closed sphere eight times. No shapes are added: each body\n"
+                              "gets a clearance, listed under it in the outliner.");
         ImGui::DragFloat("Carve clearance", &p.carve.clearance, 0.01f, 0.0f, 3.0f, "%.2f mm");
-        ImGui::SetItemTooltip("Room left around what is carved away");
+        ImGui::SetItemTooltip("Room left where carved surfaces move past each other (none where they just touch, closed)");
         ImGui::SliderInt("Carve checks", &p.carve.checksPerHinge, 8, 96);
-        ImGui::SetItemTooltip("Poses looked at in every hinge's turn; it carves, checks again between those, and carves what is left");
+        ImGui::SetItemTooltip("Poses looked at in every hinge's turn to find where pieces meet. The cut itself follows the whole\n"
+                              "motion between them; afterwards it checks again at twice as many poses, and carves anything left");
         ImGui::Checkbox("Latch the first hinge when done", &p.latchWhenDone);
         ImGui::SetItemTooltip("A press latch on the hinge that opens first (with 'Hinges hold each other shut', the one that keeps\n"
                               "the whole design closed): a small rocker in the sphere's surface, flush with it. Its catch lies\n"

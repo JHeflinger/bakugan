@@ -95,6 +95,9 @@ namespace Bakugan {
         void Picture(std::vector<unsigned char>* rgba, int* w, int* h) const;
         // The semantic loss's last views: a row of the placed mesh's, a row of the open design's.
         void SemanticPicture(std::vector<unsigned char>* rgba, int* w, int* h) const;
+        // A carving's semantic pictures, open (what DINOv3 is shown), drawn `res` across with this loss's views, on the
+        // GPU (when given one and it draws: *traced) or the CPU; without DINOv3. For checking the one against the other.
+        std::vector<float> SemanticPictures(const Carving& c, int res, bool gpu, bool* traced);
 
         float L() const { return m_L; }
         // How far from the axis a piece may be and still count as at the hinge: half of what a knuckle's leaf can
@@ -122,6 +125,14 @@ namespace Bakugan {
             float weight;                        // d loss / d distance
         };
         using Slopes = std::vector<std::vector<Slope>>;   // per field
+        // A semantic pixel's layer: a body its ray reaches (within a pixel's softness), nearest first.
+        struct SemLayer {
+            int field;
+            float c, s, depth;
+            float along;                         // d distance / d t at q (< 0: the ray enters there); 0: an edge
+            Vector3 at;                          // where the ray comes closest (the edge's point)
+            Vector3 q;                           // the point shaded
+        };
         // A surface point a semantic pixel's shade comes from, and the loss's slope against that shade. Moved with
         // the body, the point slides along the pixel's ray to stay on the surface (to first order), and is shaded anew.
         struct Shade {
@@ -172,6 +183,9 @@ namespace Bakugan {
         // semantic.cpp
         void SetUpSemantic(const TriMesh& mesh);
         void Semantics(const Bodies& b, AutoScore& s, Slopes& slopes, Shades& shades);
+        // The open design's semantic pictures (into m_SemDrawn) and every pixel's layers (MaxLayers a pixel, count
+        // of them used): the rays traced on the GPU when there is one and it draws (then true), else on the CPU.
+        bool DrawSemantic(const Bodies& b, std::vector<SemLayer>& layers, std::vector<unsigned char>& count, bool useGpu);
         std::vector<std::vector<float>> SemanticTargets(const Placement& t) const;
         float Look(const View& w, Vector3 p, Vector3 n) const;     // a surface point's shade (world point, normal)
         float DepthLook(float depth) const;                         // the depth look at a depth along the view (from the frame's centre)

@@ -132,6 +132,8 @@ namespace Bakugan {
             p.locMin = GetShaderLocation(p.shader, "boxMin");
             p.locMax = GetShaderLocation(p.shader, "boxMax");
             p.locPiece = GetShaderLocation(p.shader, "pieceNumber");
+            p.locEvery = GetShaderLocation(p.shader, "everyPiece");
+            p.locRow = GetShaderLocation(p.shader, "pieceRow");
         }
         return &(m_Programs[key] = p);
     }
@@ -139,7 +141,8 @@ namespace Bakugan {
     bool GpuSilhouettes::Draw(const TraceRequest& rq, TraceResult* out) {
         const double start = GetTime();
         const int nv = (int)rq.views.size(), res = rq.res;
-        if (!m_Ok || nv < 1 || nv > 24 || res < 1 || (long long)nv * res > 16384) return false;
+        const int bands = rq.everyPiece ? (int)rq.pieces.size() : 1;
+        if (!m_Ok || nv < 1 || nv > 24 || res < 1 || bands < 1 || (long long)nv * res > 16384 || (long long)bands * res > 16384) return false;
         // every piece's shader first: one that won't build (too many uniforms for this driver, say) means the CPU draws
         std::vector<Program*> programs;
         for (const TracePiece& piece : rq.pieces) {
@@ -147,7 +150,7 @@ namespace Bakugan {
             if (p && !p->ok) return false;
             programs.push_back(p);
         }
-        const int width = nv * res, height = res;
+        const int width = nv * res, height = res * bands;
         if (!Target(width, height)) return false;
         std::vector<Vector3> dir(nv), u(nv), v(nv);
         for (int k = 0; k < nv; k++) { dir[k] = rq.views[k].dir; u[k] = rq.views[k].u; v[k] = rq.views[k].v; }
@@ -165,6 +168,7 @@ namespace Bakugan {
             Program* p = programs[i];
             if (!p) continue;
             const float farAway = 4.0f * rq.half + Vector3Distance(piece.box.min, piece.box.max), number = (float)(i + 1);
+            const float every = rq.everyPiece ? 1.0f : 0.0f, row = rq.everyPiece ? (float)i : 0.0f;
             BeginShaderMode(p->shader);
             SetShaderValueV(p->shader, p->locU, piece.params.data(), SHADER_UNIFORM_VEC4, (int)piece.params.size());
             SetShaderValueV(p->shader, p->locDir, dir.data(), SHADER_UNIFORM_VEC3, nv);
@@ -180,6 +184,8 @@ namespace Bakugan {
             SetShaderValue(p->shader, p->locMin, &piece.box.min, SHADER_UNIFORM_VEC3);
             SetShaderValue(p->shader, p->locMax, &piece.box.max, SHADER_UNIFORM_VEC3);
             SetShaderValue(p->shader, p->locPiece, &number, SHADER_UNIFORM_FLOAT);
+            SetShaderValue(p->shader, p->locEvery, &every, SHADER_UNIFORM_FLOAT);
+            SetShaderValue(p->shader, p->locRow, &row, SHADER_UNIFORM_FLOAT);
             DrawRectangle(0, 0, width, height, WHITE);
             EndShaderMode();
         }
@@ -190,14 +196,24 @@ namespace Bakugan {
 
         float* px = (float*)rlReadTexturePixels(m_Target.texture.id, width, height, RL_PIXELFORMAT_UNCOMPRESSED_R32G32B32A32);
         if (!px) return false;
-        const size_t count = (size_t)nv * res * res;
+        const size_t count = (size_t)bands * nv * res * res;
         out->nearest.assign(count, 0.0f);
         out->along.assign(count, 0.0f);
         out->piece.assign(count, -1);
-        for (int y = 0; y < res; y++)
+        out->enter.assign(rq.everyPiece ? count : 0, -1.0f);
+        for (int y = 0; y < height; y++)
             for (int x = 0; x < width; x++) {
                 const float* t = px + ((size_t)y * width + x) * 4;
-                size_t k = (size_t)(x / res) * res * res + (size_t)y * res + (x % res);
+                const int band = y / res, row = y % res;
+                size_t k = ((size_t)band * nv + (size_t)(x / res)) * res * res + (size_t)row * res + (x % res);
+                if (rq.everyPiece) {
+                    if (t[3] < 0.5f) continue;                  // (cleared: the piece doesn't cover it)
+                    out->nearest[k] = t[0];
+                    out->along[k] = t[1];
+                    out->enter[k] = t[2];
+                    out->piece[k] = band;
+                    continue;
+                }
                 out->nearest[k] = t[0];
                 out->along[k] = t[1];
                 out->piece[k] = (int)lroundf(t[2]) - 1;

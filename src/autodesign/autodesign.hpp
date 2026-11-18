@@ -32,8 +32,8 @@ namespace Bakugan {
         float sphereDiameter = 0.0f;     // mm; 0: a sphere of the mesh's volume (it sits at the mesh's centre of volume)
         bool moveTarget = true;          // the mesh it's compared with may be moved, to wherever suits the design best
         bool scaleTarget = true;         // ... and scaled (0.3x .. 3.3x, about its centre of volume)
-        int views = 6;                   // directions the silhouettes are compared from
-        int viewResolution = 64;         // pixels across each view
+        int views = 32;                   // directions the silhouettes are compared from
+        int viewResolution = 1080;         // pixels across each view
         float minViewCoverage = 0.6f;    // every view's target must be covered at least this much (steep cost below)
         float collisionWeight = 1.0f;    // what pieces overlapping each other cost (0: ignored) ...
         float collisionRamp = 20.0f;     // ... times this by the end of the search: it rises steadily from the weight to
@@ -42,7 +42,7 @@ namespace Bakugan {
         float hingeWeight = 2.0f;        // what a hinge being away from its two pieces costs (0: ignored): how far each
                                          // piece is from the axis, over the length a hinge's barrel takes up along it
         float surfaceWeight = 1.0f;      // what hollows carving into the sphere's surface cost (0: ignored)
-        int hingeChecks = 6;             // poses checked for overlaps in every hinge's turn, spread evenly over its angle
+        int hingeChecks = 32;             // poses checked for overlaps in every hinge's turn, spread evenly over its angle
                                          // however long the turn takes (open always is checked; closed needs none: the
                                          // pieces fill the sphere side by side). Each step looks between the last one's.
         bool orderHinges = true;         // the hinges open one after another, in the order that collides least (found
@@ -78,8 +78,8 @@ namespace Bakugan {
         int rewritesPerRound = 3;        // rewrites tried in a round
         int lookahead = 12;              // Adam steps each tried rewrite (and the unchanged design) gets before comparing
         float rewriteMargin = 0.005f;    // a rewrite is kept only if its loss is this much (a share) below the unchanged design's
-        int maxPieces = 8;
-        int maxHollows = 8;
+        int maxPieces = 64;
+        int maxHollows = 64;
         std::vector<float> ruleWeights;  // how often each grammar rule is drawn, in AutoRules() order (empty: their defaults)
         unsigned seed = 1;
     };
@@ -105,6 +105,7 @@ namespace Bakugan {
         int dependents = 0;              // hinges that should be held (the moving ones, less the first to open)
         int holdable = 0;                // ... of them, those with a holder within a ledge's reach
         bool traced = false;             // the silhouettes were drawn on the GPU
+        bool semanticTraced = false;     // ... and the semantic pictures
         float hinges = 0.0f;             // hinges away from their pieces: per hinge, how far each of its two pieces is
                                          // from its axis (the mean over the barrel's length, beyond a small slack), plus how far it is from fitting under the surface; over the mesh's size
         float hingeGap = 0.0f;           // the farthest a piece is from its hinge's axis, anywhere along the barrel (mm)

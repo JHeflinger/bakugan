@@ -30,8 +30,23 @@ namespace Bakugan {
                removed == o.removed && swapKnuckles == o.swapKnuckles && headDiameter == o.headDiameter;
     }
 
+    bool Clearance::operator==(const Clearance& o) const {
+        return id == o.id && body == o.body && tool == o.tool && hingeOnly == o.hingeOnly && margin == o.margin && step == o.step && upTo == o.upTo &&
+               hinges == o.hinges && poses == o.poses;
+    }
+
     bool Design::operator==(const Design& o) const {
-        return shapes == o.shapes && groups == o.groups && hinges == o.hinges && nextId == o.nextId;
+        return shapes == o.shapes && groups == o.groups && hinges == o.hinges && clearances == o.clearances && nextId == o.nextId;
+    }
+
+    std::vector<float> Design::ClearanceAngles(const Clearance& c, int pose) const {
+        std::vector<float> a(hinges.size());
+        for (size_t h = 0; h < hinges.size(); h++) {
+            a[h] = hinges[h].end;
+            for (size_t k = 0; k < c.hinges.size(); k++)
+                if (c.hinges[k] == hinges[h].id && k < c.poses[pose].size()) a[h] = c.poses[pose][k];
+        }
+        return a;
     }
 
     // ---- lookups -----------------------------------------------------------------------------------------------------
@@ -420,6 +435,8 @@ namespace Bakugan {
         hinges.erase(std::remove_if(hinges.begin(), hinges.end(), [&](const Hinge& h) { return isGone(h.parent) || isGone(h.child); }),
                      hinges.end());
         groups.erase(std::remove_if(groups.begin(), groups.end(), [&](const Group& g) { return isGone(g.id); }), groups.end());
+        clearances.erase(std::remove_if(clearances.begin(), clearances.end(), [&](const Clearance& c) { return isGone(c.body) || isGone(c.tool); }),
+                         clearances.end());
     }
 
     bool Design::MoveShape(int index, int groupId) {
@@ -598,6 +615,12 @@ namespace Bakugan {
         for (const Shape& s : shapes) maxId = std::max(maxId, s.id);
         for (const Group& g : groups) maxId = std::max(maxId, g.id);
         for (const Hinge& h : hinges) maxId = std::max(maxId, h.id);
+        // a clearance is between two bodies
+        auto isBody = [&](int id) { int g = GroupIndex(id); return g >= 0 && groups[g].parent < 0; };
+        clearances.erase(std::remove_if(clearances.begin(), clearances.end(),
+                                        [&](const Clearance& c) { return !isBody(c.body) || !isBody(c.tool) || c.body == c.tool || c.poses.empty(); }),
+                         clearances.end());
+        for (const Clearance& c : clearances) maxId = std::max(maxId, c.id);
         nextId = std::max(nextId, maxId + 1);
     }
 
@@ -642,6 +665,16 @@ namespace Bakugan {
             if (h.swapKnuckles) s << "swapknuckles " << h.id << "\n";
         for (const Hinge& h : hinges)
             if (h.headDiameter > 0.0f) s << "pinhead " << h.id << " " << h.headDiameter << "\n";
+        // clearance id body tool hingeOnly margin step upTo hinges <ids> poses <angles, a hinge's worth per pose>
+        for (const Clearance& c : clearances) {
+            s << "clearance " << c.id << " " << c.body << " " << c.tool << " " << (c.hingeOnly ? 1 : 0) << " " << c.margin << " " << c.step << " " << c.upTo << " "
+              << c.hinges.size();
+            for (int h : c.hinges) s << " " << h;
+            s << " " << c.poses.size();
+            for (const std::vector<float>& pose : c.poses)
+                for (size_t k = 0; k < c.hinges.size(); k++) s << " " << (k < pose.size() ? pose[k] : 0.0f);
+            s << "\n";
+        }
         return s.str();
     }
 
@@ -716,6 +749,22 @@ namespace Bakugan {
                 ls >> id;
                 if (ls.fail()) { *err = "Malformed swapknuckles line: " + line.substr(0, 60); return false; }
                 swaps.push_back(id);
+            } else if (tag == "clearance") {
+                Clearance c;
+                int only = 0;
+                size_t nh = 0, np = 0;
+                ls >> c.id >> c.body >> c.tool >> only >> c.margin >> c.step >> c.upTo >> nh;
+                if (ls.fail() || nh > 4096) { *err = "Malformed clearance line: " + line.substr(0, 60); return false; }
+                c.hingeOnly = only != 0;
+                c.hinges.resize(nh);
+                for (int& h : c.hinges) ls >> h;
+                ls >> np;
+                if (ls.fail() || np > 100000) { *err = "Malformed clearance line: " + line.substr(0, 60); return false; }
+                c.poses.assign(np, std::vector<float>(nh));
+                for (std::vector<float>& pose : c.poses)
+                    for (float& a : pose) ls >> a;
+                if (ls.fail()) { *err = "Malformed clearance line: " + line.substr(0, 60); return false; }
+                d.clearances.push_back(c);
             } else if (tag == "pinhead") {
                 int id = 0;
                 float dia = 0.0f;

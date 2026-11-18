@@ -211,6 +211,8 @@ void main() { gl_Position = mvp * vec4(vertexPosition, 1.0); }
     // target, a pixel's ray marched through the body's field in the body's own frame. Out comes the least distance
     // the ray gets to the body and how far along it that is; the depth is 1 - coverage, so of several bodies drawn
     // over each other the one covering the pixel most is kept.
+    // With everyPiece (the semantic pictures), each body has a band of its own (rows pieceRow * viewRes on), and out
+    // comes also where the ray enters it (-1: it doesn't), with alpha 1 where it covers the pixel at all.
     static const char* TraceMain = R"(
 uniform vec3 viewDir[24];
 uniform vec3 viewU[24];
@@ -225,10 +227,17 @@ uniform vec3 bodyPos;
 uniform vec3 boxMin;
 uniform vec3 boxMax;
 uniform float pieceNumber;
+uniform float everyPiece;
+uniform float pieceRow;
 out vec4 finalColor;
 
 void main() {
     float fx = floor(gl_FragCoord.x), fy = floor(gl_FragCoord.y);
+    bool layers = everyPiece > 0.5;
+    if (layers) {
+        fy -= pieceRow * viewRes;
+        if (fy < 0.0 || fy >= viewRes) discard;
+    }
     int view = int(fx / viewRes);
     float x = fx - float(view) * viewRes;
     float sx = ((x + 0.5) / viewRes * 2.0 - 1.0) * frameHalf, sy = (1.0 - (fy + 0.5) / viewRes * 2.0) * frameHalf;
@@ -249,10 +258,11 @@ void main() {
         tf = min(tf, t1);
         if (tn > tf) discard;
     }
-    float t = tn, dmin = 3.0e38, tmin = tn;
+    float t = tn, dmin = 3.0e38, tmin = tn, outside = -1.0, inside = -1.0;   // outside: the last t outside
     for (int k = 0; k < 64 && t <= tf; k++) {
         float d = map(lo + dir * t);
         if (d < dmin) { dmin = d; tmin = t; }
+        if (inside < 0.0) { if (d >= 0.0) outside = t; else inside = t; }
         if (d < -tau) break;
         t += d > tau ? 0.9 * d : 0.5 * tau;
     }
@@ -269,6 +279,21 @@ void main() {
     }
     float cover = clamp(0.5 - dmin / (2.0 * tau), 0.0, 1.0);
     if (cover <= 0.0) discard;
+    if (layers) {
+        // where it enters: between the last step outside and the first inside (bisection)
+        float enter = -1.0;
+        if (dmin < 0.0 && inside >= 0.0) {
+            float a = outside >= 0.0 ? outside : inside - 0.5 * tau, c = inside;
+            for (int k = 0; k < 10; k++) {
+                float m = 0.5 * (a + c);
+                if (map(lo + dir * m) < 0.0) c = m; else a = m;
+            }
+            enter = c;
+        }
+        finalColor = vec4(dmin, tmin, enter, 1.0);
+        gl_FragDepth = 0.5;
+        return;
+    }
     finalColor = vec4(dmin, tmin, pieceNumber, 1.0);
     gl_FragDepth = 1.0 - cover;
 }

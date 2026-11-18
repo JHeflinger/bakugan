@@ -259,7 +259,9 @@ namespace Bakugan {
             res.message += Utils::Format(" (in %s's turn), up to %.2f mm deep", design.hinges[res.checked.worstHinge].name.c_str(), res.checked.deepest);
         res.message += ".";
         res.message += finished;
-        if (bestScore.traced) res.message += " Silhouettes drawn by " + p.gpu->Name() + ".";
+        if (bestScore.traced && bestScore.semanticTraced) res.message += " Silhouettes and semantic pictures drawn by " + p.gpu->Name() + ".";
+        else if (bestScore.traced) res.message += " Silhouettes drawn by " + p.gpu->Name() + ".";
+        else if (bestScore.semanticTraced) res.message += " Semantic pictures drawn by " + p.gpu->Name() + ".";
         if (loss.Semantic()) {
             static const char* looks[] = { "silhouettes", "depth", "shaded" };
             res.message += Utils::Format(" DINOv3 (%s, %s, on %s): %.3f.", looks[(int)p.semanticLook],

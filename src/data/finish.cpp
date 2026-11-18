@@ -264,287 +264,262 @@ namespace Bakugan {
     }
 
     // ---- carving collisions away ------------------------------------------------------------------------------------------
+    //
+    // Two bodies that run into each other on the way: one of them, as it is where they meet, is subtracted from the
+    // other (a Clearance: data/design.hpp), grown by the clearance. "Where they meet" is every pose of the motion from
+    // just before they first touch to just after they part, close enough together that the tool moves no more than
+    // `step` between two of them: whatever it passes through in between is then within half a step of one of them,
+    // and so inside the cut (grown by the clearance and half a step). The cut is the tool's whole sweep, with no gaps
+    // between poses, and one clean surface rather than patches.
+    // Which of the two gives way: the one that loses less, counting what would show on the closed sphere eight times.
+    // Hinge hardware is never cut, nor a body's material next to its own knuckles: what runs into those cuts the
+    // other body instead (a hingeOnly clearance).
 
     namespace {
-        // Eigenvectors of a symmetric 3x3 matrix (Jacobi), as the columns of v.
-        void Eigen(double a[3][3], double v[3][3]) {
-            for (int i = 0; i < 3; i++)
-                for (int j = 0; j < 3; j++) v[i][j] = i == j;
-            for (int sweep = 0; sweep < 24; sweep++) {
-                double off = fabs(a[0][1]) + fabs(a[0][2]) + fabs(a[1][2]);
-                if (off < 1e-12) break;
-                for (int p = 0; p < 3; p++)
-                    for (int q = p + 1; q < 3; q++) {
-                        if (fabs(a[p][q]) < 1e-15) continue;
-                        double theta = 0.5 * atan2(2.0 * a[p][q], a[q][q] - a[p][p]), c = cos(theta), s = sin(theta);
-                        for (int k = 0; k < 3; k++) {
-                            double akp = a[k][p], akq = a[k][q];
-                            a[k][p] = c * akp - s * akq;
-                            a[k][q] = s * akp + c * akq;
-                        }
-                        for (int k = 0; k < 3; k++) {
-                            double apk = a[p][k], aqk = a[q][k];
-                            a[p][k] = c * apk - s * aqk;
-                            a[q][k] = s * apk + c * aqk;
-                        }
-                        for (int k = 0; k < 3; k++) {
-                            double vkp = v[k][p], vkq = v[k][q];
-                            v[k][p] = c * vkp - s * vkq;
-                            v[k][q] = s * vkp + c * vkq;
-                        }
-                    }
-            }
-        }
-
-        struct Spot {
-            Vector3 at;
-            float volume;
+        struct Moment {
+            float t = 0.0f;
+            Motion motion = Motion::Closing;
+            std::vector<float> angles;
+            std::vector<Rigid> xf;
         };
 
-        // Rounded boxes that cover a set of points (each standing for `cell` of space), with `margin` to spare: the
-        // points' own box along their principal axes, split in two (and again) while it is mostly empty.
-        void Cover(std::vector<Spot> pts, float cell, float margin, int depth, std::vector<SuperFrustum>* out) {
-            if (pts.empty()) return;
-            Vector3 mean = { 0, 0, 0 };
-            for (const Spot& s : pts) mean = Vector3Add(mean, s.at);
-            mean = Vector3Scale(mean, 1.0f / pts.size());
-            double cov[3][3] = {}, vec[3][3];
-            for (const Spot& s : pts) {
-                Vector3 q = Vector3Subtract(s.at, mean);
-                const float c[3] = { q.x, q.y, q.z };
-                for (int i = 0; i < 3; i++)
-                    for (int j = 0; j < 3; j++) cov[i][j] += c[i] * c[j];
-            }
-            Eigen(cov, vec);
-            // the axes, longest spread first, right handed
-            int order[3] = { 0, 1, 2 };
-            std::sort(order, order + 3, [&](int a, int b) { return cov[a][a] > cov[b][b]; });
-            Frame f;
-            f.o = mean;
-            f.x = Vector3Normalize({ (float)vec[0][order[0]], (float)vec[1][order[0]], (float)vec[2][order[0]] });
-            f.y = { (float)vec[0][order[1]], (float)vec[1][order[1]], (float)vec[2][order[1]] };
-            f.y = Vector3Normalize(Vector3Subtract(f.y, Vector3Scale(f.x, Vector3DotProduct(f.x, f.y))));
-            if (Vector3Length(f.y) < 0.5f) f.y = Utils::AnyPerpendicular(f.x);
-            f.z = Vector3CrossProduct(f.x, f.y);
-            Vector3 lo = { FLT_MAX, FLT_MAX, FLT_MAX }, hi = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
-            double volume = 0.0;
-            for (const Spot& s : pts) {
-                Vector3 l = f.Local(s.at);
-                lo = Vector3Min(lo, l);
-                hi = Vector3Max(hi, l);
-                volume += s.volume;
-            }
-            Vector3 e = Vector3Subtract(hi, lo);
-            double boxVolume = (double)(e.x + cell) * (e.y + cell) * (e.z + cell);
-            if (pts.size() >= 12 && depth < 4 && boxVolume > 3.0 * volume) {
-                // mostly empty (a bent or scattered patch): its two halves along the longest axis, each on its own
-                std::sort(pts.begin(), pts.end(), [&](const Spot& a, const Spot& b) { return Vector3DotProduct(a.at, f.x) < Vector3DotProduct(b.at, f.x); });
-                std::vector<Spot> second(pts.begin() + pts.size() / 2, pts.end());
-                pts.resize(pts.size() / 2);
-                Cover(std::move(pts), cell, margin, depth + 1, out);
-                Cover(std::move(second), cell, margin, depth + 1, out);
-                return;
-            }
-            SuperFrustum s = BoxIn(f, lo.x - margin, hi.x + margin, lo.y - margin, hi.y + margin, lo.z - margin, hi.z + margin, 0.4f);
-            out->push_back(s);
+        Moment MomentAt(const Design& d, float t, Motion m) {
+            Moment o;
+            o.t = t;
+            o.motion = m;
+            o.angles.resize(d.hinges.size());
+            for (size_t h = 0; h < d.hinges.size(); h++) o.angles[h] = d.HingeAngle((int)h, t, true, m);
+            o.xf = d.TransformsAt(o.angles);
+            return o;
         }
 
-        // The points' connected patches (neighbours within a cell and a bit), each covered on its own.
-        std::vector<SuperFrustum> CoverPatches(const std::vector<Spot>& all, float cell, float margin) {
-            struct Key {
-                int x, y, z;
-                bool operator==(const Key& o) const { return x == o.x && y == o.y && z == o.z; }
-            };
-            struct Hash {
-                size_t operator()(const Key& k) const { return (size_t)k.x * 73856093u ^ (size_t)k.y * 19349663u ^ (size_t)k.z * 83492791u; }
-            };
-            // The samples come from many poses, over and over through the same space: first one spot for every half
-            // cell of space any of them is in (so a spot's volume is the space it stands for, counted once).
-            const float fine = 0.5f * cell;
-            std::unordered_map<Key, std::pair<Vector3, int>, Hash> seen;
-            for (const Spot& s : all) {
-                auto& at = seen[Key{ (int)floorf(s.at.x / fine), (int)floorf(s.at.y / fine), (int)floorf(s.at.z / fine) }];
-                at.first = Vector3Add(at.first, s.at);
-                at.second++;
+        // The motion, in order: the closing one (perHinge moments in every hinge's turn, evenly in its angle, and the
+        // open and closed poses) and, if hinges open in their own time, the opening one.
+        std::vector<std::vector<Moment>> MotionPaths(const Design& d, int perHinge, float phase) {
+            std::vector<std::vector<Moment>> paths;
+            std::vector<float> ts = { 0.0f, 1.0f };
+            for (const MotionCheck& c : HingeChecks(d, perHinge, phase)) ts.push_back(c.t);
+            std::sort(ts.begin(), ts.end());
+            ts.erase(std::unique(ts.begin(), ts.end(), [](float a, float b) { return fabsf(a - b) < 1e-6f; }), ts.end());
+            std::vector<Moment> closing;
+            for (float t : ts) closing.push_back(MomentAt(d, t, Motion::Closing));
+            paths.push_back(std::move(closing));
+            if (d.HasOwnOpening()) {
+                std::vector<Moment> opening;
+                const int n = std::max(8, perHinge * (int)d.hinges.size());
+                for (int k = 0; k <= n; k++) opening.push_back(MomentAt(d, (k + (k > 0 && k < n ? phase - 0.5f : 0.0f)) / n, Motion::Opening));
+                paths.push_back(std::move(opening));
             }
-            std::vector<Spot> pts;
-            pts.reserve(seen.size());
-            for (const auto& [k, at] : seen) pts.push_back({ Vector3Scale(at.first, 1.0f / at.second), fine * fine * fine });
-            const float voxel = 1.05f * cell;
-            auto key = [&](Vector3 p) { return Key{ (int)floorf(p.x / voxel), (int)floorf(p.y / voxel), (int)floorf(p.z / voxel) }; };
-            std::unordered_map<Key, std::vector<int>, Hash> grid;
-            for (size_t i = 0; i < pts.size(); i++) grid[key(pts[i].at)].push_back((int)i);
-            std::unordered_map<Key, int, Hash> patch;
-            std::vector<std::vector<Spot>> patches;
-            for (const auto& [start, members] : grid) {
-                if (patch.count(start)) continue;
-                int id = (int)patches.size();
-                patches.emplace_back();
-                std::vector<Key> stack = { start };
-                patch[start] = id;
-                while (!stack.empty()) {
-                    Key k = stack.back();
-                    stack.pop_back();
-                    for (int i : grid[k]) patches[id].push_back(pts[i]);
-                    for (int dz = -1; dz <= 1; dz++)
-                        for (int dy = -1; dy <= 1; dy++)
-                            for (int dx = -1; dx <= 1; dx++) {
-                                Key n = { k.x + dx, k.y + dy, k.z + dz };
-                                if (grid.count(n) && !patch.count(n)) {
-                                    patch[n] = id;
-                                    stack.push_back(n);
-                                }
-                            }
+            return paths;
+        }
+
+        // A clearance of `target` by `tool` over moments [a, b] of a path: the field samples the tool between them.
+        Clearance SweepOver(const Design& d, const std::vector<Moment>& path, int a, int b, int target, int tool, float clearance, float step) {
+            Clearance c;
+            c.body = target;
+            c.tool = tool;
+            c.margin = clearance;
+            c.step = step;
+            c.upTo = d.nextId;
+            for (const Hinge& h : d.hinges) c.hinges.push_back(h.id);
+            for (int k = a; k <= b; k++) c.poses.push_back(path[k].angles);
+            return c;
+        }
+
+        // What a clearance takes from its body: mm^3, and how much of that is within `skin` of the closed sphere's
+        // surface. Sampled where the tool can reach.
+        void Taken(const Design& with, const Design& without, const Clearance& c, const SphereInfo& sp, float skin, float spacing,
+                   double* volume, double* shown) {
+            *volume = 0.0;
+            *shown = 0.0;
+            BodyField before = BodyField::Body(without, c.body), after = BodyField::Body(with, c.body);
+            // where the tool is at any of its poses, in the body's frame (its box's corners), and the margin around it
+            BoundingBox box = before.bounds;
+            {
+                BodyField tool = BodyField::Body(with, c.tool);
+                const int gt = with.GroupIndex(c.body), gb = with.GroupIndex(c.tool);
+                Vector3 lo = { FLT_MAX, FLT_MAX, FLT_MAX }, hi = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+                for (size_t k = 0; k < c.poses.size(); k++) {
+                    std::vector<Rigid> xf = with.TransformsAt(with.ClearanceAngles(c, (int)k));
+                    Rigid back = xf[gb].Then(xf[gt].Inverse());          // the tool's frame to the body's
+                    for (int i = 0; i < 8; i++) {
+                        Vector3 q = back.Apply({ i & 1 ? tool.bounds.max.x : tool.bounds.min.x, i & 2 ? tool.bounds.max.y : tool.bounds.min.y,
+                                                 i & 4 ? tool.bounds.max.z : tool.bounds.min.z });
+                        lo = Vector3Min(lo, q);
+                        hi = Vector3Max(hi, q);
+                    }
                 }
+                box.min = Vector3Max(box.min, Vector3SubtractValue(lo, c.margin));
+                box.max = Vector3Min(box.max, Vector3AddValue(hi, c.margin));
+                if (box.max.x <= box.min.x || box.max.y <= box.min.y || box.max.z <= box.min.z) return;
             }
-            std::vector<SuperFrustum> out;
-            for (std::vector<Spot>& p : patches) Cover(std::move(p), cell, margin, 0, &out);
-            return out;
+            const int gt = with.GroupIndex(c.body);
+            const Rigid closed = with.TransformsAt(ClosedAngles(with))[gt];
+            const int nx = std::max(1, (int)ceilf((box.max.x - box.min.x) / spacing)), ny = std::max(1, (int)ceilf((box.max.y - box.min.y) / spacing)),
+                      nz = std::max(1, (int)ceilf((box.max.z - box.min.z) / spacing));
+            std::vector<double> vol(nz, 0.0), show(nz, 0.0);
+            const double each = (double)spacing * spacing * spacing;
+            ParallelFor(nz, [&](int k) {
+                for (int j = 0; j < ny; j++)
+                    for (int i = 0; i < nx; i++) {
+                        Vector3 q = { box.min.x + (i + 0.5f) * spacing, box.min.y + (j + 0.5f) * spacing, box.min.z + (k + 0.5f) * spacing };
+                        float b = before.Distance(q);
+                        if (b >= 0.0f) continue;
+                        if (after.Distance(q) < 0.0f) continue;
+                        vol[k] += each;
+                        if (sp.ok && sp.radius - Vector3Distance(closed.Apply(q), sp.centre) < skin) show[k] += each;
+                    }
+            });
+            for (int k = 0; k < nz; k++) { *volume += vol[k]; *shown += show[k]; }
         }
-    }
 
-    namespace {
-        FinishResult Carve(const Design& in, const CarveParams& p, JobControl* c, float nearHinges);
-    }
+        bool HasKnuckles(const Design& d, int body) {
+            for (const Hinge& h : d.hinges)
+                if (h.hardware && (h.parent == body || h.child == body)) return true;
+            return false;
+        }
 
-    FinishResult CarveCollisions(const Design& in, const CarveParams& p, JobControl* c) { return Carve(in, p, c, 0.0f); }
-
-    namespace {
-    // nearHinges > 0: only what two bodies joined by a hinge with hardware share within that distance of its axis.
-    FinishResult Carve(const Design& in, const CarveParams& p, JobControl* c, float nearHinges) {
-        FinishResult r;
-        r.design = in;
-        Design d = in;
-        const SphereInfo sp = FindSphere(in);
-        BoundingBox bounds = in.Bounds();
-        const float cell = std::clamp(Vector3Distance(bounds.min, bounds.max) / 56.0f, 0.3f, 2.0f);
-        const float skin = sp.ok ? fmaxf(1.0f, 0.08f * sp.radius) : 1.0f;
-        const float margin = p.clearance + 0.3f * cell;
-        const int rounds = std::max(1, p.rounds);
-        for (int round = 0;; round++) {
-            if (c && c->Cancelled()) { r.cancelled = true; r.message = "Stopped."; return r; }
-            if (c) c->SetProgress((float)round / (rounds + 1));
-            BodySet set = MakeBodySet(d, cell);
-            const int n = (int)set.fields.size();
-            if (n < 2) { r.message = "Nothing to carve: fewer than two bodies."; return r; }
-            std::vector<std::vector<char>> under = HingeSubtrees(d);
-            std::vector<MotionCheck> checks = HingeChecks(d, p.checksPerHinge, fmodf(0.5f + 0.6180339887f * round, 1.0f));
-            checks.insert(checks.begin(), MotionCheck{ 0.0f, -1, 0.0f });
-            std::vector<Rigid> closed = d.Transforms(1.0f, true);
-            bool anyHardware = false;
-            for (const Hinge& h : d.hinges) anyHardware |= h.hardware;
-            // the bodies without their hinges' hardware (cuts don't reach hardware), and every hinge's knuckles
-            BodySet bare;
-            std::vector<std::vector<Knuckle>> knuckles(d.hinges.size());
-            if (anyHardware) {
-                Design plain = d;
-                for (Hinge& h : plain.hinges) h.hardware = false;
-                bare = MakeBodySet(plain, cell);
-                for (size_t h = 0; h < d.hinges.size(); h++) knuckles[h] = d.Knuckles((int)h);
-            }
-            // what overlaps, per pair of bodies, as points of each of the two (in its own frame)
-            struct Found {
-                std::vector<Spot> a, b;
-                std::vector<Spot> onlyA, onlyB;          // inside the other's hinge hardware (which no cut reaches): this one gives way
-                double shownA = 0.0, shownB = 0.0;       // the volume that is near the closed surface, in each
+        // hingePairs: only bodies a hinge with hardware joins (AddHinges makes room for its hinges with this).
+        FinishResult Carve(const Design& in, const CarveParams& p, JobControl* c, bool hingePairs) {
+            FinishResult r;
+            r.design = in;
+            Design d = in;
+            const SphereInfo sp = FindSphere(in);
+            BoundingBox bounds = in.Bounds();
+            const float cell = std::clamp(Vector3Distance(bounds.min, bounds.max) / 56.0f, 0.3f, 2.0f);
+            const float skin = sp.ok ? fmaxf(1.0f, 0.08f * sp.radius) : 1.0f;
+            const float clearance = fmaxf(0.05f, p.clearance);
+            auto joined = [&](int a, int b) {
+                for (const Hinge& h : d.hinges)
+                    if (h.hardware && ((h.parent == a && h.child == b) || (h.parent == b && h.child == a))) return true;
+                return false;
             };
-            std::map<std::pair<int, int>, Found> found;
-            std::vector<double> volume(checks.size(), 0.0);
-            std::mutex mutex;
-            ParallelFor((int)checks.size(), [&](int k) {
-                if (c && c->Cancelled()) return;
-                const MotionCheck& check = checks[k];
-                std::vector<Rigid> xf = d.Transforms(check.t, true);
-                for (int i = 0; i < n; i++)
-                    for (int j = i + 1; j < n; j++) {
-                        if (check.hinge >= 0 && !MovingApart(d, under, set.group[i], set.group[j], check.t)) continue;
-                        Clash clash;
-                        const Rigid &xa = xf[set.group[i]], &xb = xf[set.group[j]];
-                        SampleOverlap({ &set.fields[i], set.boxes[i], xa }, { &set.fields[j], set.boxes[j], xb }, cell, { 0.5f, 0.5f, 0.5f }, &clash, true);
-                        if (clash.samples.empty()) continue;
-                        std::lock_guard<std::mutex> l(mutex);
-                        volume[k] += clash.volume;
-                        Found& f = found[{ i, j }];
-                        for (const OverlapSample& s : clash.samples) {
-                            Vector3 la = xa.ApplyInverse(s.at), lb = xb.ApplyInverse(s.at);
-                            if (nearHinges > 0.0f) {
-                                bool near = false;
-                                for (const Hinge& h : d.hinges) {
-                                    if (!h.hardware) continue;
-                                    const int ia = d.groups[set.group[i]].id, ib = d.groups[set.group[j]].id;
-                                    if (!(h.parent == ia && h.child == ib) && !(h.child == ia && h.parent == ib)) continue;
-                                    const Vector3 a = Vector3Normalize(h.axis), q = Vector3Subtract(la, h.pivot);
-                                    near |= Vector3Length(Vector3Subtract(q, Vector3Scale(a, Vector3DotProduct(q, a)))) < nearHinges;
+            // start from the design without the clearances this would make again
+            d.clearances.erase(std::remove_if(d.clearances.begin(), d.clearances.end(), [&](const Clearance& k) { return !hingePairs || joined(k.body, k.tool); }),
+                               d.clearances.end());
+            const MotionOverlap before = MeasureMotion(d, p.checksPerHinge, cell);
+            r.before = before.worstVolume;
+            const int rounds = std::max(1, p.rounds);
+            int made = 0;
+            const float step = std::clamp(0.5f * clearance, 0.03f, 0.1f);   // the sweep's samples, at most this far apart
+            for (int round = 0; round < rounds; round++) {
+                if (c && c->Cancelled()) { r.cancelled = true; r.message = "Stopped."; return r; }
+                if (c) c->SetProgress(0.9f * round / rounds);
+                BodySet set = MakeBodySet(d, cell);
+                const int n = (int)set.fields.size();
+                if (n < 2) { r.message = "Nothing to carve: fewer than two bodies."; return r; }
+                std::vector<std::vector<char>> under = HingeSubtrees(d);
+                // where in the motion each pair meets, and the points (each in its own frame) where it does
+                struct Meeting {
+                    std::vector<char> at;            // per moment of the path
+                    std::vector<Vector3> inA, inB;
+                };
+                const std::vector<std::vector<Moment>> paths = MotionPaths(d, p.checksPerHinge, fmodf(0.5f + 0.6180339887f * round, 1.0f));
+                std::map<std::pair<int, int>, std::vector<Meeting>> meet;      // per pair, per path
+                std::mutex mutex;
+                for (size_t pi = 0; pi < paths.size(); pi++) {
+                    const std::vector<Moment>& path = paths[pi];
+                    ParallelFor((int)path.size(), [&](int k) {
+                        if (c && c->Cancelled()) return;
+                        const Moment& m = path[k];
+                        for (int i = 0; i < n; i++)
+                            for (int j = i + 1; j < n; j++) {
+                                const int a = d.groups[set.group[i]].id, b = d.groups[set.group[j]].id;
+                                if (hingePairs && !joined(a, b)) continue;
+                                Clash clash;
+                                SampleOverlap({ &set.fields[i], set.boxes[i], m.xf[set.group[i]] }, { &set.fields[j], set.boxes[j], m.xf[set.group[j]] }, cell,
+                                              { 0.5f, 0.5f, 0.5f }, &clash, true);
+                                if (clash.samples.empty()) continue;
+                                std::lock_guard<std::mutex> l(mutex);
+                                std::vector<Meeting>& per = meet[{ i, j }];
+                                if (per.empty()) per.resize(paths.size());
+                                Meeting& mt = per[pi];
+                                if (mt.at.empty()) mt.at.assign(path.size(), 0);
+                                mt.at[k] = 1;
+                                for (const OverlapSample& s : clash.samples) {
+                                    mt.inA.push_back(m.xf[set.group[i]].ApplyInverse(s.at));
+                                    mt.inB.push_back(m.xf[set.group[j]].ApplyInverse(s.at));
                                 }
-                                if (!near) continue;
                             }
-                            if (anyHardware) {
-                                // in a body's hardware: in the body, but not in what it is without hardware
-                                bool hardA = bare.fields[i].Distance(la) > 0.0f, hardB = bare.fields[j].Distance(lb) > 0.0f;
-                                if (hardA && hardB) continue;                            // hardware in hardware: nothing to carve
-                                if (hardA) { f.onlyB.push_back({ lb, s.volume }); continue; }
-                                if (hardB) { f.onlyA.push_back({ la, s.volume }); continue; }
-                                // next to the hinge that joins the two: along one's knuckle, the other gives way (what
-                                // is cut around a body's own knuckle would cut it loose)
-                                int giving = -1;
-                                for (const Hinge& h : d.hinges) {
-                                    if (!h.hardware) continue;
-                                    const bool aParent = h.parent == d.groups[set.group[i]].id && h.child == d.groups[set.group[j]].id;
-                                    const bool aChild = h.child == d.groups[set.group[i]].id && h.parent == d.groups[set.group[j]].id;
-                                    if (!aParent && !aChild) continue;
-                                    const Vector3 a = Vector3Normalize(h.axis), q = Vector3Subtract(la, h.pivot);
-                                    const float z = Vector3DotProduct(q, a);
-                                    if (Vector3Length(Vector3Subtract(q, Vector3Scale(a, z))) > h.leafLength + 1.0f) continue;
-                                    for (const Knuckle& k : knuckles[&h - d.hinges.data()])
-                                        if (!k.removed && z > k.lo - h.clearance && z < k.hi + h.clearance) giving = k.child == aChild ? 1 : 0;   // 1: B gives way
+                    });
+                }
+                if (c && c->Cancelled()) { r.cancelled = true; r.message = "Stopped."; return r; }
+                if (meet.empty()) break;
+                for (auto& [pair, per] : meet) {
+                    const int a = d.groups[set.group[pair.first]].id, b = d.groups[set.group[pair.second]].id;
+                    for (size_t pi = 0; pi < per.size(); pi++) {
+                        const Meeting& mt = per[pi];
+                        if (mt.at.empty()) continue;
+                        const std::vector<Moment>& path = paths[pi];
+                        // each run of moments where they meet, from the one before to the one after
+                        const int last = (int)path.size() - 1;
+                        for (int k = 0; k <= last; k++) {
+                            if (!mt.at[k]) continue;
+                            int from = std::max(0, k - 1), to = k;
+                            while (to < last && mt.at[to + 1]) to++;
+                            k = to;
+                            to = std::min(last, to + 1);
+                            // both ways, then the one that takes less
+                            Clearance cutA = SweepOver(d, path, from, to, a, b, clearance, step);      // a gives way
+                            Clearance cutB = SweepOver(d, path, from, to, b, a, clearance, step);
+                            double costA = 0.0, costB = 0.0, shown = 0.0, vol = 0.0;
+                            {
+                                Design t = d;
+                                cutA.id = t.nextId++;
+                                t.clearances.push_back(cutA);
+                                Taken(t, d, cutA, sp, skin, 0.5f * cell, &vol, &shown);
+                                costA = vol + 8.0 * shown;
+                            }
+                            {
+                                Design t = d;
+                                cutB.id = t.nextId++;
+                                t.clearances.push_back(cutB);
+                                Taken(t, d, cutB, sp, skin, 0.5f * cell, &vol, &shown);
+                                costB = vol + 8.0 * shown;
+                            }
+                            const bool aGives = costA <= costB;
+                            Clearance cut = aGives ? cutA : cutB, back = aGives ? cutB : cutA;
+                            cut.id = d.nextId++;
+                            d.clearances.push_back(cut);
+                            made++;
+                            // what the one giving way can't cut (its hardware, next to its knuckles) cuts the other
+                            if (HasKnuckles(d, cut.body)) {
+                                back.hingeOnly = true;
+                                back.id = d.nextId;
+                                Design t = d;
+                                t.nextId++;
+                                t.clearances.push_back(back);
+                                Taken(t, d, back, sp, skin, 0.5f * cell, &vol, &shown);
+                                if (vol > 0.0) {
+                                    d = t;
+                                    made++;
                                 }
-                                if (giving == 1) { f.onlyB.push_back({ lb, s.volume }); continue; }
-                                if (giving == 0) { f.onlyA.push_back({ la, s.volume }); continue; }
-                            }
-                            f.a.push_back({ la, s.volume });
-                            f.b.push_back({ lb, s.volume });
-                            if (sp.ok) {
-                                // where that is when closed: near the sphere's surface it would show
-                                if (sp.radius - Vector3Distance(closed[set.group[i]].Apply(la), sp.centre) < skin) f.shownA += s.volume;
-                                if (sp.radius - Vector3Distance(closed[set.group[j]].Apply(lb), sp.centre) < skin) f.shownB += s.volume;
                             }
                         }
                     }
-            });
-            if (c && c->Cancelled()) { r.cancelled = true; r.message = "Stopped."; return r; }
-            double worst = 0.0;
-            for (double v : volume) worst = std::max(worst, v);
-            if (round == 0) r.before = worst;
-            r.after = worst;
-            if (found.empty() || round >= rounds) break;
-            for (auto& [pair, f] : found) {
-                // carved from the one it shows less on when closed (the same: from the second, usually the smaller)
-                bool fromA = f.shownA < f.shownB;
-                const int bodyA = d.groups[set.group[pair.first]].id, bodyB = d.groups[set.group[pair.second]].id;
-                auto carve = [&](const std::vector<Spot>& pts, int body) {
-                    if (pts.empty()) return;
-                    for (const SuperFrustum& s : CoverPatches(pts, cell, margin)) {
-                        d.AddShape(s, body, "Carved", Op::Cut);
-                        r.cuts++;
-                    }
-                };
-                carve(fromA ? f.a : f.b, fromA ? bodyA : bodyB);
-                carve(f.onlyA, bodyA);
-                carve(f.onlyB, bodyB);
+                }
             }
-        }
-        if (c) c->SetProgress(1.0f);
-        if (r.cuts == 0) {
-            r.message = Utils::Format("Nothing collides on the way (%d poses in every hinge's turn): nothing carved.", p.checksPerHinge);
+            if (c) c->SetProgress(0.95f);
+            if (made == 0) {
+                r.message = Utils::Format("Nothing collides on the way (%d poses in every hinge's turn): nothing carved.", p.checksPerHinge);
+                return r;
+            }
+            // checked again, between the poses it looked at
+            const MotionOverlap after = MeasureMotion(d, 2 * p.checksPerHinge, cell, 0.25f);
+            r.after = after.worstVolume;
+            r.cuts = made;
+            if (c) c->SetProgress(1.0f);
+            r.ok = true;
+            r.design = d;
+            r.message = Utils::Format("Carved %d clearance%s, each one body less the other's sweep and %.2f mm around it: %.1f mm3 overlapped at "
+                                      "the worst pose, %.2f mm3 now.", made, made == 1 ? "" : "s", clearance + 0.5f * step, r.before, r.after);
+            if (r.after > 0.01 && after.deepest < 0.01f) r.message += " (What is left only touches: under 0.01 mm deep.)";
+            else if (r.after > 0.01) r.message += " What is left is between parts nothing cuts (hinge hardware, or next to two bodies' own knuckles).";
             return r;
         }
-        r.ok = true;
-        r.design = d;
-        r.message = Utils::Format("Carved %d cut%s where bodies ran into each other: %.1f mm3 overlapped at the worst pose, %.2f mm3 now.", r.cuts,
-                                  r.cuts == 1 ? "" : "s", r.before, r.after);
-        return r;
     }
-    }
+
+    FinishResult CarveCollisions(const Design& in, const CarveParams& p, JobControl* c) { return Carve(in, p, c, false); }
 
     // ---- hinges ---------------------------------------------------------------------------------------------------------------
 
@@ -745,7 +720,7 @@ namespace Bakugan {
             relief.checksPerHinge = 24;
             relief.clearance = sz.clearance;
             relief.rounds = 3;
-            FinishResult made = Carve(d, relief, nullptr, sz.relief);
+            FinishResult made = Carve(d, relief, nullptr, true);
             if (made.ok) { d = made.design; r.relieved = made.cuts; }
         }
         if (c && c->Cancelled()) { r.cancelled = true; r.message = "Stopped."; return r; }
@@ -772,7 +747,8 @@ namespace Bakugan {
                                   p.pin == PinStyle::Fused ? "printed in place" : "for a separate pin", 2.0f * sz.radius, sz.length, 2.0f * sz.pinRadius, sz.clearance);
         if (r.moved > 0.05f)
             r.message += Utils::Format(" To be inside the sphere, axes moved up to %.1f mm toward its centre, which changes the motion a little.", r.moved);
-        if (r.relieved > 0) r.message += Utils::Format(" %d cut%s next to them, where their two bodies would rub as they turn.", r.relieved, r.relieved == 1 ? "" : "s");
+        if (r.relieved > 0)
+            r.message += Utils::Format(" Their bodies make each other room to turn (%d clearance%s).", r.relieved, r.relieved == 1 ? "" : "s");
         r.message += Utils::Format(" Overlapping on the way: %.1f mm3 at worst before, %.1f mm3 now", before.worstVolume, after.worstVolume);
         r.message += after.worstVolume > before.worstVolume + 0.5 ? " (Carve collisions away clears the rest)." : ".";
         if (closedOverlap > 0.5) r.message += Utils::Format(" Closed, %.1f mm3 of hardware is inside another body.", closedOverlap);

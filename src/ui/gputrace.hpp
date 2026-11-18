@@ -9,6 +9,7 @@
 // Drawing: one float target holds every view side by side. Each piece is one rectangle over all of it, with a shader
 // made from the piece's field (cached by its code: a piece's numbers are uniforms, so only a rewrite compiles
 // anything), marching each pixel's ray as Loss::Trace does. The depth test keeps, per pixel, the piece covering it most.
+// For the semantic pictures (everyPiece) each piece has a band of its own instead, one view-height tall, below the last.
 #include "autodesign/tracer.hpp"
 #include <raylib.h>
 #include <condition_variable>
@@ -41,7 +42,7 @@ namespace Bakugan {
             Shader shader = {};
             bool ok = false;
             int locU = -1, locDir = -1, locViewU = -1, locViewV = -1, locCentre = -1, locHalf = -1, locRes = -1, locTau = -1, locFar = -1,
-                locQuat = -1, locPos = -1, locMin = -1, locMax = -1, locPiece = -1;
+                locQuat = -1, locPos = -1, locMin = -1, locMax = -1, locPiece = -1, locEvery = -1, locRow = -1;
         };
         Program* ProgramFor(const std::string& code, int uniforms);
         bool Target(int width, int height);
