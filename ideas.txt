@@ -1,0 +1,5 @@
+group up anmdd indentify features, and evaluation is not based on fitting on the input shape but rather do the features exist and are they all relatively the same scale/position/orientation from each other
+
+multiple threading - a couple exploratory threads and one consistent thread
+
+auto cut out collisions? so like auto carve out?
