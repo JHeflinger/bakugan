@@ -225,6 +225,21 @@ namespace {
         return t;
     }
 
+    // A new, empty folder in `parent` for this run: <stem>_1, <stem>_2, ... the first that doesn't exist yet.
+    // create_directory fails when the folder is there already, so two runs started together can't share one.
+    bool MakeRunDir(const fs::path& parent, const std::string& stem, fs::path* out, std::string* error) {
+        std::error_code ec;
+        fs::create_directories(parent, ec);
+        if (ec) { *error = "can't create " + parent.string() + ": " + ec.message(); return false; }
+        for (int n = 1; n < 1000000; n++) {
+            fs::path dir = parent / (stem + "_" + std::to_string(n));
+            if (fs::create_directory(dir, ec)) { *out = dir; return true; }
+            if (ec) { *error = "can't create " + dir.string() + ": " + ec.message(); return false; }
+        }
+        *error = "no free folder name for " + stem + " in " + parent.string();
+        return false;
+    }
+
     std::string ScoreJson(const AutoScore& s) {
         return Utils::Format("{\"loss\": %.6g, \"fit\": %.6g, \"cover\": %.6g, \"extra\": %.6g, \"worst_view\": %.6g, \"collision\": %.6g, "
                              "\"overlap_open\": %.6g, \"overlap_motion\": %.6g, \"surface_carved\": %.6g, \"hinges\": %.6g, "
@@ -257,9 +272,10 @@ namespace {
         if (cfg.input.mesh.empty()) { fprintf(stderr, "usage: foldaball optimize <mesh.obj> (or input.mesh in the settings)\n"); return 2; }
         TriMesh mesh;
         if (!LoadMesh(cfg.input.mesh, cfg.input.meshSize, &mesh, &err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
-        const fs::path outDir = cfg.output.dir.empty() ? fs::path("foldaball_out") : fs::path(cfg.output.dir);
+        const fs::path baseDir = cfg.output.dir.empty() ? fs::path("foldaball_out") : fs::path(cfg.output.dir);
         const std::string name = cfg.output.name.empty() ? fs::path(cfg.input.mesh).stem().string() : cfg.output.name;
-        if (!MakeDir(outDir, &err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        fs::path outDir;                                     // this run's own folder: <output dir>/<name>_<n>
+        if (!MakeRunDir(baseDir, name, &outDir, &err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
         SaveSettings(cfg, outDir / (name + ".config.ini"));
 
         AutoParams p = cfg.generate;
@@ -429,8 +445,10 @@ namespace {
         sp.outDir = cfg.output.dir;
         sp.preview = cfg.output.preview;
         sp.previewSize = cfg.output.previewSize;
-        const fs::path outDir = sp.outDir.empty() ? fs::path(folder) / "autodesign_suite" : fs::path(sp.outDir);
-        if (!MakeDir(outDir, &err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        const fs::path baseDir = sp.outDir.empty() ? fs::path(folder) / "autodesign_suite" : fs::path(sp.outDir);
+        fs::path outDir;
+        if (!MakeRunDir(baseDir, "suite", &outDir, &err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        sp.outDir = outDir.string(); 
         SaveSettings(cfg, outDir / "suite.config.ini");
         if (!a.quiet)
             printf("Test suite: %d mesh%s from %s, %d steps each%s; results in %s\n", (int)count, count == 1 ? "" : "es", folder.c_str(), sp.generate.steps,
