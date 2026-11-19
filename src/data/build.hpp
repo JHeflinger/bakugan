@@ -50,6 +50,23 @@ namespace Bakugan {
                          const JobControl* control, const std::function<void(float)>& progress,
                          std::shared_ptr<const LevelSet>* keep = nullptr);
 
+    // The separate pieces a solid f falls into (6-connected at `voxel`), largest first, with their volumes; and, for each
+    // piece smaller than removeShare of the largest's volume, boxes (world, axis aligned) that cover all of it and none of the rest: cut
+    // together, they take that piece away and leave the others as they were (to within half a voxel where a piece
+    // comes that close to another). covered is false when that couldn't be done in a reasonable number of boxes.
+    struct Island {
+        double volume = 0.0;             // mm^3
+        BoundingBox bounds = {};
+        bool remove = false;             // smaller than removeShare of the largest (and not a speck)
+        bool speck = false;              // fewer than 2 x 2 x 2 voxels: below what the voxels can tell from a sharp edge
+                                         // sampled apart (and below what a slicer keeps): left alone
+        bool covered = false;            // ... and these boxes take it away
+        int tight = 0;                   // boxes that had to come within a voxel of another piece
+        std::vector<BoundingBox> cover;
+    };
+    std::vector<Island> FindIslands(const std::function<float(Vector3)>& f, BoundingBox box, float voxel, double removeShare,
+                                    const JobControl* control = nullptr, float* voxelUsed = nullptr);
+
     // Meshes every body (and separate pin) of the design. samples > 0 also takes up to that many surface points per part.
     // With a pose (transforms indexed like the groups) and gap > 0, every body is trimmed back by gap / 2 from the bodies
     // it touches in that pose, so parts printed together come out apart.

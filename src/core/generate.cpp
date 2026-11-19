@@ -151,7 +151,7 @@ namespace Bakugan {
 
     void App::StartFinish(Finish what) {
         if (m_FinishJob.Busy() || m_AutoJob.Busy() || m_SuiteJob.Busy()) return;
-        if (m_Design.hinges.empty()) { m_Status = "Nothing to finish: the design has no hinges."; return; }
+        if (m_Design.hinges.empty() && what != Finish::Floating) { m_Status = "Nothing to finish: the design has no hinges."; return; }
         Design d = m_Design;
         const AutoParams& p = m_AutoParams;
         if (what == Finish::Hinges) {
@@ -164,6 +164,9 @@ namespace Bakugan {
         } else if (what == Finish::Ledges) {
             LedgeParams q = p.ledges;
             m_FinishJob.Start([d, q](JobControl& c) { c.SetStage("Adding ledges"); return AddLedges(d, q, &c); });
+        } else if (what == Finish::Floating) {
+            FloatingParams q = p.floating;
+            m_FinishJob.Start([d, q](JobControl& c) { c.SetStage("Looking for floating bits"); return RemoveFloatingBits(d, q, &c); });
         } else {
             LatchParams q = p.latch;
             q.hinge = m_Sel.hinge;           // the selected hinge, or (none selected) the first to open

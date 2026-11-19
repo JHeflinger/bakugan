@@ -1234,3 +1234,107 @@ namespace Bakugan {
         return r;
     }
 }
+
+// ---- floating bits ---------------------------------------------------------------------------------------------------
+#include "data/build.hpp"
+
+namespace Bakugan {
+    FinishResult RemoveFloatingBits(const Design& in, const FloatingParams& p, JobControl* c) {
+        FinishResult r;
+        r.design = in;
+        Design d = in;
+        float voxel = p.voxel;
+        if (voxel <= 0.0f) {                             // auto: the bodies' longest side over 250
+            BoundingBox all = { { FLT_MAX, FLT_MAX, FLT_MAX }, { -FLT_MAX, -FLT_MAX, -FLT_MAX } };
+            for (int g : in.Bodies()) {
+                BodyField f = BodyField::Body(in, in.groups[g].id);
+                if (!f.Empty()) all = { Vector3Min(all.min, f.bounds.min), Vector3Max(all.max, f.bounds.max) };
+            }
+            Vector3 e = all.min.x <= all.max.x ? Vector3Subtract(all.max, all.min) : Vector3{ 40, 40, 40 };
+            voxel = std::clamp(fmaxf(e.x, fmaxf(e.y, e.z)) / 250.0f, 0.05f, 0.4f);
+        }
+        const double share = std::clamp((double)p.share, 0.0, 1.0);
+        std::vector<int> bodies;
+        for (int g : in.Bodies()) bodies.push_back(in.groups[g].id);
+        std::vector<std::string> notes;
+        float used = voxel;
+        int tight = 0, specks = 0, failedAll = 0;
+        std::vector<std::string> split;                  // bodies in several big pieces
+        for (size_t k = 0; k < bodies.size(); k++) {
+            if (c && c->Cancelled()) { r.cancelled = true; return r; }
+            const int body = bodies[k];
+            const std::string name = d.groups[d.GroupIndex(body)].name;
+            if (c) {
+                c->SetStage("Looking for floating bits: " + name);
+                c->SetProgress((float)k / bodies.size());
+            }
+            BodyField f = BodyField::Body(d, body);
+            if (f.Empty()) continue;
+            std::vector<Island> islands = FindIslands([&](Vector3 q) { return f.Distance(q); }, f.bounds, voxel, share, c, &used);
+            int here = 0, failed = 0, big = 0;
+            for (const Island& is : islands) {
+                specks += is.speck;
+                big += !is.speck && !is.remove;
+                if (!is.remove) continue;
+                if (!is.covered) { failed++; continue; }
+                int g = d.AddGroup("Floating bit", body);
+                d.groups[g].op = Op::Cut;
+                d.groups[g].color = d.groups[d.GroupIndex(body)].color;
+                const int gid = d.groups[g].id;
+                for (const BoundingBox& b : is.cover) {
+                    SuperFrustum box;
+                    box.position = Vector3Scale(Vector3Add(b.min, b.max), 0.5f);
+                    box.size = Vector3Subtract(b.max, b.min);
+                    box.rounding = 0.0f;
+                    d.AddShape(box, gid, "Bit cut");
+                }
+                here++;
+                r.removedVolume += is.volume;
+                tight += is.tight > 0;
+            }
+            r.removed += here;
+            failedAll += failed;
+            if (big > 1) {
+                std::string sizes;
+                for (const Island& is : islands)
+                    if (!is.speck && !is.remove) sizes += (sizes.empty() ? "" : ", ") + Utils::Format("%.0f", is.volume);
+                split.push_back(name + " (" + sizes + " mm^3)");
+            }
+            if (here == 0) continue;
+            // looked at again: what is left (a box can only take away what the voxels saw)
+            BodyField after = BodyField::Body(d, body);
+            std::vector<Island> again = FindIslands([&](Vector3 q) { return after.Distance(q); }, after.bounds, used, share, c);
+            int left = 0;
+            for (const Island& is : again) left += is.remove;
+            r.left += left;
+            if (!islands.empty() && !again.empty()) {
+                double change = again[0].volume - islands[0].volume;
+                if (fabs(change) > 0.002 * islands[0].volume)
+                    notes.push_back(Utils::Format("%s's main piece changed by %.1f mm^3 (%.2f%%)", name.c_str(), change, 100.0 * change / islands[0].volume));
+            }
+        }
+        if (c) c->SetProgress(1.0f);
+        if (tight > 0)
+            notes.push_back(Utils::Format("%d of the bits lay within a voxel of the rest of their body: cut up to it (at most half a voxel, "
+                                          "%.2f mm, of the rest can have gone with them)", tight, 0.5f * used));
+        if (failedAll > 0) notes.push_back(Utils::Format("%d bit%s too intricate to box in", failedAll, failedAll == 1 ? " was" : "s were"));
+        if (!split.empty()) {
+            std::string list;
+            for (size_t k = 0; k < split.size(); k++) list += (k ? "; " : "") + split[k];
+            notes.push_back("in big pieces, kept (raise the share to take the smaller away): " + list);
+        }
+        if (specks > 0) notes.push_back(Utils::Format("%d speck%s under 2 voxels across left alone", specks, specks == 1 ? "" : "s"));
+        if (r.removed == 0) {
+            r.message = Utils::Format("No floating bits smaller than %.0f%% of their body's largest piece (looked at in %.2f mm voxels).", 100.0 * share, used);
+            for (const std::string& n : notes) r.message += " Note: " + n + ".";
+            return r;
+        }
+        r.ok = true;
+        r.design = d;
+        r.message = Utils::Format("Removed %d floating bit%s (%.2f mm^3 in all; %.2f mm voxels): each a \"Floating bit\" cut feature in its body.", r.removed,
+                                  r.removed == 1 ? "" : "s", r.removedVolume, used);
+        if (r.left > 0) r.message += Utils::Format(" %d small bit%s still there afterwards.", r.left, r.left == 1 ? " is" : "s are");
+        for (const std::string& n : notes) r.message += " Note: " + n + ".";
+        return r;
+    }
+}

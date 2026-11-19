@@ -38,11 +38,28 @@ namespace Bakugan {
         std::vector<float> enter;        // everyPiece: how far along the ray it enters the piece (-1: it doesn't)
     };
 
+    // Weighted sums of fields at points: what the gradient measures (Loss::Gradient). Each job is one field (one of
+    // `codes`, with its own numbers), placed by xf, at points [start, start + count) of `points` (world xyz; w: the
+    // point's weight); its answer is sum over them of w · field(xf⁻¹ · point).
+    struct EvalJob {
+        int code = 0;
+        std::vector<Vector4> params;
+        Rigid xf;
+        int start = 0, count = 0;
+    };
+    struct EvalRequest {
+        std::vector<std::string> codes;  // bodies of `float map(vec3 p)` (BodyField::Glsl)
+        std::vector<Vector4> points;
+        std::vector<EvalJob> jobs;
+    };
+
     class SilhouetteTracer {
     public:
         virtual ~SilhouetteTracer() = default;
         // Called from the search's thread; false when it couldn't be drawn (the caller draws it on the CPU instead).
         virtual bool Trace(const TraceRequest& request, TraceResult* result) = 0;
+        // The same for fields at points: false (the caller evaluates them itself) when it can't.
+        virtual bool Evaluate(const EvalRequest& request, std::vector<double>* sums) { (void)request; (void)sums; return false; }
         virtual std::string Name() const = 0;
     };
 }

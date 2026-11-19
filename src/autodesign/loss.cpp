@@ -5,6 +5,8 @@
 #include "data/field.hpp"
 #include <raymath.h>
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <atomic>
 #include <cfloat>
 #include <cmath>
@@ -40,6 +42,25 @@ namespace Bakugan {
                     float e1 = (c.x - b.x) * (py - b.y) - (c.y - b.y) * (px - b.x);
                     float e2 = (a.x - c.x) * (py - c.y) - (a.y - c.y) * (px - c.x);
                     if ((e0 >= 0 && e1 >= 0 && e2 >= 0) || (e0 <= 0 && e1 <= 0 && e2 <= 0)) hit[(size_t)y * n + x] = 1;
+                }
+        }
+
+        // The same with a depth buffer: each pixel keeps the nearest depth (za, zb, zc at the corners, interpolated).
+        void FillTriangleDepth(Vector2 a, Vector2 b, Vector2 c, float za, float zb, float zc, int n, std::vector<float>& depth) {
+            const float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+            if (fabsf(area) < 1e-12f) return;
+            int x0 = std::max(0, (int)floorf(fminf(a.x, fminf(b.x, c.x)))), x1 = std::min(n - 1, (int)ceilf(fmaxf(a.x, fmaxf(b.x, c.x))));
+            int y0 = std::max(0, (int)floorf(fminf(a.y, fminf(b.y, c.y)))), y1 = std::min(n - 1, (int)ceilf(fmaxf(a.y, fmaxf(b.y, c.y))));
+            for (int y = y0; y <= y1; y++)
+                for (int x = x0; x <= x1; x++) {
+                    float px = x + 0.5f, py = y + 0.5f;
+                    float wa = ((b.x - px) * (c.y - py) - (b.y - py) * (c.x - px)) / area;
+                    float wb = ((c.x - px) * (a.y - py) - (c.y - py) * (a.x - px)) / area;
+                    float wc = 1.0f - wa - wb;
+                    if (wa < -1e-6f || wb < -1e-6f || wc < -1e-6f) continue;
+                    float z = wa * za + wb * zb + wc * zc;
+                    float& d = depth[(size_t)y * n + x];
+                    if (z < d) d = z;
                 }
         }
     }
@@ -99,6 +120,32 @@ namespace Bakugan {
             for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) FillTriangle(pts[mesh.indices[t]], pts[mesh.indices[t + 1]], pts[mesh.indices[t + 2]], m_Fine, hit);
             for (size_t k = 0; k < hit.size(); k++) m_MeshFine[v][k] = hit[k];
         });
+        // ... and (FitLook::Depth) its front depth along the view, from the frame's centre: covered × depth, so that
+        // resampling it bilinearly and dividing by the coverage resampled the same way gives a depth that edges don't mix
+        // with the background
+        if (DepthFit()) {
+            m_MeshFineZ.assign(n, std::vector<float>((size_t)m_Fine * m_Fine, 0.0f));
+            ParallelFor(n, [&](int v) {
+                std::vector<float> depth((size_t)m_Fine * m_Fine, FLT_MAX);
+                std::vector<Vector2> pts(mesh.positions.size());
+                std::vector<float> zs(mesh.positions.size());
+                const View& w = m_Views[v];
+                for (size_t i = 0; i < pts.size(); i++) {
+                    Vector3 q = Vector3Subtract(mesh.positions[i], m_Centre);
+                    pts[i] = { (Vector3DotProduct(q, w.u) / m_Half + 1.0f) * 0.5f * m_Fine, (1.0f - Vector3DotProduct(q, w.v) / m_Half) * 0.5f * m_Fine };
+                    zs[i] = Vector3DotProduct(q, w.dir);
+                }
+                for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
+                    unsigned a = mesh.indices[t], b = mesh.indices[t + 1], c = mesh.indices[t + 2];
+                    FillTriangleDepth(pts[a], pts[b], pts[c], zs[a], zs[b], zs[c], m_Fine, depth);
+                }
+                for (size_t k = 0; k < depth.size(); k++)
+                    m_MeshFineZ[v][k] = m_MeshFine[v][k] > 0.0f && depth[k] < FLT_MAX ? depth[k] : 0.0f;
+                // (a pixel the coverage pass filled but the depth pass missed, on a sliver's edge: the coverage goes too)
+                for (size_t k = 0; k < depth.size(); k++)
+                    if (depth[k] == FLT_MAX) m_MeshFine[v][k] = 0.0f;
+            });
+        }
 
         // the collisions' sample points
         std::mt19937 rng(p.seed * 31u + 7u);
@@ -110,6 +157,7 @@ namespace Bakugan {
         }
         if (p.semanticWeight > 0.0f) SetUpSemantic(mesh);
         m_Target = TargetSilhouettes(m_Placed);
+        if (DepthFit()) m_TargetDepth = TargetDepths(m_Placed);
         if (m_Dino) m_SemTarget = SemanticTargets(m_Placed);
     }
 
@@ -157,6 +205,37 @@ namespace Bakugan {
                     out[v][(size_t)y * m_Res + x] = 0.25f * sum;
                 }
         return out;
+    }
+
+    std::vector<std::vector<float>> Loss::TargetDepths(const Placement& t) const {
+        const int nv = (int)m_Views.size();
+        std::vector<std::vector<float>> out(nv, std::vector<float>((size_t)m_Res * m_Res, 0.0f));
+        if (m_MeshFineZ.size() != (size_t)nv) return out;
+        for (int v = 0; v < nv; v++) {
+            const View& w = m_Views[v];
+            // a point of the mesh at depth z (unplaced) is, placed, at shift + scale · (z - zc)
+            const float zc = Vector3DotProduct(Vector3Subtract(m_MeshCentre, m_Centre), w.dir);
+            const float shift = Vector3DotProduct(Vector3Subtract(Vector3Add(m_MeshCentre, t.offset), m_Centre), w.dir);
+            for (int y = 0; y < m_Res; y++)
+                for (int x = 0; x < m_Res; x++) {
+                    float cover = 0.0f, coverZ = 0.0f;
+                    for (int k = 0; k < 4; k++) {                // 2 x 2 samples a pixel, as for the silhouettes
+                        float sx = ((x + 0.25f + 0.5f * (k & 1)) / m_Res * 2.0f - 1.0f) * m_Half, sy = (1.0f - (y + 0.25f + 0.5f * (k >> 1)) / m_Res * 2.0f) * m_Half;
+                        Vector2 b = Unplace(w, sx, sy, t);
+                        float fx = (b.x / m_Half + 1.0f) * 0.5f * m_Fine, fy = (1.0f - b.y / m_Half) * 0.5f * m_Fine;
+                        cover += Bilinear(m_MeshFine[v], m_Fine, fx, fy);
+                        coverZ += Bilinear(m_MeshFineZ[v], m_Fine, fx, fy);
+                    }
+                    out[v][(size_t)y * m_Res + x] = cover > 1e-6f ? shift + t.scale * (coverZ / cover - zc) : 0.0f;
+                }
+        }
+        return out;
+    }
+
+    float Loss::DepthCost(float dz, float* slope) const {
+        const float s = fmaxf(m_P.depthScale, 1e-4f) * m_L, s2 = s * s, d2 = dz * dz;
+        if (slope) *slope = 2.0f * dz * s2 / ((d2 + s2) * (d2 + s2));
+        return d2 / (d2 + s2);
     }
 
     Placement Loss::KeepTargetInFrame(Placement t) const {
@@ -244,7 +323,8 @@ namespace Bakugan {
         s.surface = SurfaceTerm(c, &s.surfaceCarved);
         s.total += m_P.surfaceWeight * s.surface;
         if (!grad || ps.empty() || !s.valid) return s;
-        Gradient(c, target, bodyOf, b, slopes, shades, ps, *grad);
+        s.gradientTraced = Gradient(c, target, bodyOf, b, slopes, shades, ps, *grad, &s);
+        const auto placing = std::chrono::steady_clock::now();
 
         // the placement: the targets drawn again with it nudged two units either way, against the design as drawn
         const float silhouette = std::max(0.0f, m_P.silhouetteWeight);
@@ -257,7 +337,11 @@ namespace Bakugan {
                 Placement t = target;
                 Set(cc, t, ps[j], Get(c, target, ps[j]) + (side == 0 ? 2.0f : -2.0f) * ps[j].unit, m_L);   // (2 units: the silhouettes wiggle finer)
                 value[side] = Get(cc, t, ps[j]);
-                if (silhouette > 0.0f) loss[side] += silhouette * FitLoss(TargetSilhouettes(t));
+                if (silhouette > 0.0f) {
+                    std::vector<std::vector<float>> depths;
+                    if (DepthFit()) depths = TargetDepths(t);
+                    loss[side] += silhouette * FitLoss(TargetSilhouettes(t), DepthFit() ? &depths : nullptr);
+                }
                 if (m_Dino && m_SemGradTarget.size() == m_SemDrawn.size()) {
                     std::vector<std::vector<float>> pictures = SemanticTargets(t);
                     const size_t px = (size_t)m_SemRes * m_SemRes;
@@ -268,6 +352,7 @@ namespace Bakugan {
             float step = value[0] - value[1];
             if (step > 0.0f) (*grad)[j] = (float)((loss[0] - loss[1]) / step) * ps[j].unit;
         }
+        s.msPlacement = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - placing).count();
         return s;
     }
 
@@ -294,6 +379,7 @@ namespace Bakugan {
             target.scale != m_Placed.scale) {
             m_Placed = target;
             m_Target = TargetSilhouettes(target);
+            if (DepthFit()) m_TargetDepth = TargetDepths(target);
             if (m_Dino) m_SemTarget = SemanticTargets(target);
         }
         if (b.fields.empty()) return s;
@@ -315,9 +401,19 @@ namespace Bakugan {
 
         Slopes slopes(b.fields.size());
         Shades shades(b.fields.size());
-        Silhouettes(b, s, slopes);
+        auto t0 = std::chrono::steady_clock::now();
+        auto ms = [](std::chrono::steady_clock::time_point& t) {
+            auto now = std::chrono::steady_clock::now();
+            float d = std::chrono::duration<float, std::milli>(now - t).count();
+            t = now;
+            return d;
+        };
+        Silhouettes(b, s, slopes);              // (and, with FitLook::Depth, the depth rasters)
+        s.msViews = ms(t0);
         if (m_Dino) Semantics(b, s, slopes, shades);
+        s.msSemantic = ms(t0);
         if (m_P.collisionWeight > 0.0f) Collisions(d, b, s, slopes, phase);
+        s.msCollisions = ms(t0);
         Hinges(d, b, s);
         if (m_P.dependencies) Dependencies(d, b, s, slopes);
         s.total = std::max(0.0f, m_P.silhouetteWeight) * (s.fit + s.coveragePenalty) + (m_Dino ? m_P.semanticWeight * s.semantic : 0.0f) +
@@ -345,15 +441,38 @@ namespace Bakugan {
         who.assign((size_t)nv * px, -1);
         at.assign((size_t)nv * px, { 0, 0, 0 });
         m_Cover.assign((size_t)nv * px, 0.0f);
-        *traced = m_P.gpu && DrawTraced(b, who, at);
+        // with depths: on the GPU, every piece's results (where rays enter them too); else here
+        const bool depth = DepthFit();
+        std::vector<std::vector<DepthLayer>> rows;
+        if (depth) {
+            m_Z.assign((size_t)nv * px, 0.0f);
+            m_ZA.assign((size_t)nv * px, 0.0f);
+            m_ZLayers.clear();
+            rows.resize((size_t)nv * m_Res);
+        }
+        *traced = m_P.gpu && (depth ? DrawTracedDepth(b, who, at) : DrawTraced(b, who, at));
         if (*traced) return;
+        if (depth) {                                     // (a failed GPU attempt may have left some behind)
+            std::fill(m_Cover.begin(), m_Cover.end(), 0.0f);
+            std::fill(who.begin(), who.end(), -1);
+            std::fill(m_Z.begin(), m_Z.end(), 0.0f);
+            std::fill(m_ZA.begin(), m_ZA.end(), 0.0f);
+            m_ZLayers.clear();
+        }
         ParallelFor(nv * m_Res, [&](int task) {               // every row of every view
             int v = task / m_Res, y = task % m_Res;
+            std::vector<DepthLayer> layers;
             for (int x = 0; x < m_Res; x++) {
                 size_t k = (size_t)v * px + (size_t)y * m_Res + x;
+                layers.clear();
                 for (size_t i = 0; i < b.fields.size(); i++) {
-                    Vector3 p;
-                    float dmin = Trace(b.fields[i], b.box[i], b.xf[0][b.group[i]], m_Views[v], FrameX(x, m_Res), FrameY(y, m_Res), m_Tau, &p);
+                    Vector3 p, hit = { NAN, NAN, NAN };       // (set only where the ray steps inside)
+                    const float none = FLT_MAX;
+                    float dmin = Trace(b.fields[i], b.box[i], b.xf[0][b.group[i]], m_Views[v], FrameX(x, m_Res), FrameY(y, m_Res), m_Tau, &p,
+                                       depth ? &hit : nullptr);
+                    if (depth && dmin < 0.0f && dmin != none && !std::isnan(hit.x))     // a layer: a piece the ray enters
+                        layers.push_back({ (int)k, (int)i, Vector3DotProduct(Vector3Subtract(hit, m_Centre), m_Views[v].dir),
+                                           std::clamp(-dmin / m_Tau, 0.0f, 1.0f), hit, p });
                     float c = std::clamp(0.5f - dmin / (2.0f * m_Tau), 0.0f, 1.0f);
                     if (c > m_Cover[k]) {
                         m_Cover[k] = c;
@@ -361,11 +480,84 @@ namespace Bakugan {
                         at[k] = p;
                     }
                 }
+                if (!layers.empty()) CompositeDepth(k, layers, rows[task]);
             }
         });
+        if (depth)
+            for (const std::vector<DepthLayer>& row : rows) m_ZLayers.insert(m_ZLayers.end(), row.begin(), row.end());
     }
 
     // The same drawing by the tracer: every piece's field as GLSL, marched there the way Trace marches it here.
+    void Loss::CompositeDepth(size_t k, std::vector<DepthLayer>& layers, std::vector<DepthLayer>& row) {
+        std::sort(layers.begin(), layers.end(), [](const DepthLayer& a, const DepthLayer& c) { return a.z < c.z; });
+        if (layers.size() > 4) layers.resize(4);
+        float through = 1.0f, A = 0.0f, Z = 0.0f;
+        for (const DepthLayer& l : layers) {
+            float w = l.alpha * through;
+            A += w;
+            Z += w * l.z;
+            through *= 1.0f - l.alpha;
+        }
+        if (A <= 0.0f) return;
+        m_ZA[k] = A;
+        m_Z[k] = Z / A;
+        row.insert(row.end(), layers.begin(), layers.end());
+    }
+
+    // The depth fit's drawing on the GPU: every piece's own results per pixel (as the semantic pictures are drawn), from
+    // which the cover (the piece covering a pixel most) and the depth layers (the pieces a ray enters) come, as here.
+    bool Loss::DrawTracedDepth(const Bodies& b, std::vector<int>& who, std::vector<Vector3>& at) {
+        const int nv = (int)m_Views.size(), px = m_Res * m_Res, nb = (int)b.fields.size();
+        if (nb == 0) return false;
+        TraceRequest rq;
+        rq.centre = m_Centre;
+        rq.half = m_Half;
+        rq.res = m_Res;
+        rq.tau = m_Tau;
+        rq.everyPiece = true;
+        for (const View& w : m_Views) rq.views.push_back({ w.dir, w.u, w.v });
+        for (int i = 0; i < nb; i++) {
+            TracePiece piece;
+            piece.code = b.fields[i].Glsl(&piece.params);
+            piece.box = b.box[i];
+            piece.xf = b.xf[0][b.group[i]];
+            rq.pieces.push_back(std::move(piece));
+        }
+        TraceResult r;
+        const size_t n = (size_t)nb * nv * px;
+        if (!m_P.gpu->Trace(rq, &r) || r.nearest.size() != n || r.along.size() != n || r.enter.size() != n || r.piece.size() != n) return false;
+        std::vector<std::vector<DepthLayer>> rows((size_t)nv * m_Res);
+        ParallelFor(nv * m_Res, [&](int task) {
+            int v = task / m_Res, y = task % m_Res;
+            const View& w = m_Views[v];
+            std::vector<DepthLayer> layers;
+            for (int x = 0; x < m_Res; x++) {
+                const size_t k = (size_t)v * px + (size_t)y * m_Res + x;
+                layers.clear();
+                for (int i = 0; i < nb; i++) {
+                    const size_t g = ((size_t)i * nv + v) * px + (size_t)y * m_Res + x;
+                    if (r.piece[g] < 0) continue;
+                    const Vector3 o = RayStart(b.box[i], w, FrameX(x, m_Res), FrameY(y, m_Res));
+                    const float dmin = r.nearest[g];
+                    const Vector3 p = Vector3Add(o, Vector3Scale(w.dir, r.along[g]));
+                    const float c = std::clamp(0.5f - dmin / (2.0f * m_Tau), 0.0f, 1.0f);
+                    if (c > m_Cover[k]) {
+                        m_Cover[k] = c;
+                        who[k] = i;
+                        at[k] = p;
+                    }
+                    if (dmin < 0.0f && r.enter[g] >= 0.0f) {
+                        const Vector3 hit = Vector3Add(o, Vector3Scale(w.dir, r.enter[g]));
+                        layers.push_back({ (int)k, i, Vector3DotProduct(Vector3Subtract(hit, m_Centre), w.dir), std::clamp(-dmin / m_Tau, 0.0f, 1.0f), hit, p });
+                    }
+                }
+                if (!layers.empty()) CompositeDepth(k, layers, rows[task]);
+            }
+        });
+        for (const std::vector<DepthLayer>& row : rows) m_ZLayers.insert(m_ZLayers.end(), row.begin(), row.end());
+        return true;
+    }
+
     bool Loss::DrawTraced(const Bodies& b, std::vector<int>& who, std::vector<Vector3>& at) {
         const int nv = (int)m_Views.size(), px = m_Res * m_Res;
         TraceRequest rq;
@@ -404,6 +596,13 @@ namespace Bakugan {
         std::vector<int> who;
         std::vector<Vector3> at;
         Draw(b, who, at, &s.traced);
+        const bool depth = DepthFit() && m_Z.size() == m_Cover.size() && m_TargetDepth.size() == m_Views.size();
+        std::vector<size_t> layerStart;                  // where each pixel's layers start in m_ZLayers (and end: the next)
+        if (depth) {
+            layerStart.assign((size_t)nv * px + 1, 0);
+            for (const DepthLayer& l : m_ZLayers) layerStart[l.pixel + 1]++;
+            for (size_t k = 1; k < layerStart.size(); k++) layerStart[k] += layerStart[k - 1];
+        }
 
         const float minCover = std::clamp(m_P.minViewCoverage, 0.0f, 1.0f), silhouette = std::max(0.0f, m_P.silhouetteWeight);
         const float weight = 1.0f / nv;
@@ -438,6 +637,62 @@ namespace Bakugan {
             }
             if (tsum <= 0.0) continue;
             float cover = (float)(hit / tsum), extra = (float)(spill / tsum);
+            // depth rasters: where both cover a pixel, how far apart their front surfaces are: min(T, A) · cost(z - Tz)
+            if (depth) {
+                double mismatch = 0.0;
+                const std::vector<float>& Tz = m_TargetDepth[v];
+                for (int k = 0; k < px; k++) {
+                    size_t kk = (size_t)v * px + k;
+                    const float A = m_ZA[kk];
+                    if (T[k] <= 0.0f || A <= 0.0f) continue;
+                    float slope;
+                    const float cost = DepthCost(m_Z[kk] - Tz[k], &slope), cover = fminf(T[k], A);
+                    mismatch += cover * cost;
+                    if (silhouette <= 0.0f) continue;
+                    // slopes, per layer i (nearest first): through its depth z_i (at where its ray enters it), and its
+                    // opacity alpha_i (at its edge's point: d alpha / d distance = -1 / tau, between 0 and 1)
+                    const float scale = silhouette * weight / (float)tsum;
+                    const size_t first = layerStart[kk], end = layerStart[kk + 1], n = end - first;
+                    float alpha[4], w[4], z[4];
+                    for (size_t a = 0; a < n; a++) { alpha[a] = m_ZLayers[first + a].alpha; z[a] = m_ZLayers[first + a].z; }
+                    for (size_t a = 0; a < n; a++) {
+                        w[a] = alpha[a];
+                        for (size_t j = 0; j < a; j++) w[a] *= 1.0f - alpha[j];
+                    }
+                    const float Z = m_Z[kk];
+                    for (size_t a = 0; a < n; a++) {
+                        const DepthLayer& l = m_ZLayers[first + a];
+                        // through z_a
+                        const float dz = scale * cover * slope * w[a] / A;
+                        if (dz != 0.0f) {
+                            const Rigid& xf = b.xf[0][b.group[l.field]];
+                            Quaternion inv = { -xf.rotation.x, -xf.rotation.y, -xf.rotation.z, xf.rotation.w };
+                            Vector3 q = xf.ApplyInverse(l.hit), dl = Vector3RotateByQuaternion(m_Views[v].dir, inv);
+                            const float h = 0.25f * m_Tau;
+                            float along = (b.fields[l.field].Distance(Vector3Add(q, Vector3Scale(dl, h))) -
+                                           b.fields[l.field].Distance(Vector3Subtract(q, Vector3Scale(dl, h)))) / (2.0f * h);
+                            // raising the distance at the entry by e pushes the entry back by e / |d distance / d t|
+                            if (along < -0.2f) slopes[l.field].push_back({ 0, l.hit, dz / -along });
+                        }
+                        // through alpha_a: d w_a = prod_{j<a}(1 - alpha_j); d w_c (c > a) = -alpha_c prod_{j<c, j != a}(1 - alpha_j)
+                        if (alpha[a] <= 0.0f || alpha[a] >= 1.0f) continue;
+                        float dA = 1.0f, dZw = 0.0f;
+                        for (size_t j = 0; j < a; j++) dA *= 1.0f - alpha[j];
+                        dZw = dA * (z[a] - Z);
+                        for (size_t c = a + 1; c < n; c++) {
+                            float dw = -alpha[c];
+                            for (size_t j = 0; j < c; j++)
+                                if (j != a) dw *= 1.0f - alpha[j];
+                            dA += dw;
+                            dZw += dw * (z[c] - Z);
+                        }
+                        const float dCost = (A < T[k] ? cost * dA : 0.0f) + cover * slope * dZw / A;
+                        if (dCost != 0.0f) slopes[l.field].push_back({ 0, l.at, scale * dCost * (-1.0f / m_Tau) });
+                    }
+                }
+                s.depth += (float)(mismatch / tsum) / nv;
+                lossSum += mismatch / tsum;
+            }
             lossSum += (1.0f - cover) + extra;
             coverSum += cover;
             extraSum += extra;
@@ -449,8 +704,9 @@ namespace Bakugan {
                 size_t kk = (size_t)v * px + k;
                 float c = D[k], t = T[k];
                 int i = who[kk];
-                if (i < 0 || c <= 0.0f || c >= 1.0f || c == t) continue;     // not on an edge, or no slope
-                float dD = c < t ? (float)((-weight - (shortOf ? 10.0f : 0.0f)) / tsum) : (float)(weight / tsum);
+                if (i < 0 || c <= 0.0f || c >= 1.0f) continue;               // not on an edge
+                float dD = c < t ? (float)((-weight - (shortOf ? 10.0f : 0.0f)) / tsum) : c > t ? (float)(weight / tsum) : 0.0f;
+                if (dD == 0.0f) continue;
                 slopes[i].push_back({ 0, at[kk], silhouette * dD * (-1.0f / (2.0f * m_Tau)) });
             }
         }
@@ -460,7 +716,7 @@ namespace Bakugan {
     }
 
     // The silhouettes' part of the loss (fit + coverage penalty) for the last drawing, against other targets.
-    float Loss::FitLoss(const std::vector<std::vector<float>>& target) const {
+    float Loss::FitLoss(const std::vector<std::vector<float>>& target, const std::vector<std::vector<float>>* depth) const {
         const int nv = (int)m_Views.size(), px = m_Res * m_Res;
         const float minCover = std::clamp(m_P.minViewCoverage, 0.0f, 1.0f);
         if (m_Cover.size() != (size_t)nv * px) return 0.0f;
@@ -468,15 +724,19 @@ namespace Bakugan {
         for (int v = 0; v < nv; v++) {
             const float* D = m_Cover.data() + (size_t)v * px;
             double tsum = 0.0, hit = 0.0, spill = 0.0;
+            double mismatch = 0.0;
+            const bool z = depth && DepthFit() && m_Z.size() == m_Cover.size();
             for (int k = 0; k < px; k++) {
                 float t = target[v][k];
                 tsum += t;
                 hit += fminf(t, D[k]);
                 spill += fmaxf(0.0f, D[k] - t);
+                size_t kk = (size_t)v * px + k;
+                if (z && t > 0.0f && m_ZA[kk] > 0.0f) mismatch += fminf(t, m_ZA[kk]) * DepthCost(m_Z[kk] - (*depth)[v][k], nullptr);
             }
             if (tsum <= 0.0) continue;
             double cover = hit / tsum;
-            loss += ((1.0 - cover) + spill / tsum) / nv + 10.0 * fmax(0.0, minCover - cover);
+            loss += ((1.0 - cover) + spill / tsum + mismatch / tsum) / nv + 10.0 * fmax(0.0, minCover - cover);
         }
         return (float)loss;
     }
@@ -807,55 +1067,100 @@ namespace Bakugan {
     // the poses (a joint's) rebuilt, the distance measured again. The hinge term is measured again directly, for the
     // joints the parameter touches. The poses' times stay as they were (the checks are placed by the design, not part
     // of what is moved).
-    void Loss::Gradient(const Carving& c, const Placement& target, const std::vector<int>& bodyOf, const Bodies& b, const Slopes& slopes,
-                        const Shades& shades, const std::vector<Param>& ps, std::vector<float>& grad) {
+    // The gradient by central differences: each parameter nudged a tenth of its unit either way, and every slope's
+    // point measured again in the field (and pose) it then has. Those measurements (by far the most of the work: a few
+    // per slope point per parameter that touches its piece) go to the GPU when there is one, all in one request (the
+    // fields' GLSL with each nudge's numbers: the code is the same, only its uniforms change); the CPU makes them
+    // otherwise, or when the GPU can't. Shades, the hinge and surface terms are measured here either way. True when the
+    // GPU made them.
+    bool Loss::Gradient(const Carving& c, const Placement& target, const std::vector<int>& bodyOf, const Bodies& b, const Slopes& slopes,
+                        const Shades& shades, const std::vector<Param>& ps, std::vector<float>& grad, AutoScore* score) {
+        using Clock = std::chrono::steady_clock;
+        const auto began = Clock::now();
+        const size_t nf = b.fields.size();
+        const int poses = (int)b.times.size();
+        // the slopes' points (world; w: the weight), piece by piece and pose by pose
+        std::vector<Vector4> points;
+        std::vector<std::vector<std::pair<int, int>>> range(nf, std::vector<std::pair<int, int>>(poses, { 0, 0 }));
+        for (size_t i = 0; i < nf; i++)
+            for (int pose = 0; pose < poses; pose++) {
+                const int start = (int)points.size();
+                for (const Slope& sl : slopes[i])
+                    if (sl.pose == pose) points.push_back({ sl.at.x, sl.at.y, sl.at.z, sl.weight });
+                range[i][pose] = { start, (int)points.size() - start };
+            }
+        const bool gpu = m_P.gpu != nullptr && !points.empty();
+        std::vector<std::string> baseCode(gpu ? nf : 0);
+        std::vector<std::vector<Vector4>> baseParams(gpu ? nf : 0);
+        if (gpu)
+            for (size_t i = 0; i < nf; i++) baseCode[i] = b.fields[i].Glsl(&baseParams[i]);
+
+        // a side of a parameter's difference: what the CPU measured, and (for the GPU) what its jobs need
+        struct Side {
+            double sum = 0.0;
+            float value = 0.0f;
+            std::vector<BodyField> changed;              // the pieces whose fields the nudge changes
+            std::vector<int> changedOf;                  // per piece: its index in changed, or -1
+            std::vector<std::vector<Vector4>> params;    // ... their GLSL numbers (and code, where it isn't the piece's)
+            std::vector<std::string> code;
+            std::vector<std::vector<Rigid>> xf;          // every pose's transforms after the nudge
+        };
+        std::vector<std::array<Side, 2>> work(ps.size());
+        std::vector<char> live(ps.size(), 0);
+
         ParallelFor((int)ps.size(), [&](int j) {
             const Param& p = ps[j];
             if (p.kind == Param::Target) return;            // the placement's: see Evaluate
             bool ok = false;
             float base = Get(c, target, p, &ok);
             if (!ok) return;
-            double sum[2] = { 0.0, 0.0 };
-            float value[2] = { 0.0f, 0.0f };
+            live[j] = 1;
             for (int side = 0; side < 2; side++) {
+                Side& w = work[j][side];
                 Carving e = c;
                 Placement t = target;
                 Set(e, t, p, base + (side == 0 ? 0.1f : -0.1f) * p.unit, m_L);
-                value[side] = Get(e, t, p);
+                w.value = Get(e, t, p);
                 Tidy(e);
                 Design de = e.Build();
-                std::vector<std::vector<Rigid>> xf;
-                for (float time : b.times) xf.push_back(de.Transforms(time, true));
+                for (float time : b.times) w.xf.push_back(de.Transforms(time, true));
                 // a cutter's parameter changes the fields of the pieces it shapes
-                std::vector<int> changedOf(b.fields.size(), -1);
-                std::vector<BodyField> changed;
+                w.changedOf.assign(nf, -1);
                 if (p.kind == Param::Cutter)
                     for (int k : e.PiecesUsing(p.id)) {
-                        changedOf[k] = (int)changed.size();
-                        changed.push_back(BodyField::Body(de, bodyOf[k]));
+                        w.changedOf[k] = (int)w.changed.size();
+                        w.changed.push_back(BodyField::Body(de, bodyOf[k]));
                     }
-                auto field = [&](size_t i) -> const BodyField& { return changedOf[i] >= 0 ? changed[changedOf[i]] : b.fields[i]; };
-                for (size_t i = 0; i < b.fields.size(); i++) {
-                    for (const Slope& sl : slopes[i]) {
-                        const Rigid& before = b.xf[sl.pose][b.group[i]];
-                        const Rigid& after = xf[sl.pose][b.group[i]];
-                        bool poseMoves = memcmp(&before, &after, sizeof(Rigid)) != 0;
-                        if (changedOf[i] < 0 && !poseMoves) continue;   // this parameter doesn't touch it
-                        sum[side] += sl.weight * field(i).Distance(after.ApplyInverse(sl.at));
+                auto field = [&](size_t i) -> const BodyField& { return w.changedOf[i] >= 0 ? w.changed[w.changedOf[i]] : b.fields[i]; };
+                if (gpu)
+                    for (size_t k = 0; k < w.changed.size(); k++) {
+                        w.params.emplace_back();
+                        std::string code = w.changed[k].Glsl(&w.params.back());
+                        size_t i = std::find(w.changedOf.begin(), w.changedOf.end(), (int)k) - w.changedOf.begin();
+                        w.code.push_back(code == baseCode[i] ? std::string() : code);
                     }
+                for (size_t i = 0; i < nf; i++) {
+                    if (!gpu)
+                        for (const Slope& sl : slopes[i]) {
+                            const Rigid& before = b.xf[sl.pose][b.group[i]];
+                            const Rigid& after = w.xf[sl.pose][b.group[i]];
+                            bool poseMoves = memcmp(&before, &after, sizeof(Rigid)) != 0;
+                            if (w.changedOf[i] < 0 && !poseMoves) continue;   // this parameter doesn't touch it
+                            w.sum += sl.weight * field(i).Distance(after.ApplyInverse(sl.at));
+                        }
                     // the semantic pixels' shades: the surface point slid along its ray, and shaded again
                     for (const Shade& sh : shades[i]) {
                         const Rigid& before = b.xf[sh.pose][b.group[i]];
-                        const Rigid& after = xf[sh.pose][b.group[i]];
+                        const Rigid& after = w.xf[sh.pose][b.group[i]];
                         bool poseMoves = memcmp(&before, &after, sizeof(Rigid)) != 0;
-                        if (changedOf[i] < 0 && !poseMoves) continue;
-                        sum[side] += sh.weight * ShadeAt(field(i), after, sh);
+                        if (w.changedOf[i] < 0 && !poseMoves) continue;
+                        w.sum += sh.weight * ShadeAt(field(i), after, sh);
                     }
                 }
                 // the surface term, for a hollow's parameter
                 if (p.kind == Param::Cutter && m_P.surfaceWeight > 0.0f) {
                     int k = e.CutterIndex(p.id);
-                    if (k >= 0 && e.cutters[k].hollow) sum[side] += m_P.surfaceWeight * SurfaceTerm(e);
+                    if (k >= 0 && e.cutters[k].hollow) w.sum += m_P.surfaceWeight * SurfaceTerm(e);
                 }
                 // the hinge term, for the joints this parameter touches: a pivot it moves, or a piece whose field it changes
                 if (m_P.hingeWeight > 0.0f)
@@ -864,13 +1169,86 @@ namespace Bakugan {
                         int pi = pg >= 0 ? b.fieldOf[pg] : -1, ci = cg >= 0 ? b.fieldOf[cg] : -1;
                         if (pi < 0 || ci < 0) continue;
                         bool pivotMoves = p.kind == Param::Joint && h.name == "Joint " + std::to_string(p.id) && p.field < 6;   // pivot or axis
-                        if (!pivotMoves && changedOf[pi] < 0 && changedOf[ci] < 0) continue;
-                        sum[side] += HingeWeight() * HingeCost(h, field(pi), field(ci));
+                        if (!pivotMoves && w.changedOf[pi] < 0 && w.changedOf[ci] < 0) continue;
+                        w.sum += HingeWeight() * HingeCost(h, field(pi), field(ci));
                     }
+                if (!gpu) {                              // (what the GPU would have needed: not kept)
+                    w.changed.clear();
+                    w.xf.clear();
+                }
             }
-            float step = value[0] - value[1];
-            if (step > 0.0f) grad[j] = (float)((sum[0] - sum[1]) / step) * p.unit;    // per unit of the parameter
         });
+
+        const auto prepared = Clock::now();
+        // the slopes' measurements: every (parameter, side, piece, pose) they touch, a job
+        bool traced = false;
+        if (gpu) {
+            EvalRequest rq;
+            rq.points = std::move(points);
+            rq.codes = baseCode;                         // code i: piece i's
+            struct Owner {
+                int j, side, piece, pose;
+            };
+            std::vector<Owner> owners;
+            for (size_t j = 0; j < ps.size(); j++) {
+                if (!live[j]) continue;
+                for (int side = 0; side < 2; side++) {
+                    const Side& w = work[j][side];
+                    for (size_t i = 0; i < nf; i++)
+                        for (int pose = 0; pose < poses; pose++) {
+                            const auto [start, count] = range[i][pose];
+                            if (count == 0) continue;
+                            const Rigid& before = b.xf[pose][b.group[i]];
+                            const Rigid& after = w.xf[pose][b.group[i]];
+                            const int k = w.changedOf[i];
+                            if (k < 0 && memcmp(&before, &after, sizeof(Rigid)) == 0) continue;
+                            EvalJob job;
+                            job.code = (int)i;
+                            if (k >= 0 && !w.code[k].empty()) {
+                                job.code = (int)rq.codes.size();
+                                rq.codes.push_back(w.code[k]);
+                            }
+                            job.params = k >= 0 ? w.params[k] : baseParams[i];
+                            job.xf = after;
+                            job.start = start;
+                            job.count = count;
+                            rq.jobs.push_back(std::move(job));
+                            owners.push_back({ (int)j, side, (int)i, pose });
+                        }
+                }
+            }
+            std::vector<double> sums;
+            traced = m_P.gpu->Evaluate(rq, &sums) && sums.size() == rq.jobs.size();
+            if (traced) {
+                for (size_t q = 0; q < owners.size(); q++) work[owners[q].j][owners[q].side].sum += sums[q];
+            } else {                                     // the GPU couldn't: the same jobs here
+                std::vector<double> here(owners.size(), 0.0);
+                ParallelFor((int)owners.size(), [&](int q) {
+                    const Owner& o = owners[q];
+                    const Side& w = work[o.j][o.side];
+                    const BodyField& f = w.changedOf[o.piece] >= 0 ? w.changed[w.changedOf[o.piece]] : b.fields[o.piece];
+                    const EvalJob& job = rq.jobs[q];
+                    double s = 0.0;
+                    for (int k = job.start; k < job.start + job.count; k++) {
+                        const Vector4& pt = rq.points[k];
+                        s += pt.w * f.Distance(job.xf.ApplyInverse({ pt.x, pt.y, pt.z }));
+                    }
+                    here[q] = s;
+                });
+                for (size_t q = 0; q < owners.size(); q++) work[owners[q].j][owners[q].side].sum += here[q];
+            }
+        }
+
+        if (score) {
+            score->msPrepare = std::chrono::duration<float, std::milli>(prepared - began).count();
+            score->msMeasure = std::chrono::duration<float, std::milli>(Clock::now() - prepared).count();
+        }
+        for (size_t j = 0; j < ps.size(); j++) {
+            if (!live[j]) continue;
+            float step = work[j][0].value - work[j][1].value;
+            if (step > 0.0f) grad[j] = (float)((work[j][0].sum - work[j][1].sum) / step) * ps[j].unit;    // per unit of the parameter
+        }
+        return traced;
     }
 
     // ---- the picture for the UI ---------------------------------------------------------------------------------------

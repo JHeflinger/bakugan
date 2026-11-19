@@ -55,12 +55,12 @@ settings: goal.views: must be between 1 and 64, got 0
 | section | what | the editor's |
 |---|---|---|
 | `[input]` | `mesh`, `mesh_size` (centre and scale to this many mm; 0 = as the file is) | Model tab |
-| `[goal]` | views, collisions, hinges, dependencies, surface, mesh move/scale | Goal |
+| `[goal]` | `fit_look` (silhouette or depth rasters), `depth_scale`, views, collisions, hinges, dependencies, surface, mesh move/scale | Goal |
 | `[start]` | `sphere_diameter`; `design`: a saved design to carry on from (`--start`) | Start from |
 | `[semantic]` | DINOv3 loss, silhouette weight | Semantic loss |
 | `[optimizer]` | steps, learning rate, rounds, lookahead, limits, seed | Optimizer |
-| `[grammar]` | one weight per rewrite rule | Grammar |
-| `[finishing]` | hinges, carving, latch | Finishing |
+| `[grammar]` | one weight per rewrite rule (`add_a_cut`, ..., `split`) | Grammar |
+| `[finishing]` | hinges, carving, latch, `remove_floating` (+ `floating_share`, `floating_voxel`) | Finishing |
 | `[suite]` | folder, mesh size, video | the suite's panel |
 | `[output]` | where results go, which files | new |
 | `[runtime]` | threads, progress interval | new |

@@ -222,6 +222,7 @@ namespace {
         t += Utils::Format("  surface carved       %.1f%%\n", s.surfaceCarved * 100.0f);
         t += Utils::Format("  hinges off pieces    %.4f   (farthest a piece is from an axis: %.2f mm)\n", s.hinges, s.hingeGap);
         if (s.dependents > 0) t += Utils::Format("  held hinges          %d of %d have a holder in reach\n", s.holdable, s.dependents);
+        if (s.depth > 0.0f) t += Utils::Format("  depth mismatch       %.4f\n", s.depth);
         if (s.semantic > 0.0f) t += Utils::Format("  DINOv3               %.4f   (worst view %.4f)\n", s.semantic, s.worstSemantic);
         t += Utils::Format("  mesh placed          scaled %.3fx, moved %.2f mm\n", s.target.scale, Vector3Length(s.target.offset));
         return t;
@@ -245,9 +246,9 @@ namespace {
     std::string ScoreJson(const AutoScore& s) {
         return Utils::Format("{\"loss\": %.6g, \"fit\": %.6g, \"cover\": %.6g, \"extra\": %.6g, \"worst_view\": %.6g, \"collision\": %.6g, "
                              "\"overlap_open\": %.6g, \"overlap_motion\": %.6g, \"surface_carved\": %.6g, \"hinges\": %.6g, "
-                             "\"dependency\": %.6g, \"semantic\": %.6g, \"mesh_scale\": %.6g, \"mesh_moved_mm\": %.6g}",
+                             "\"dependency\": %.6g, \"depth\": %.6g, \"semantic\": %.6g, \"mesh_scale\": %.6g, \"mesh_moved_mm\": %.6g}",
                              s.total, s.fit, s.viewCover, s.viewExtra, s.worstView, s.collision, s.clashOpen, s.clashMotion,
-                             s.surfaceCarved, s.hinges, s.dependency, s.semantic, s.target.scale, Vector3Length(s.target.offset));
+                             s.surfaceCarved, s.hinges, s.dependency, s.depth, s.semantic, s.target.scale, Vector3Length(s.target.offset));
     }
 
     // Nearest neighbour enlargement, so a 64 pixel view is something to look at.
@@ -313,6 +314,11 @@ namespace {
             Watcher watch(control, cfg.runtime.progressSeconds,
                 [&] {
                     std::lock_guard<std::mutex> l(live->mutex);
+                    static bool said = false;
+                    if (!said && live->iteration > 0 && !live->devices.empty() && !a.quiet) {
+                        said = true;
+                        printf("%s%s\n", live->devices.c_str(), live->deviceShortfall ? "  <- asked for the GPU, didn't get it" : "");
+                    }
                     std::string stage = control.Stage();
                     if (live->iterations <= 0) return stage.empty() ? std::string("starting") : stage;
                     return Utils::Format("%s: step %d/%d (%.0f%%), loss %.4f, %d of %d rewrite rounds kept", stage.c_str(), live->iteration,

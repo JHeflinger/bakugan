@@ -201,6 +201,36 @@ void main() {
 }
 )";
 
+    // The gradient's sums: a pixel (outWidth across) is a chunk of EvalChunk points of one job, each read from `points`
+    // (xyz world, w weight), taken into the body's frame (bodyQuat, bodyPos) and measured: out comes sum w · map.
+    // A job's chunks are pixels [chunkStart, chunkStart + ceil(count / EvalChunk)); the rest are left alone.
+    static const char* EvalMain = R"(
+uniform sampler2D points;
+uniform vec4 bodyQuat;
+uniform vec3 bodyPos;
+uniform float start;
+uniform float count;
+uniform float chunkStart;
+uniform float outWidth;
+uniform float pointsWidth;
+out vec4 finalColor;
+const int CHUNK = 32;
+void main() {
+    float idx = floor(gl_FragCoord.y) * outWidth + floor(gl_FragCoord.x) - chunkStart;
+    if (idx < 0.0 || idx * float(CHUNK) >= count) discard;
+    int pw = int(pointsWidth);
+    int first = int(start + idx * float(CHUNK));
+    int last = int(min(start + count, start + idx * float(CHUNK) + float(CHUNK)));
+    vec4 inv = vec4(-bodyQuat.xyz, bodyQuat.w);
+    float sum = 0.0;
+    for (int i = first; i < last; i++) {
+        vec4 q = texelFetch(points, ivec2(i % pw, i / pw), 0);
+        sum += q.w * map(qrot(inv, q.xyz - bodyPos));
+    }
+    finalColor = vec4(sum, 0.0, 0.0, 1.0);
+}
+)";
+
     static const char* TraceVertex = R"(#version 330
 in vec3 vertexPosition;
 uniform mat4 mvp;
@@ -313,6 +343,7 @@ void main() {
     std::string Sdf::ProbeFragmentSource(const std::string& body, int uniforms) { return Assemble(body, uniforms, ProbeMain); }
     const char* Sdf::ProbeVertexSource() { return ProbeVertex; }
     std::string Sdf::TraceFragmentSource(const std::string& body, int uniforms) { return Assemble(body, uniforms, TraceMain); }
+    std::string Sdf::EvalFragmentSource(const std::string& body, int uniforms) { return Assemble(body, uniforms, EvalMain); }
     const char* Sdf::TraceVertexSource() { return TraceVertex; }
     std::string Sdf::ShapeMap() { return "return sf(p, 0);\n"; }
 

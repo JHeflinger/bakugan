@@ -22,6 +22,7 @@ namespace Bakugan {
     public:
         // the search's thread
         bool Trace(const TraceRequest& request, TraceResult* result) override;
+        bool Evaluate(const EvalRequest& request, std::vector<double>* sums) override;
         std::string Name() const override { return "the GPU"; }
 
         // the UI thread (the one with the context)
@@ -37,20 +38,30 @@ namespace Bakugan {
         int Compiles() const { return m_Compiles; }
         // Draws a request right here (the UI thread): what Service does for the search.
         bool Draw(const TraceRequest& request, TraceResult* result);
+        bool DrawEval(const EvalRequest& request, std::vector<double>* sums);
+        int Evaluated() const { return m_Evaluated; }   // gradients measured here
+        double LastEvalMs() const { return m_LastEvalMs; }
     private:
         struct Program {
             Shader shader = {};
             bool ok = false;
+            int locPoints = -1, locStart = -1, locCount = -1, locChunkStart = -1, locOutWidth = -1, locPointsWidth = -1;   // (eval)
             int locU = -1, locDir = -1, locViewU = -1, locViewV = -1, locCentre = -1, locHalf = -1, locRes = -1, locTau = -1, locFar = -1,
                 locQuat = -1, locPos = -1, locMin = -1, locMax = -1, locPiece = -1, locEvery = -1, locRow = -1;
         };
         Program* ProgramFor(const std::string& code, int uniforms);
+        Program* EvalProgramFor(const std::string& code, int uniforms);
+        bool DrawViews(const TraceRequest& request, TraceResult* result);   // at most 24 views (the shader's arrays)
         bool Target(int width, int height);
         void Drop();
     private:
         bool m_Ok = false;
         std::string m_Error;
         RenderTexture2D m_Target = {};
+        unsigned int m_EvalFbo = 0, m_EvalTexture = 0;
+        int m_EvalWidth = 0, m_EvalHeight = 0;
+        int m_Evaluated = 0;
+        double m_LastEvalMs = 0.0;
         std::unordered_map<std::string, Program> m_Programs;
         int m_Drawn = 0, m_Compiles = 0;
         double m_LastMs = 0.0;
@@ -59,6 +70,8 @@ namespace Bakugan {
         std::condition_variable m_Asked, m_Answered;
         const TraceRequest* m_Request = nullptr;
         TraceResult* m_Result = nullptr;
+        const EvalRequest* m_EvalRequest = nullptr;
+        std::vector<double>* m_EvalSums = nullptr;
         bool m_Pending = false, m_Done = false, m_Success = false, m_Closed = false;
         double m_LastAsked = -1e9;           // GetTime() of the last request
     };

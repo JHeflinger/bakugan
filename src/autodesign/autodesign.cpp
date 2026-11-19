@@ -74,6 +74,37 @@ namespace Bakugan {
             res.message = loss.Error();
             return res;
         }
+        // where a step's work ran (said live, so a GPU that isn't being used shows at once, not at the end)
+        auto devices = [&](const AutoScore& s, bool* shortfall) {
+            *shortfall = false;
+            std::string d = "Views drawn ";
+            if (!p.gpu) d += "on the CPU";
+            else if (s.traced) d += "by " + p.gpu->Name();
+            else {
+                d += "on the CPU (the GPU didn't answer: see the editor's GPU line)";
+                *shortfall = true;
+            }
+            if (loss.Semantic()) {
+                std::string where = loss.SemanticDevice();
+                d += "; DINOv3 on " + where;
+                if (p.semanticGpu && where != "CUDA") *shortfall = true;
+                if (p.gpu) d += s.semanticTraced ? " (its pictures drawn on the GPU)" : " (its pictures drawn on the CPU)";
+            }
+            if (p.gpu) d += s.gradientTraced ? "; the gradient's field measurements on the GPU" : "; the gradient on the CPU";
+            else d += "; the gradient on the CPU";
+            d += "; collisions, shading and rebuilding the pieces on the CPU";
+            if (s.msViews + s.msPrepare + s.msMeasure > 0.0f)
+                d += Utils::Format(". Last step: views %.0f ms, semantic %.0f, collisions %.0f, gradient %.0f preparing + %.0f measuring, placement %.0f",
+                                   s.msViews, s.msSemantic, s.msCollisions, s.msPrepare, s.msMeasure, s.msPlacement);
+            return d;
+        };
+        if (live) {
+            std::lock_guard<std::mutex> l(live->mutex);
+            AutoScore none;
+            none.traced = p.gpu != nullptr;
+            none.semanticTraced = p.gpu != nullptr;
+            live->devices = devices(none, &live->deviceShortfall);
+        }
         std::mt19937 rng(p.seed);
         RuleContext rules{ loss, p, rng };
         const int budget = std::max(0, p.steps);
@@ -184,6 +215,7 @@ namespace Bakugan {
             std::lock_guard<std::mutex> l(live->mutex);
             live->iteration = steps;
             live->iterations = budget;
+            live->devices = devices(s, &live->deviceShortfall);
             live->rounds = rounds;
             live->accepted = accepted;
             if (live->history.size() < 2000) live->history.push_back(s.total);
@@ -271,6 +303,8 @@ namespace Bakugan {
             if (p.carveWhenDone) finish("Carving collisions away", [&] { return CarveCollisions(design, p.carve, &c); });
             if (p.latchWhenDone) finish("Adding the latch", [&] { return AddLatch(design, p.latch, &c); });
         }
+        if (bestScore.valid && p.removeFloatingWhenDone)
+            finish("Removing floating bits", [&] { return RemoveFloatingBits(design, p.floating, &c); });
         // ... and its motion checked once more, more closely than the search could afford to
         c.SetStage("Checking the motion");
         const double sphereVolume = 4.0 / 3.0 * PI * pow(loss.SphereRadius(), 3.0);
@@ -296,6 +330,7 @@ namespace Bakugan {
                                     bestScore.viewCover * 100.0f, bestScore.viewExtra * 100.0f, bestScore.worstView * 100.0f,
                                     Vector3Length(t.offset), t.scale, bestScore.total, steps, accepted, rounds,
                                     reordered > 0 ? Utils::Format(", the opening order changed %d times", reordered).c_str() : "");
+        if (p.fitLook == FitLook::Depth) res.message += Utils::Format(" Depth mismatch %.3f.", bestScore.depth);
         res.message += Utils::Format(" Checked at %d poses: overlapping %.2f%% of the sphere open, %.2f%% at worst on the way", res.checked.poses,
                                      100.0 * res.checked.openVolume / sphereVolume, 100.0 * res.checked.worstVolume / sphereVolume);
         if (res.checked.worstHinge >= 0 && res.checked.worstVolume > 0.0)

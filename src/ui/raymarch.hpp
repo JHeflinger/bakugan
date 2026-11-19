@@ -17,6 +17,9 @@ namespace Bakugan {
         const char* ProbeVertexSource();
         // Same map, marched the way the generator draws its silhouettes (ui/gputrace.cpp).
         std::string TraceFragmentSource(const std::string& mapBody, int uniforms);
+        // Weighted sums of map at points (the gradient's: autodesign/tracer.hpp EvalRequest), EvalChunk points a pixel
+        std::string EvalFragmentSource(const std::string& mapBody, int uniforms);
+        constexpr int EvalChunk = 32;
         const char* TraceVertexSource();
         // One superfrustum on its own (the design view's shapes).
         std::string ShapeMap();

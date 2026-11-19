@@ -150,7 +150,12 @@ namespace Bakugan {
         void Draw(const Bodies& b, std::vector<int>& who, std::vector<Vector3>& at, bool* traced);
         bool DrawTraced(const Bodies& b, std::vector<int>& who, std::vector<Vector3>& at);
         Vector3 RayStart(const BoundingBox& box, const View& w, float sx, float sy) const;
-        float FitLoss(const std::vector<std::vector<float>>& target) const;   // the silhouettes' part, against these targets
+        // the silhouettes' part (fit + coverage penalty), against these targets (and these depths, with FitLook::Depth)
+        float FitLoss(const std::vector<std::vector<float>>& target, const std::vector<std::vector<float>>* depth = nullptr) const;
+        bool DepthFit() const { return m_P.fitLook == FitLook::Depth; }
+        // The placed mesh's front depth per pixel (along the view, from the frame's centre; where it covers nothing: 0)
+        std::vector<std::vector<float>> TargetDepths(const Placement& t) const;
+        float DepthCost(float dz, float* slope) const;   // a covered pixel's depth mismatch cost, and its slope
         void Collisions(const Design& d, const Bodies& b, AutoScore& s, Slopes& slopes, float phase);
         // What one sample inside two pieces costs, and its slope against its depth.
         float ClashCost(float depth, float* slope) const;
@@ -167,8 +172,8 @@ namespace Bakugan {
         float HingeCost(const Hinge& h, const BodyField& parent, const BodyField& child, float* farthest = nullptr) const;
         float HingeWeight() const { return m_P.hingeWeight; }
         float SurfaceTerm(const Carving& c, float* carved = nullptr) const;
-        void Gradient(const Carving& c, const Placement& target, const std::vector<int>& bodyOf, const Bodies& b, const Slopes& slopes,
-                      const Shades& shades, const std::vector<Param>& ps, std::vector<float>& grad);
+        bool Gradient(const Carving& c, const Placement& target, const std::vector<int>& bodyOf, const Bodies& b, const Slopes& slopes,
+                      const Shades& shades, const std::vector<Param>& ps, std::vector<float>& grad, AutoScore* s = nullptr);
         // A ray through the frame at (sx, sy) (from its centre, in mm) against one body (moved by xf), sphere traced
         // through its field inside its box; tau: the pixel size. Returns the nearest it gets (negative: how deep), and
         // where (world); with hit, also where it first enters the body (world; only when it does: the return is < 0).
@@ -205,6 +210,8 @@ namespace Bakugan {
         float m_MeshReach = 1.0f;                     // the farthest the mesh gets from it
         int m_Fine = 256;                             // the fine drawing's size
         std::vector<std::vector<float>> m_MeshFine;  // the mesh where it is, per view: covered (0/1) at m_Fine
+        std::vector<std::vector<float>> m_MeshFineZ; // ... (FitLook::Depth) covered × its front depth there
+        std::vector<std::vector<float>> m_TargetDepth;   // the placed mesh's front depth per view (FitLook::Depth)
         Placement m_Placed;                           // the placement the targets are drawn for
         std::vector<std::vector<float>> m_Target;    // the placed mesh's silhouette per view
         Vector3 m_SphereCentre = { 0, 0, 0 };
@@ -214,6 +221,22 @@ namespace Bakugan {
         std::vector<Vector3> m_SurfaceDirs;   // points spread evenly over the sphere (unit directions), for its surface
         std::vector<Spot> m_Extra;
         std::vector<float> m_Cover;       // the last silhouettes (open): views × pixels
+        // FitLook::Depth: per pixel, the pieces its ray enters (up to 4, nearest first), each with an opacity that rises from
+        // 0 at its silhouette's edge to 1 a pixel inside (alpha = clamp(-nearest / tau, 0, 1)), composited front to back:
+        //   w_i = alpha_i · prod_{j<i} (1 - alpha_j),   A = sum w_i,   z = sum w_i z_i / A
+        // so the depth never jumps: not where a piece's edge comes or goes, nor where a near piece's edge crosses a far one.
+        struct DepthLayer {
+            int pixel, field;
+            float z, alpha;
+            Vector3 hit;                  // where the ray enters it (world)
+            Vector3 at;                   // where the ray comes nearest it (its edge's point)
+        };
+        std::vector<float> m_Z;           // the composited depth per pixel (views × pixels)
+        std::vector<float> m_ZA;          // ... and its opacity A (0: nothing entered)
+        std::vector<DepthLayer> m_ZLayers;   // every pixel's layers, a pixel's together, nearest first
+        // a pixel's layers (any order, and how many) made its composite, kept in row (nearest 4 first)
+        void CompositeDepth(size_t pixel, std::vector<DepthLayer>& layers, std::vector<DepthLayer>& row);
+        bool DrawTracedDepth(const Bodies& b, std::vector<int>& who, std::vector<Vector3>& at);   // FitLook::Depth on the GPU
         // the semantic loss
         std::string m_Error;
         std::unique_ptr<Dino> m_Dino;

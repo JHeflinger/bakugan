@@ -125,6 +125,146 @@ namespace Bakugan {
             return true;
         }
 
+        // Split: the biggest piece cut in two halves of equal volume by a plane (a box much bigger than the piece, one face
+        // on the plane), the halves hinged together at angle 0. Nothing about the design changes: the two halves fill
+        // exactly what the piece did and move as one (the hinge never turns until Adam opens it), so the loss before and
+        // after is the same (to sampling: the halves' fields are the piece's, cut), and every parameter that was there
+        // keeps its Adam memory (memory is per parameter id; the new cutter and joint start fresh). The new hinge is put
+        // where it costs nothing: on the cut face, its barrel's length along the face, inside both halves.
+        bool Split(Carving& c, const RuleContext& ctx) {
+            if ((int)c.pieces.size() >= ctx.p.maxPieces) return false;
+            const float R = c.radius;
+            std::vector<int> bodyOf;
+            Design d = c.Build(&bodyOf);
+
+            // 1. the biggest piece: volumes by sampling each piece's box
+            auto inside = [&](const BodyField& f, BoundingBox box, int n, std::vector<Vector3>* points) {
+                Vector3 e = Vector3Subtract(box.max, box.min);
+                int in = 0;
+                for (int k = 0; k < n; k++) {
+                    Vector3 q = { box.min.x + e.x * Uniform(ctx.rng, 0, 1), box.min.y + e.y * Uniform(ctx.rng, 0, 1), box.min.z + e.z * Uniform(ctx.rng, 0, 1) };
+                    if (f.Distance(q) < 0.0f) {
+                        in++;
+                        if (points) points->push_back(q);
+                    }
+                }
+                return (double)in / n * e.x * e.y * e.z;
+            };
+            int pi = -1;
+            double most = 0.0;
+            for (size_t k = 0; k < c.pieces.size(); k++) {
+                double v = inside(BodyField::Body(d, bodyOf[k]), c.PieceBounds(c.pieces[k]), 1500, nullptr);
+                if (v > most) { most = v; pi = (int)k; }
+            }
+            if (pi < 0) return false;
+            const BodyField piece = BodyField::Body(d, bodyOf[pi]);
+            const BoundingBox bounds = c.PieceBounds(c.pieces[pi]);
+            std::vector<Vector3> pts;
+            for (int tries = 0; tries < 6 && pts.size() < 4000; tries++) inside(piece, bounds, 4000, &pts);
+            if (pts.size() < 200) return false;
+
+            // 2. the plane: a random direction, at the median of the piece's points along it (half its volume either side).
+            // Of a few drawn, the one least edge on to every view: a view along the plane sees the new seam as a soft line
+            // a pixel wide (each piece's silhouette fades over a pixel at its own surface, the cut face too), the one
+            // thing about a split the loss can see. Face on, it sees nothing.
+            Vector3 dir = RandomDirection(ctx.rng);
+            {
+                const std::vector<Vector3> views = ctx.loss.ViewDirections();
+                float best = -1.0f;
+                for (int k = 0; k < 24; k++) {
+                    Vector3 cand = k == 0 ? dir : RandomDirection(ctx.rng);
+                    float worst = 1.0f;
+                    for (const Vector3& v : views) worst = fminf(worst, fabsf(Vector3DotProduct(cand, v)));
+                    if (worst > best) { best = worst; dir = cand; }
+                }
+            }
+            std::vector<float> along(pts.size());
+            for (size_t k = 0; k < pts.size(); k++) along[k] = Vector3DotProduct(pts[k], dir);
+            std::nth_element(along.begin(), along.begin() + along.size() / 2, along.end());
+            const float median = along[along.size() / 2];
+            const float offset = median - Vector3DotProduct(c.centre, dir);   // the plane, from the sphere's centre
+            if (fabsf(offset) >= R) return false;
+            const Vector3 onPlane = Vector3Add(c.centre, Vector3Scale(dir, offset));      // nearest the centre
+
+            // 3. the cutter: a box past the sphere on the far side of the plane, every way (no more than a cutter may be:
+            // Set would clamp it at Adam's first step, which would move the plane)
+            Cutter cut;
+            cut.id = c.nextId++;
+            const float depth = 1.05f * (R - offset) + 0.01f * R, wide = 2.1f * sqrtf(R * R - offset * offset) + 0.02f * R;
+            if (fmaxf(depth, wide) > 1.99f * ctx.loss.L()) return false;
+            cut.sf.size = { wide, wide, depth };
+            cut.sf.rotation = QuaternionFromVector3ToVector3({ 0, 0, 1 }, dir);
+            cut.sf.position = Vector3Add(onPlane, Vector3Scale(dir, 0.5f * depth));
+            cut.sf.rounding = 0.0f;
+            c.cutters.push_back(cut);
+            Piece half;                                     // the half on the box's side
+            half.id = c.nextId++;
+            half.inside = c.pieces[pi].inside;
+            half.outside = c.pieces[pi].outside;
+            half.inside.push_back(cut.id);
+            c.pieces[pi].outside.push_back(cut.id);
+            c.pieces.push_back(half);
+            const int rest = c.pieces[pi].id;
+            d = c.Build(&bodyOf);
+            const BodyField restField = BodyField::Body(d, bodyOf[pi]), halfField = BodyField::Body(d, bodyOf.back());
+
+            // 4. the hinge: on the cut face, where both halves are along its barrel (no cost from the hinge term)
+            const Vector3 side = Vector3Normalize(Vector3CrossProduct(dir, fabsf(dir.y) < 0.9f ? Vector3{ 0, 1, 0 } : Vector3{ 1, 0, 0 }));
+            const Vector3 side2 = Vector3CrossProduct(dir, side);
+            const float disc = sqrtf(R * R - offset * offset);
+            const HingeSizes hs = PlanHinge(R, ctx.p.hinges);
+            const float halfBarrel = 0.5f * hs.length, slack = ctx.loss.HingeSlack();
+            const bool flush = ctx.p.buildHinges && ctx.p.hinges.flush;
+            std::vector<Vector3> face;                      // points of the cut face (in the piece, on the plane)
+            for (int k = 0; k < 2000 && face.size() < 64; k++) {
+                float a = Uniform(ctx.rng, 0.0f, 2.0f * PI), r = disc * sqrtf(Uniform(ctx.rng, 0.0f, 1.0f));
+                Vector3 q = Vector3Add(onPlane, Vector3Add(Vector3Scale(side, r * cosf(a)), Vector3Scale(side2, r * sinf(a))));
+                if (piece.Distance(q) < -0.01f * R) face.push_back(q);
+            }
+            if (face.empty()) {                            // (sampling missed a thin piece: undo)
+                c.pieces.pop_back();
+                c.pieces[pi].outside.pop_back();
+                c.cutters.pop_back();
+                return false;
+            }
+            float bestCost = FLT_MAX;
+            Vector3 pivot = face[0], axis = side;
+            for (const Vector3& q : face)
+                for (int k = 0; k < 12; k++) {
+                    float a = PI * k / 12.0f;
+                    Vector3 ax = Vector3Add(Vector3Scale(side, cosf(a)), Vector3Scale(side2, sinf(a)));
+                    float cost = flush ? fmaxf(0.0f, Vector3Distance(q, c.centre) - hs.pivotRadius) : 0.0f;
+                    for (float w : { -halfBarrel, 0.0f, halfBarrel }) {
+                        Vector3 p = Vector3Add(q, Vector3Scale(ax, w));
+                        cost += fmaxf(0.0f, restField.Distance(p) - slack) + fmaxf(0.0f, halfField.Distance(p) - slack);
+                    }
+                    // among those that cost nothing: the one deepest in the piece (most room for Adam to move it)
+                    cost += 1e-6f * piece.Distance(q);
+                    if (cost < bestCost) { bestCost = cost; pivot = q; axis = ax; }
+                }
+
+            // the joints the piece had go with the half their pivot is in (or nearer), as for a cut
+            int anchor = rest;
+            for (Joint& j : c.joints) {
+                bool toHalf = halfField.Distance(j.pivot) < restField.Distance(j.pivot);
+                if (j.child == rest && toHalf) { j.child = half.id; anchor = half.id; }
+                else if (j.parent == rest && toHalf) j.parent = half.id;
+            }
+            Joint j;
+            j.id = c.nextId++;
+            j.parent = anchor;
+            j.child = anchor == rest ? half.id : rest;
+            j.pivot = pivot;
+            j.axis = axis;
+            j.open = 0.0f;                                  // it does nothing until Adam opens it
+            j.t0 = Uniform(ctx.rng, 0.0f, 0.5f);
+            j.t1 = j.t0 + 0.5f;
+            for (const Joint& o : c.joints) j.order = std::max(j.order, o.order + 1);   // it opens last (its turn moves nothing)
+            c.joints.push_back(j);
+            Tidy(c);
+            return true;
+        }
+
         // Add a hollow: material taken away where the open design shows outside the mesh. At one of those pixels
         // (Loss::ExtraSpots), a rounded bar through its piece along the view that saw it, as long as the piece is deep
         // there, so the pixel clears at once. If the bar reaches the sphere's surface, the surface term weighs that; Adam
@@ -219,6 +359,7 @@ namespace Bakugan {
             { "remove a cut",    0.5f, RemoveCut,    true },
             { "add a hollow",    0.5f, AddHollow,    false },
             { "remove a hollow", 0.25f, RemoveHollow, true },
+            { "split",           0.5f, Split,        false },   // (last: weights are kept in this order)
         };
         return rules;
     }

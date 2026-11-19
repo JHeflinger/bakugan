@@ -75,6 +75,12 @@ namespace Bakugan {
         float clearance = 0.35f;         // mm between the rocker and what is around it
     };
 
+    struct FloatingParams {
+        float share = 0.05f;             // a body's separate bits smaller than this share of its largest piece go
+        float voxel = 0.0f;              // mm the bodies are looked at in: bits joined by less than this count as apart
+                                         // (0: the design's longest side / 200, 0.1 .. 0.5 mm)
+    };
+
     struct FinishResult {
         bool ok = false;                 // the design was changed
         bool cancelled = false;
@@ -92,12 +98,20 @@ namespace Bakugan {
         int built = 0;                   // hinges that got hardware
         int relieved = 0;                // clearances that give their two bodies room to turn
         float moved = 0.0f;              // the farthest an axis was moved (mm)
+        // RemoveFloatingBits
+        int removed = 0;                 // bits taken away
+        double removedVolume = 0.0;      // mm^3, all of them
+        int left = 0;                    // small bits still there afterwards (ones no boxes could cover cleanly)
     };
 
     FinishResult CarveCollisions(const Design& d, const CarveParams& p, JobControl* c = nullptr);
     FinishResult AddHinges(const Design& d, const HingeParams& p, JobControl* c = nullptr);
     FinishResult AddLedges(const Design& d, const LedgeParams& p, JobControl* c = nullptr);
     FinishResult AddLatch(const Design& d, const LatchParams& p, JobControl* c = nullptr);
+    // Takes away the bits of each body that float apart from the rest of it, smaller than p.share of its largest piece
+    // (many cuts leave slivers that can't be printed and add nothing): a cut feature "Floating bit" per bit, of boxes that
+    // cover it and keep clear of the rest of the body. Then looks again, and says what (if anything) is left.
+    FinishResult RemoveFloatingBits(const Design& d, const FloatingParams& p, JobControl* c = nullptr);
 
     // Whether a hinge is held shut: with everything closed, starting to open it runs into something (more than
     // `tolerance` mm^3 of overlap by the time it has turned a few degrees).

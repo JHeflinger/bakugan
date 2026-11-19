@@ -192,6 +192,11 @@ namespace Bakugan::Cli {
 
         // -- the Generate tab -----------------------------------------------------------------------------------------------
         section = "goal";
+        Choice("fit_look", p.fitLook, { { "silhouette", (int)FitLook::Silhouette }, { "depth", (int)FitLook::Depth } },
+               "How each view of the open design is compared with the mesh's: silhouette (outlines), or depth (outlines, plus how far "
+               "apart the front surfaces are where both cover a pixel: depth rasters, so each view sees some 3D).");
+        Float("depth_scale", p.depthScale, 0.001, 10,
+              "fit_look = depth: a depth mismatch this big (a share of the mesh's size) costs a covered pixel half as much as a missing one.");
         Int("views", p.views, 1, 64, "Directions the outlines are compared from, spread over a half sphere. (The slider: 1..16)");
         Int("view_pixels", p.viewResolution, 8, 1024, "Pixels across each view: finer is more exact and slower. (The slider: 32..192)");
         Float("min_view_coverage", p.minViewCoverage, 0, 1,
@@ -280,6 +285,10 @@ namespace Bakugan::Cli {
         Bool("latch_when_done", p.latchWhenDone, "A press latch on the hinge that opens first.");
         Float("latch_scale", p.latch.scale, 0.1, 10, "Latch size against the default for the sphere. (The slider: 0.6..1.6)");
         Float("latch_clearance", p.latch.clearance, 0, 10, "mm printed around the rocker.");
+        Bool("remove_floating", p.removeFloatingWhenDone, "Last: take away bits of bodies that float apart from the rest (slivers cuts leave).");
+        Float("floating_share", p.floating.share, 0, 1, "... those smaller than this share of their body's largest piece.");
+        Float("floating_voxel", p.floating.voxel, 0, 10, "mm bodies are looked at in for that: bits joined by less count as apart.",
+              "auto: the design's longest side / 200");
 
         section = "suite";
         Str("folder", suite.folder, "The folder of .obj files (suite). Can also be given on the command line.");

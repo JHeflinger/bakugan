@@ -886,6 +886,15 @@ namespace Bakugan {
     void App::Frame() {
         // a search that draws its silhouettes on the GPU has them drawn here, by this thread: it stays at it for most
         // of a frame while the search keeps asking (the editor redraws about a dozen times a second meanwhile)
+        {
+            // While a job runs the GPU tracer is served from this loop, once a frame. A vsynced swap waits for the
+            // compositor, which on Wayland (Hyprland, ...) stops asking for frames from a window it isn't showing (another
+            // workspace, covered): the loop, and every GPU drawing the search asks for, would stall (and fall back to the
+            // CPU after 2 s each). So no vsync while a job runs; SetTargetFPS still paces the loop.
+            const bool busy = m_AutoJob.Busy() || m_SuiteJob.Busy();
+            if (busy && IsWindowState(FLAG_VSYNC_HINT)) ClearWindowState(FLAG_VSYNC_HINT);
+            else if (!busy && !IsWindowState(FLAG_VSYNC_HINT)) SetWindowState(FLAG_VSYNC_HINT);
+        }
         if (m_Gpu->Ok()) m_Gpu->Service(m_AutoJob.Busy() || m_SuiteJob.Busy() ? 0.08 : 0.0);
         HandleFileDrops();
         PollJobs();

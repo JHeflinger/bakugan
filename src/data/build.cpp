@@ -12,7 +12,9 @@
 #include <raymath.h>
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cmath>
+#include <functional>
 #include <cstdio>
 #include <mutex>
 #include <sstream>
@@ -55,10 +57,11 @@ namespace Bakugan {
         return openvdb::tools::BoxSampler::sample(m->acc, ijk);
     }
 
-    TriMesh MeshLevelSet(const std::function<float(Vector3)>& f, BoundingBox box, float voxel, float adaptivity,
-                         const JobControl* control, const std::function<void(float)>& progress, std::shared_ptr<const LevelSet>* keep) {
+    // The narrow band level set of f inside box, sampled sparsely (an octree descent skips cubes the surface can't pass
+    // through), sign flood filled; grid index (0, 0, 0) is at *origin and n[] is the index extent. Null when empty or cancelled.
+    static openvdb::FloatGrid::Ptr SparseLevelSet(const std::function<float(Vector3)>& f, BoundingBox box, float voxel, const JobControl* control,
+                                                  const std::function<void(float)>& progress, Vector3* originOut, int nOut[3]) {
         InitVDB();
-        TriMesh out;
         const float band = 3.0f * voxel;
         const int pad = 3, B = 4, T = 64;   // 4^3 leaf blocks: finer culling of empty space
         // the odd fraction keeps grid points off the round-number planes designs are full of: samples exactly on a
@@ -106,16 +109,27 @@ namespace Bakugan {
                 if (progress && (k & 15) == 0) progress(0.85f * k / (float)tiles);
             }
         });
-        if (control && control->Cancelled()) return out;
+        if (control && control->Cancelled()) return nullptr;
 
         Grid::Ptr grid = Grid::create(band);
         for (Grid::Ptr& g : local) grid->tree().merge(g->tree(), openvdb::MERGE_ACTIVE_STATES);
-        if (grid->activeVoxelCount() == 0) return out;
+        if (grid->activeVoxelCount() == 0) return nullptr;
         openvdb::math::Transform::Ptr xform = openvdb::math::Transform::createLinearTransform(voxel);
         xform->postTranslate(openvdb::Vec3d(origin.x, origin.y, origin.z));
         grid->setTransform(xform);
         grid->setGridClass(openvdb::GRID_LEVEL_SET);
         openvdb::tools::signedFloodFill(grid->tree());
+        if (originOut) *originOut = origin;
+        if (nOut) for (int a = 0; a < 3; a++) nOut[a] = n[a];
+        return grid;
+    }
+
+    TriMesh MeshLevelSet(const std::function<float(Vector3)>& f, BoundingBox box, float voxel, float adaptivity,
+                         const JobControl* control, const std::function<void(float)>& progress, std::shared_ptr<const LevelSet>* keep) {
+        using Grid = openvdb::FloatGrid;
+        TriMesh out;
+        Grid::Ptr grid = SparseLevelSet(f, box, voxel, control, progress, nullptr, nullptr);
+        if (!grid) return out;
         if (keep) {
             auto ls = std::make_shared<LevelSet>();
             ls->grid = grid;
@@ -143,6 +157,160 @@ namespace Bakugan {
         Utils::ComputeNormals(out);
         Utils::ComputeBounds(out);
         if (progress) progress(1.0f);
+        return out;
+    }
+
+    // ---- islands ----------------------------------------------------------------------------------------------------------
+
+    std::vector<Island> FindIslands(const std::function<float(Vector3)>& f, BoundingBox box, float voxel, double removeShare,
+                                    const JobControl* control, float* voxelUsed) {
+        std::vector<Island> out;
+        // a dense grid of inside / outside covers the box: no finer than 32M cells
+        {
+            Vector3 e = Vector3Subtract(box.max, box.min);
+            double cells = (double)(e.x / voxel + 10) * (e.y / voxel + 10) * (e.z / voxel + 10);
+            if (cells > 32e6) voxel *= (float)cbrt(cells / 32e6) * 1.02f;
+        }
+        if (voxelUsed) *voxelUsed = voxel;
+        Vector3 origin;
+        int n[3];
+        openvdb::FloatGrid::Ptr grid = SparseLevelSet(f, box, voxel, control, {}, &origin, n);
+        if (!grid) return out;
+        const size_t nx = n[0], ny = n[1], nz = n[2], N = nx * ny * nz;
+        auto index = [&](size_t i, size_t j, size_t k) { return (k * ny + j) * nx + i; };
+
+        // inside: the level set's sign (flood filled, so deep inside is negative too)
+        std::vector<int> label(N, 0);                    // 0 outside, -1 inside (not yet labelled), else its piece + 1
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, nz), [&](const tbb::blocked_range<size_t>& r) {
+            auto acc = grid->getConstAccessor();
+            for (size_t k = r.begin(); k != r.end(); k++)
+                for (size_t j = 0; j < ny; j++)
+                    for (size_t i = 0; i < nx; i++)
+                        if (acc.getValue(openvdb::Coord((int)i, (int)j, (int)k)) < 0.0f) label[index(i, j, k)] = -1;
+        });
+        if (control && control->Cancelled()) return out;
+
+        // the pieces: flood fills, 6-connected
+        std::vector<std::vector<size_t>> cells;
+        std::vector<size_t> stack;
+        for (size_t s = 0; s < N; s++) {
+            if (label[s] != -1) continue;
+            int id = (int)cells.size() + 1;
+            cells.emplace_back();
+            std::vector<size_t>& mine = cells.back();
+            label[s] = id;
+            stack.push_back(s);
+            while (!stack.empty()) {
+                size_t c = stack.back();
+                stack.pop_back();
+                mine.push_back(c);
+                size_t i = c % nx, j = (c / nx) % ny, k = c / (nx * ny);
+                size_t nb[6];
+                int m = 0;
+                if (i > 0) nb[m++] = c - 1;
+                if (i + 1 < nx) nb[m++] = c + 1;
+                if (j > 0) nb[m++] = c - nx;
+                if (j + 1 < ny) nb[m++] = c + nx;
+                if (k > 0) nb[m++] = c - nx * ny;
+                if (k + 1 < nz) nb[m++] = c + nx * ny;
+                for (int q = 0; q < m; q++)
+                    if (label[nb[q]] == -1) { label[nb[q]] = id; stack.push_back(nb[q]); }
+            }
+        }
+
+        // every inside cell, summed: how many lie in any box of cells, at once
+        const size_t px = nx + 1, py = ny + 1, pz = nz + 1;
+        std::vector<int> sum(px * py * pz, 0);
+        auto S = [&](size_t i, size_t j, size_t k) -> int& { return sum[(k * py + j) * px + i]; };
+        for (size_t k = 1; k < pz; k++)
+            for (size_t j = 1; j < py; j++)
+                for (size_t i = 1; i < px; i++)
+                    S(i, j, k) = (label[index(i - 1, j - 1, k - 1)] > 0) + S(i - 1, j, k) + S(i, j - 1, k) + S(i, j, k - 1) - S(i - 1, j - 1, k) -
+                                 S(i - 1, j, k - 1) - S(i, j - 1, k - 1) + S(i - 1, j - 1, k - 1);
+        // cells in [lo, hi] (inclusive, clamped)
+        auto count = [&](long lo[3], long hi[3]) {
+            long a[3], b[3];
+            const long lim[3] = { (long)nx - 1, (long)ny - 1, (long)nz - 1 };
+            for (int d = 0; d < 3; d++) {
+                a[d] = std::max(0L, lo[d]);
+                b[d] = std::min(lim[d], hi[d]);
+                if (a[d] > b[d]) return 0;
+            }
+            return S(b[0] + 1, b[1] + 1, b[2] + 1) - S(a[0], b[1] + 1, b[2] + 1) - S(b[0] + 1, a[1], b[2] + 1) - S(b[0] + 1, b[1] + 1, a[2]) +
+                   S(a[0], a[1], b[2] + 1) + S(a[0], b[1] + 1, a[2]) + S(b[0] + 1, a[1], a[2]) - S(a[0], a[1], a[2]);
+        };
+        auto world = [&](double i, double j, double k) { return Vector3{ origin.x + (float)(i * voxel), origin.y + (float)(j * voxel), origin.z + (float)(k * voxel) }; };
+
+        const double cellVolume = (double)voxel * voxel * voxel;
+        size_t largest = 0;
+        for (size_t p = 1; p < cells.size(); p++)
+            if (cells[p].size() > cells[largest].size()) largest = p;
+        const double removeBelow = cells.empty() ? 0.0 : removeShare * cells[largest].size() * cellVolume;
+        for (size_t p = 0; p < cells.size(); p++) {
+            Island is;
+            const std::vector<size_t>& mine = cells[p];
+            is.volume = mine.size() * cellVolume;
+            long lo[3] = { LONG_MAX, LONG_MAX, LONG_MAX }, hi[3] = { LONG_MIN, LONG_MIN, LONG_MIN };
+            for (size_t c : mine) {
+                long q[3] = { (long)(c % nx), (long)((c / nx) % ny), (long)(c / (nx * ny)) };
+                for (int d = 0; d < 3; d++) { lo[d] = std::min(lo[d], q[d]); hi[d] = std::max(hi[d], q[d]); }
+            }
+            is.bounds = { world(lo[0] - 0.5, lo[1] - 0.5, lo[2] - 0.5), world(hi[0] + 0.5, hi[1] + 0.5, hi[2] + 0.5) };
+            is.speck = mine.size() < 8;
+            is.remove = p != largest && is.volume < removeBelow && !is.speck;
+            if (is.remove) {
+                // boxes over it, none within `margin` cells of another piece's: halve a box (along its longest side)
+                // until it is clear, each half shrunk to the cells of this piece in it
+                const int id = (int)p + 1, margin = 2, most = 256;
+                bool ok = true;
+                std::function<void(std::vector<size_t>&)> cover = [&](std::vector<size_t>& part) {
+                    if (part.empty() || !ok) return;
+                    long a[3] = { LONG_MAX, LONG_MAX, LONG_MAX }, b[3] = { LONG_MIN, LONG_MIN, LONG_MIN };
+                    for (size_t c : part) {
+                        long q[3] = { (long)(c % nx), (long)((c / nx) % ny), (long)(c / (nx * ny)) };
+                        for (int d = 0; d < 3; d++) { a[d] = std::min(a[d], q[d]); b[d] = std::max(b[d], q[d]); }
+                    }
+                    long ga[3], gb[3];
+                    for (int d = 0; d < 3; d++) { ga[d] = a[d] - margin; gb[d] = b[d] + margin; }
+                    // this piece's cells in the grown box (only it can be there, apart from others)
+                    int own = 0;
+                    for (size_t c : mine) {
+                        long q[3] = { (long)(c % nx), (long)((c / nx) % ny), (long)(c / (nx * ny)) };
+                        own += q[0] >= ga[0] && q[0] <= gb[0] && q[1] >= ga[1] && q[1] <= gb[1] && q[2] >= ga[2] && q[2] <= gb[2];
+                    }
+                    const bool single = a[0] == b[0] && a[1] == b[1] && a[2] == b[2];
+                    if (count(ga, gb) == own || single) {
+                        // clear (a box one cell wider than its cells all round: the surface lies within a cell of them),
+                        // or a lone cell next to another piece: just its own cell
+                        const double g = single && count(ga, gb) != own ? 0.0 : 1.0;
+                        if (g == 0.0) is.tight++;
+                        is.cover.push_back({ world(a[0] - 0.5 - g, a[1] - 0.5 - g, a[2] - 0.5 - g), world(b[0] + 0.5 + g, b[1] + 0.5 + g, b[2] + 0.5 + g) });
+                        if ((int)is.cover.size() > most) ok = false;
+                        return;
+                    }
+                    int axis = 0;
+                    for (int d = 1; d < 3; d++)
+                        if (b[d] - a[d] > b[axis] - a[axis]) axis = d;
+                    long mid = (a[axis] + b[axis]) / 2;
+                    std::vector<size_t> left, right;
+                    for (size_t c : part) {
+                        long q[3] = { (long)(c % nx), (long)((c / nx) % ny), (long)(c / (nx * ny)) };
+                        (q[axis] <= mid ? left : right).push_back(c);
+                    }
+                    part.clear();
+                    part.shrink_to_fit();
+                    cover(left);
+                    cover(right);
+                };
+                (void)id;
+                std::vector<size_t> all = mine;
+                cover(all);
+                is.covered = ok;
+                if (!ok) is.cover.clear();
+            }
+            out.push_back(std::move(is));
+        }
+        std::sort(out.begin(), out.end(), [](const Island& a, const Island& b) { return a.volume > b.volume; });
         return out;
     }
 

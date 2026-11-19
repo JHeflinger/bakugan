@@ -27,13 +27,29 @@ namespace Bakugan {
         return ok;
     }
 
+    bool GpuSilhouettes::Evaluate(const EvalRequest& request, std::vector<double>* sums) {
+        std::unique_lock<std::mutex> l(m_Mutex);
+        if (m_Closed || !m_Ok || m_Pending) return false;
+        m_EvalRequest = &request;
+        m_EvalSums = sums;
+        m_Pending = true;
+        m_Done = false;
+        m_Asked.notify_all();
+        m_Answered.wait_for(l, std::chrono::seconds(4), [&] { return m_Done || m_Closed; });
+        bool ok = m_Done && m_Success;
+        m_Pending = false;
+        m_EvalRequest = nullptr;
+        m_EvalSums = nullptr;
+        return ok;
+    }
+
     void GpuSilhouettes::Service(double seconds) {
         using Clock = std::chrono::steady_clock;
         const Clock::time_point until = Clock::now() + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(std::max(0.0, seconds)));
         std::unique_lock<std::mutex> l(m_Mutex);
         for (;;) {
             if (m_Pending && !m_Done) {
-                m_Success = Draw(*m_Request, m_Result);
+                m_Success = m_EvalRequest ? DrawEval(*m_EvalRequest, m_EvalSums) : Draw(*m_Request, m_Result);
                 m_Done = true;
                 m_LastAsked = GetTime();
                 m_Answered.notify_all();
@@ -96,6 +112,8 @@ namespace Bakugan {
 
     void GpuSilhouettes::Unload() {
         Close();
+        if (m_EvalFbo) rlUnloadFramebuffer(m_EvalFbo);   // (and its texture)
+        m_EvalFbo = m_EvalTexture = 0;
         for (auto& kv : m_Programs)
             if (kv.second.ok) UnloadShader(kv.second.shader);
         m_Programs.clear();
@@ -138,7 +156,40 @@ namespace Bakugan {
         return &(m_Programs[key] = p);
     }
 
+    // More views than the shader's arrays hold (24) are drawn 24 at a time, and the results put back in order.
     bool GpuSilhouettes::Draw(const TraceRequest& rq, TraceResult* out) {
+        const int nv = (int)rq.views.size();
+        if (nv <= 24) return DrawViews(rq, out);
+        const double start = GetTime();
+        const size_t px = (size_t)rq.res * rq.res;
+        const int bands = rq.everyPiece ? (int)rq.pieces.size() : 1;
+        const size_t count = (size_t)bands * nv * px;
+        out->nearest.assign(count, 0.0f);
+        out->along.assign(count, 0.0f);
+        out->piece.assign(count, -1);
+        out->enter.assign(rq.everyPiece ? count : 0, -1.0f);
+        for (int v0 = 0; v0 < nv; v0 += 24) {
+            const int n = std::min(24, nv - v0);
+            TraceRequest part = rq;
+            part.views.assign(rq.views.begin() + v0, rq.views.begin() + v0 + n);
+            TraceResult r;
+            if (!DrawViews(part, &r)) return false;
+            m_Drawn--;                                   // (one drawing, however many parts)
+            for (int band = 0; band < bands; band++)
+                for (int v = 0; v < n; v++) {
+                    const size_t from = ((size_t)band * n + v) * px, to = ((size_t)band * nv + v0 + v) * px;
+                    std::copy_n(r.nearest.begin() + from, px, out->nearest.begin() + to);
+                    std::copy_n(r.along.begin() + from, px, out->along.begin() + to);
+                    std::copy_n(r.piece.begin() + from, px, out->piece.begin() + to);
+                    if (rq.everyPiece) std::copy_n(r.enter.begin() + from, px, out->enter.begin() + to);
+                }
+        }
+        m_Drawn++;
+        m_LastMs = (GetTime() - start) * 1000.0;
+        return true;
+    }
+
+    bool GpuSilhouettes::DrawViews(const TraceRequest& rq, TraceResult* out) {
         const double start = GetTime();
         const int nv = (int)rq.views.size(), res = rq.res;
         const int bands = rq.everyPiece ? (int)rq.pieces.size() : 1;
@@ -221,6 +272,141 @@ namespace Bakugan {
         MemFree(px);
         m_Drawn++;
         m_LastMs = (GetTime() - start) * 1000.0;
+        return true;
+    }
+}
+
+namespace Bakugan {
+    GpuSilhouettes::Program* GpuSilhouettes::EvalProgramFor(const std::string& code, int uniforms) {
+        std::string key = "eval\n" + std::to_string(uniforms) + "\n" + code;
+        auto it = m_Programs.find(key);
+        if (it != m_Programs.end()) return &it->second;
+        if (m_Programs.size() >= 256) {
+            for (auto& kv : m_Programs)
+                if (kv.second.ok) UnloadShader(kv.second.shader);
+            m_Programs.clear();
+        }
+        Program p;
+        std::string fs = Sdf::EvalFragmentSource(code, uniforms);
+        p.shader = LoadShaderFromMemory(Sdf::TraceVertexSource(), fs.c_str());
+        m_Compiles++;
+        p.ok = p.shader.id != 0 && p.shader.id != rlGetShaderIdDefault();
+        if (p.ok) {
+            p.locU = GetShaderLocation(p.shader, "U");
+            p.locPoints = GetShaderLocation(p.shader, "points");
+            p.locQuat = GetShaderLocation(p.shader, "bodyQuat");
+            p.locPos = GetShaderLocation(p.shader, "bodyPos");
+            p.locStart = GetShaderLocation(p.shader, "start");
+            p.locCount = GetShaderLocation(p.shader, "count");
+            p.locChunkStart = GetShaderLocation(p.shader, "chunkStart");
+            p.locOutWidth = GetShaderLocation(p.shader, "outWidth");
+            p.locPointsWidth = GetShaderLocation(p.shader, "pointsWidth");
+        }
+        return &m_Programs.emplace(key, p).first->second;
+    }
+
+    // Every job's points summed on the GPU, Sdf::EvalChunk to a pixel; read back once and summed here per job.
+    bool GpuSilhouettes::DrawEval(const EvalRequest& rq, std::vector<double>* sums) {
+        const double start = GetTime();
+        sums->assign(rq.jobs.size(), 0.0);
+        if (!m_Ok) return false;
+        if (rq.jobs.empty()) return true;
+        const int chunk = Sdf::EvalChunk;
+        std::vector<long long> first(rq.jobs.size());
+        long long chunks = 0;
+        for (size_t j = 0; j < rq.jobs.size(); j++) {
+            first[j] = chunks;
+            chunks += (std::max(0, rq.jobs[j].count) + chunk - 1) / chunk;
+        }
+        if (chunks == 0) return true;
+        const int outWidth = 2048, pointsWidth = 4096;
+        const long long outHeight = (chunks + outWidth - 1) / outWidth;
+        const long long pointsHeight = ((long long)rq.points.size() + pointsWidth - 1) / pointsWidth;
+        if (outHeight > 16384 || pointsHeight > 16384 || pointsHeight < 1) return false;
+
+        // the target: a float texture, kept while big enough
+        if (!m_EvalFbo || m_EvalWidth != outWidth || m_EvalHeight < outHeight) {
+            if (m_EvalFbo) rlUnloadFramebuffer(m_EvalFbo);
+            m_EvalWidth = outWidth;
+            m_EvalHeight = (int)std::max<long long>(outHeight, 64);
+            m_EvalFbo = rlLoadFramebuffer();
+            if (!m_EvalFbo) return false;
+            rlEnableFramebuffer(m_EvalFbo);
+            m_EvalTexture = rlLoadTexture(nullptr, m_EvalWidth, m_EvalHeight, RL_PIXELFORMAT_UNCOMPRESSED_R32G32B32A32, 1);
+            rlFramebufferAttach(m_EvalFbo, m_EvalTexture, RL_ATTACHMENT_COLOR_CHANNEL0, RL_ATTACHMENT_TEXTURE2D, 0);
+            const bool complete = m_EvalTexture != 0 && rlFramebufferComplete(m_EvalFbo);
+            rlDisableFramebuffer();
+            if (!complete) {
+                rlUnloadFramebuffer(m_EvalFbo);
+                m_EvalFbo = m_EvalTexture = 0;
+                return false;
+            }
+        }
+        // the points: a float texture too
+        std::vector<Vector4> pts((size_t)pointsWidth * pointsHeight, Vector4{ 0, 0, 0, 0 });
+        std::copy(rq.points.begin(), rq.points.end(), pts.begin());
+        Texture2D points = {};
+        points.id = rlLoadTexture(pts.data(), pointsWidth, (int)pointsHeight, RL_PIXELFORMAT_UNCOMPRESSED_R32G32B32A32, 1);
+        if (points.id == 0) return false;
+        points.width = pointsWidth;
+        points.height = (int)pointsHeight;
+        points.mipmaps = 1;
+        points.format = PIXELFORMAT_UNCOMPRESSED_R32G32B32A32;
+        rlTextureParameters(points.id, RL_TEXTURE_MIN_FILTER, RL_TEXTURE_FILTER_NEAREST);
+        rlTextureParameters(points.id, RL_TEXTURE_MAG_FILTER, RL_TEXTURE_FILTER_NEAREST);
+
+        RenderTexture2D target = {};
+        target.id = m_EvalFbo;
+        target.texture.id = m_EvalTexture;
+        target.texture.width = m_EvalWidth;
+        target.texture.height = m_EvalHeight;
+        target.texture.mipmaps = 1;
+        target.texture.format = PIXELFORMAT_UNCOMPRESSED_R32G32B32A32;
+        bool ok = true;
+        BeginTextureMode(target);
+        rlClearColor(0, 0, 0, 0);
+        rlClearScreenBuffers();
+        rlDisableColorBlend();
+        const float fOut = (float)outWidth, fPoints = (float)pointsWidth;
+        for (size_t j = 0; j < rq.jobs.size(); j++) {
+            const EvalJob& job = rq.jobs[j];
+            if (job.count <= 0) continue;
+            Program* p = EvalProgramFor(rq.codes[job.code], (int)std::max<size_t>(1, job.params.size()));
+            if (!p || !p->ok) { ok = false; break; }
+            // the rows its chunks are on (gl_FragCoord rows: raylib's texture mode counts from the top)
+            const long long c0 = first[j], c1 = first[j] + (job.count + chunk - 1) / chunk - 1;
+            const int r0 = (int)(c0 / outWidth), r1 = (int)(c1 / outWidth);
+            const float fStart = (float)job.start, fCount = (float)job.count, fChunk = (float)c0;
+            BeginShaderMode(p->shader);
+            if (!job.params.empty()) SetShaderValueV(p->shader, p->locU, job.params.data(), SHADER_UNIFORM_VEC4, (int)job.params.size());
+            SetShaderValueTexture(p->shader, p->locPoints, points);
+            SetShaderValue(p->shader, p->locQuat, &job.xf.rotation, SHADER_UNIFORM_VEC4);
+            SetShaderValue(p->shader, p->locPos, &job.xf.position, SHADER_UNIFORM_VEC3);
+            SetShaderValue(p->shader, p->locStart, &fStart, SHADER_UNIFORM_FLOAT);
+            SetShaderValue(p->shader, p->locCount, &fCount, SHADER_UNIFORM_FLOAT);
+            SetShaderValue(p->shader, p->locChunkStart, &fChunk, SHADER_UNIFORM_FLOAT);
+            SetShaderValue(p->shader, p->locOutWidth, &fOut, SHADER_UNIFORM_FLOAT);
+            SetShaderValue(p->shader, p->locPointsWidth, &fPoints, SHADER_UNIFORM_FLOAT);
+            DrawRectangle(0, m_EvalHeight - 1 - r1, outWidth, r1 - r0 + 1, WHITE);
+            EndShaderMode();
+        }
+        rlDrawRenderBatchActive();
+        rlEnableColorBlend();
+        EndTextureMode();
+        rlUnloadTexture(points.id);
+        if (!ok) return false;
+
+        float* px = (float*)rlReadTexturePixels(m_EvalTexture, m_EvalWidth, m_EvalHeight, RL_PIXELFORMAT_UNCOMPRESSED_R32G32B32A32);
+        if (!px) return false;
+        for (size_t j = 0; j < rq.jobs.size(); j++) {
+            const long long n = (std::max(0, rq.jobs[j].count) + chunk - 1) / chunk;
+            double s = 0.0;
+            for (long long k = 0; k < n; k++) s += px[(size_t)(first[j] + k) * 4];
+            (*sums)[j] = s;
+        }
+        MemFree(px);
+        m_Evaluated++;
+        m_LastEvalMs = (GetTime() - start) * 1000.0;
         return true;
     }
 }

@@ -60,7 +60,22 @@ namespace Bakugan {
         Hint("A sphere is cut into pieces and hinged, so that open it looks like the mesh. Closed, the pieces are the sphere "
              "again, always: only the open pose and the motion are scored.");
         {
-            ImGui::SliderInt("Views", &p.views, 6, 128);
+            {
+            int look = (int)p.fitLook;
+            if (ImGui::Combo("Compare", &look, "Silhouettes\0Depth rasters\0")) p.fitLook = (FitLook)look;
+            ImGui::SetItemTooltip("How each view of the open design is compared with the mesh's.\n"
+                                  "Silhouettes: outlines only (covered and extra pixels).\n"
+                                  "Depth rasters: the outlines, and where both cover a pixel, how far apart their front surfaces\n"
+                                  "are along the view: each view sees the shape in depth, not just its outline. (Drawn on the CPU.)");
+            if (p.fitLook == FitLook::Depth) {
+                float pct = p.depthScale * 100.0f;
+                if (ImGui::SliderFloat("Depth tolerance", &pct, 0.5f, 30.0f, "%.1f%% of the mesh", ImGuiSliderFlags_Logarithmic)) p.depthScale = pct / 100.0f;
+                ImGui::SetItemTooltip("A front surface this far from the mesh's (a share of the mesh's size) costs a pixel half as much as\n"
+                                      "leaving it uncovered; farther costs up to as much, no more (so a piece well in front of the\n"
+                                      "mesh isn't punished without end)");
+            }
+        }
+        ImGui::SliderInt("Views", &p.views, 6, 128);
             ImGui::SetItemTooltip("Directions the outlines are compared from, spread over a half sphere (from the other\n"
                                   "half they would only be mirror images)");
             ImGui::SliderInt("View pixels", &p.viewResolution, 64, 4000);
@@ -244,8 +259,9 @@ namespace Bakugan {
         ImGui::Checkbox("Draw the views on the GPU", &m_AutoUseGpu);
         ImGui::EndDisabled();
         ImGui::SetItemTooltip("%s", m_Gpu->Ok() ? "Every step's views of the open design (the silhouettes, and the pictures DINOv3 is shown) are\n"
-                                                  "raymarched by the graphics card instead of the CPU's cores. The comparison with the mesh, the\n"
-                                                  "shading of the semantic pictures and the gradient stay on the CPU; DINOv3 itself runs where\n"
+                                                  "raymarched by the graphics card instead of the CPU's cores, and the gradient's field measurements\n"
+                                                  "(every edge point measured again for each parameter nudged) are made there too. Rebuilding the\n"
+                                                  "pieces, the comparison with the mesh and the shading stay on the CPU; DINOv3 itself runs where\n"
                                                   "its own CUDA option says. The editor's window is drawn with the same card: it redraws only a\n"
                                                   "dozen times a second while a search runs, between the search's steps."
                                                 : m_Gpu->Error().c_str());
@@ -336,11 +352,24 @@ namespace Bakugan {
         ImGui::SliderFloat("Latch size", &p.latch.scale, 0.6f, 1.6f, "x %.2f");
         ImGui::DragFloat("Latch clearance", &p.latch.clearance, 0.01f, 0.15f, 1.0f, "%.2f mm");
         ImGui::SetItemTooltip("The gap printed around the rocker (what your printer needs between parts that must not fuse)");
+        ImGui::Checkbox("Remove floating bits when done", &p.removeFloatingWhenDone);
+        ImGui::SetItemTooltip("Last of all: take away the bits of each body that float apart from the rest of it (the slivers many\n"
+                              "cuts leave, which can't be printed and add nothing). Each goes by a \"Floating bit\" cut feature in\n"
+                              "its body: boxes that cover it and keep clear of the rest.");
+        {
+            float pct = p.floating.share * 100.0f;
+            if (ImGui::SliderFloat("Bits under", &pct, 0.1f, 50.0f, "%.1f%% of the body", ImGuiSliderFlags_Logarithmic)) p.floating.share = pct / 100.0f;
+            ImGui::SetItemTooltip("A separate bit of a body goes when it is smaller than this share of the body's largest piece");
+        }
         ImGui::EndDisabled();
         if (m_FinishJob.Busy()) {
             DrawJob(m_FinishJob.Control(), true, "finish", [&] { m_FinishJob.Cancel(); });
             return;
         }
+        ImGui::BeginDisabled(busy || m_Design.shapes.empty());
+        if (ImGui::Button("Remove floating bits now", ImVec2(-FLT_MIN, 0))) StartFinish(Finish::Floating);
+        ImGui::SetItemTooltip("Take away the current design's floating bits (any design; Ctrl+Z undoes it)");
+        ImGui::EndDisabled();
         ImGui::BeginDisabled(busy || m_Design.hinges.empty());
         float third = (ImGui::GetContentRegionAvail().x - 3.0f * ImGui::GetStyle().ItemSpacing.x) / 4.0f;
         if (ImGui::Button("Add hinges", ImVec2(third, 0))) StartFinish(Finish::Hinges);
@@ -382,8 +411,12 @@ namespace Bakugan {
         }
         const JobControl* c = m_AutoJob.Control();
         int it = 0, n = 0, accepted = 0, rounds = 0;
+        std::string devices;
+        bool shortfall = false;
         if (m_AutoLive) {
             std::lock_guard<std::mutex> l(m_AutoLive->mutex);
+            devices = m_AutoLive->devices;
+            shortfall = m_AutoLive->deviceShortfall;
             it = m_AutoLive->iteration;
             n = m_AutoLive->iterations;
             accepted = m_AutoLive->accepted;
@@ -399,7 +432,17 @@ namespace Bakugan {
         ImGui::SetItemTooltip("Stop and keep the best design found so far");
         if (rounds > 0) ImGui::TextDisabled("%d of %d rewrite rounds changed the design", accepted, rounds);
         if (m_AutoUseGpu && m_Gpu->Drawn() > 0)
-            ImGui::TextDisabled("GPU: %d drawings, %.1f ms the last, %d shaders compiled", m_Gpu->Drawn(), m_Gpu->LastMs(), m_Gpu->Compiles());
+            ImGui::TextDisabled("GPU: %d drawings, %.1f ms the last; %d gradients, %.1f ms the last; %d shaders compiled", m_Gpu->Drawn(),
+                                m_Gpu->LastMs(), m_Gpu->Evaluated(), m_Gpu->LastEvalMs(), m_Gpu->Compiles());
+        if (!devices.empty()) {
+            if (shortfall) Warn(devices.c_str());
+            else ImGui::TextDisabled("%s", devices.c_str());
+            ImGui::SetItemTooltip("Where each step's work ran. With Draw the views on the GPU, the views and the gradient's field\n"
+                                  "measurements (each parameter nudged, every edge point measured again) go to the GPU.\n"
+                                  "DINOv3 runs with CUDA only with an ONNX Runtime built with it (on Arch:\n"
+                                  "onnxruntime-cuda, with cuda and cudnn), else on the CPU, saying why. The views are drawn on the GPU\n"
+                                  "only with Draw the views on the GPU, by this window's OpenGL: the window must keep drawing frames.");
+        }
     }
 
     void App::GenerateScore() {
@@ -467,6 +510,11 @@ namespace Bakugan {
         ImGui::TextColored(s.surfaceCarved > 0.02f ? Amber : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled), "Sphere surface carved: %.1f%%",
                            s.surfaceCarved * 100.0f);
         ImGui::SetItemTooltip("The share of the sphere's surface hollows reach (closed, it shows there)");
+        if (m_AutoParams.fitLook == FitLook::Depth || s.depth > 0.0f) {
+            ImGui::TextDisabled("Depth mismatch %.3f", s.depth);
+            ImGui::SetItemTooltip("Where the design and the mesh both cover a pixel, how far apart their front surfaces are (0: none),\n"
+                                  "the mean over the views; part of the fit");
+        }
         ImGui::TextDisabled("loss %.3f (fit %.3f, coverage %.3f, semantic %.3f, collisions %.3f x %.0f, hinges %.3f, surface %.3f, holding %.3f)",
                             s.total, s.fit, s.coveragePenalty, s.semantic, s.collision, s.collisionScale, s.hinges, s.surface, s.dependency);
         ImGui::SetItemTooltip("Lower is better: silhouettes * (fit + coverage penalty) + semantic * its weight\n"

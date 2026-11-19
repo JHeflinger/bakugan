@@ -29,6 +29,14 @@ namespace Bakugan {
 
     struct AutoStart;
 
+    // How the open design's views are compared with the mesh's (the fit):
+    enum class FitLook {
+        Silhouette,                      // outlines only: covered and extra pixels
+        Depth,                           // outlines, and where both cover a pixel, how far apart their front surfaces are
+                                         // along the view (a depth raster each): the views see the shape in 3D, not just
+                                         // its outline
+    };
+
     struct AutoParams {
         // what is wanted
         float sphereDiameter = 0.0f;     // mm; 0: a sphere of the mesh's volume (it sits at the mesh's centre of volume)
@@ -37,6 +45,10 @@ namespace Bakugan {
         std::shared_ptr<const AutoStart> startFrom;
         bool moveTarget = true;          // the mesh it's compared with may be moved, to wherever suits the design best
         bool scaleTarget = true;         // ... and scaled (0.3x .. 3.3x, about its centre of volume)
+        FitLook fitLook = FitLook::Silhouette;
+        float depthScale = 0.05f;        // FitLook::Depth: a depth mismatch this big (a share of the mesh's size) costs a
+                                         // covered pixel half as much as a missing one; more costs up to as much (robust:
+                                         // d² / (d² + scale²)), so a piece far in front of the mesh isn't punished forever
         int views = 32;                   // directions the silhouettes are compared from
         int viewResolution = 1080;         // pixels across each view
         float minViewCoverage = 0.6f;    // every view's target must be covered at least this much (steep cost below)
@@ -65,6 +77,8 @@ namespace Bakugan {
         CarveParams carve;
         bool latchWhenDone = false;      // a press latch on the hinge that opens first
         LatchParams latch;
+        bool removeFloatingWhenDone = false;   // last: take away bits of bodies that float apart from the rest (slivers
+        FloatingParams floating;               // many cuts leave), smaller than floating.share of the body's largest piece
         float silhouetteWeight = 1.0f;   // the silhouette comparison's share of the loss (0: only the semantic one)
         // the semantic loss: the views drawn and compared by DINOv3's embeddings (see dino.hpp, semantic.cpp)
         float semanticWeight = 0.0f;     // its share of the loss (0: off)
@@ -95,6 +109,9 @@ namespace Bakugan {
                                          //           + collision weight * collision + hinge weight * hinges
                                          //           + surface weight * surface + dependency weight * dependency
         float fit = 0.0f;                // open pose against the placed mesh: mean over views of (1 - covered) + extra
+                                         // (+ depth, with FitLook::Depth)
+        float depth = 0.0f;              // FitLook::Depth: mean over views of the depth mismatch, sum over pixels both
+                                         // cover of min(T, D) · d² / (d² + scale²), over sum(T)
         float coveragePenalty = 0.0f;    // 10 per whole share a view is covered less than minViewCoverage
         float viewCover = 0.0f, viewExtra = 0.0f;              // means over the views
         float worstView = 0.0f;          // least covered view
@@ -110,6 +127,11 @@ namespace Bakugan {
         int dependents = 0;              // hinges that should be held (the moving ones, less the first to open)
         int holdable = 0;                // ... of them, those with a holder within a ledge's reach
         bool traced = false;             // the silhouettes were drawn on the GPU
+        bool gradientTraced = false;     // ... and their gradient's field evaluations made there
+        // where the step's time went (ms): drawing and comparing the views, the semantic loss (drawing, DINOv3, its
+        // slopes), collisions, the gradient's preparing (every parameter nudged: the pieces rebuilt; shades, hinges) and
+        // measuring (every slope point measured again), and the placement's (its targets drawn again)
+        float msViews = 0, msSemantic = 0, msCollisions = 0, msPrepare = 0, msMeasure = 0, msPlacement = 0;
         bool semanticTraced = false;     // ... and the semantic pictures
         float hinges = 0.0f;             // hinges away from their pieces: per hinge, how far each of its two pieces is
                                          // from its axis (the mean over the barrel's length, beyond a small slack), plus how far it is from fitting under the surface; over the mesh's size
@@ -147,6 +169,8 @@ namespace Bakugan {
         std::vector<unsigned char> semanticViews;    // RGBA: the semantic loss's views and their targets (when it's on)
         int semanticWidth = 0, semanticHeight = 0;
         std::vector<float> ruleWeights;  // the UI may change these while it runs: each rewrite round reads them (empty: the params')
+        std::string devices;             // where the latest step ran: the views drawn on the GPU or here, DINOv3 on CUDA or not
+        bool deviceShortfall = false;    // ... and something asked for the GPU didn't get it
         int recordFrames = 0;            // set before starting: this many evenly spaced snapshots go into `frames`
         std::vector<AutoFrame> frames;
     };

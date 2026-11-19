@@ -58,6 +58,14 @@ With 0 steps it only scores the editor's design as it is: its open pose against 
 - **Add a cut** (adds). A small cap sliced off a piece where it meets the sphere's surface: a box whose inner face is a little under the surface. The cap is hinged to the rest of the piece along the edge of that face, like a lid. The joint's open angle starts at 0, so nothing looks different (`rulecheck`: the open pose's field is unchanged to 0.0000 mm) until Adam opens it. The joints the piece had go with whichever part their pivot is in. No more than `maxPieces` pieces.
 - **Add a hollow** (adds). At a pixel where the open design shows outside the placed mesh (`Loss::ExtraSpots`, from the last evaluation), a rounded bar through its piece along the view that saw it, as long as the piece is deep there, so the pixel clears at once. Where the bar reaches the sphere's surface the surface term weighs it, and Adam reshapes and moves it from there. No more than `maxHollows`. A hollow inside the sphere only changes the silhouettes where an opened piece shows the sphere's inside (a cut face); the outline of the sphere's own surface only shrinks by carving through it, which the surface term charges for. In the runs so far (robot, creature) hollows were kept now and then, carving under 2% of the surface, without making the fit better on average than carving with cuts alone, which is why they're drawn half as often by default.
 - **Remove a hollow** (simplifies). Any hollow.
+- **Split** (adds). The biggest piece (by sampled volume) is cut into two halves of equal volume (the median of points
+  sampled in it, along a random direction: of 24 drawn, the one least edge on to every view) by a box past the sphere on
+  one side of the plane, and the halves are hinged at angle 0, on the cut face where both are along the barrel's length.
+  The design doesn't change: the halves fill what the piece did and move as one, so the loss is the same before and after
+  (the one thing the loss can see is the new seam, a pixel wide, in views that look along it: at 192 pixels a view a split
+  moved the fit by under 0.0002, against 0.002-0.003 for a new cut), and every parameter that was there keeps its Adam memory
+  (memory is per parameter id; only the new cutter's and joint's are fresh). Adam then opens the hinge, or moves the plane,
+  as the loss asks. Its weight is last in `AutoRules()` order, so settings and editors from before keep theirs.
 - **Remove a cut** (simplifies). Two pieces that one cutter split, and that no later cut has split since, joined by a joint (likelier the less it opens), become one piece again; the cutter and the joint go. The joints of the piece that hung from the other go to it.
 
 How often each rule is drawn is its weight (`AutoParams::ruleWeights`, in `AutoRules()` order; empty means the table's defaults). The Grammar section of the Generate tab sets them, and a running job picks up changes at its next rewrite round (through `AutoLive::ruleWeights`). A weight of 0 switches a rule off.
@@ -68,6 +76,16 @@ A rewrite is judged against leaving the carving alone, after both have had the s
 
 Only the open pose and the motion are scored. Closed, the pieces are the sphere.
 
+- **Depth rasters** (`fitLook = Depth`, instead of silhouettes alone). Each view also compares front depths: the mesh's
+  from a z-buffer (resampled with its coverage, so edges don't blend with the background, and moved and scaled with the
+  placement), the design's composited front to back from the pieces each pixel's ray enters (up to 4), each weighted by an
+  opacity that rises from 0 at its silhouette's edge to 1 a pixel inside, so the depth never jumps where an edge comes or
+  goes. Per pixel min(T, A) · d² / (d² + s²), d the depth difference, A the composite's opacity, s `depthScale` of the
+  mesh's size: robust, a covered pixel's mismatch costs at most what a missing pixel does. Added to the fit, over sum(T)
+  per view. Its gradient: each layer's depth through where its ray enters it (the entry moves e / |d distance / d t| as
+  its distance there rises by e), and each layer's opacity through its edge point. Against brute force at 128 pixels a
+  view: the whole fit's gradient cosine 0.96 (silhouettes alone: 0.985). On the GPU, from the tracer's every-piece results
+  (where rays enter each piece), the same to the last digit.
 - **Silhouettes.** Per view, with T the placed mesh's coverage of a pixel and D the design's: covered = Σ min(T, D) / Σ T, extra = Σ max(0, D − T) / Σ T, and the view's loss is (1 − covered) + extra. `fit` is the mean over the views. A view covered less than `minViewCoverage` costs 10 per whole share short.
 - **Semantics** (below), when `semanticWeight` > 0.
 - **Collisions**, weighted by `collisionWeight` (times the ramp).
@@ -139,6 +157,14 @@ The same passes the Generate tab's Finishing section runs on any design (`data/f
 - **Carve collisions away** (`CarveCollisions`). Where two bodies run into each other on the way, one is cut by the other's whole sweep: everything the other passes through between the moments they first touch and part again. Not boxes around sampled overlaps, so there are no patches, and nothing slips between samples. See *Clearances* below. It looks for where bodies meet at `checksPerHinge` poses of every hinge's turn (and the opening motion when hinges open in their own time). Of the two ways round, the body that gives way is the one that loses less, what would show on the closed sphere counting eight times. It then checks again at twice as many poses, between the first ones, and carves anything left, up to `rounds` times. Carving again replaces the clearances it made before. It works on any design; nothing is added anywhere, so nothing sticks out of the sphere. It takes 4 to 17 s on the test designs.
 - **Add hinges** (`AddHinges`): each hinge's hardware; see Hinges.
 - **Add ledges**: as above, for a carved sphere.
+- **Remove floating bits** (`RemoveFloatingBits`, last). Many cuts leave bits of a body floating apart from the rest of it:
+  slivers that can't be printed and add nothing. Each body is sampled sparsely into a narrow band level set (as for
+  meshing), its inside cells labelled 6-connected, and every piece smaller than `share` of its largest goes: a cut feature
+  "Floating bit" of boxes that cover it and keep two voxels clear of the rest of the body (a box is halved until it is; a
+  lone cell next to the rest is cut to its own cell, so at most half a voxel of the rest can go). Then the body is looked
+  at again. Pieces under 2 x 2 x 2 voxels are left alone (sharp edges sampled apart, and below what a slicer keeps), and a
+  body in several big pieces is said, not trimmed. Voxels: the bodies' longest side / 250 (about 0.17 mm for a 40 mm
+  sphere); a few seconds per design.
 - **Add latch** (`AddLatch`). A press latch on the hinge that opens first (or the selected one): a small rocker printed into the surface, flush with it. A thin web joins its leg to the body below; pressing the arm's far end in turns the rocker about the web, and its catch steps back off a lip on the other body. Where the body that stays down is deep enough at the seam, the rocker is in it and its catch lies *over* a lip on the lid's edge. Where it isn't (a thin edge), the rocker is in the lid and its catch hooks *under* a lip left at the surface of the other body; its web is then under the catch's tip where that is the lid's own material, and just inside the seam where it isn't (the lip gets a little more room over the catch there, because the catch rises slightly as it steps back). Either way it is cut from the sphere, with `clearance` around it. A place is taken only if the lid runs into the catch when it starts to open, and, with the rocker pressed, clears it all the way open. The web is made as long as the body is deep there (the longer, the less it is strained); the result says how far it bends. The rocker needs about 0.6 of the sphere's radius of depth at the seam in one of the two bodies: where neither has it, there is no latch, and the result says so.
 
 ## Clearances
@@ -153,7 +179,18 @@ A clearance (`Clearance` in `data/design.hpp`) is a boolean cut kept with the de
 
 ## The views on the GPU
 
-`AutoParams::gpu` is a `SilhouetteTracer` (`tracer.hpp`). With one, each evaluation hands every piece's field over as GLSL and gets back, per pixel of every view, the piece that covers it most, how near its ray comes and where: what `Loss::Trace` finds on the CPU, marched the same way step for step. The comparison with the mesh and the gradient (which re-evaluates fields at edge pixels and overlap samples) stay on the CPU.
+`AutoParams::gpu` is a `SilhouetteTracer` (`tracer.hpp`). With one, each evaluation hands every piece's field over as GLSL and gets back, per pixel of every view, the piece that covers it most, how near its ray comes and where: what `Loss::Trace` finds on the CPU, marched the same way step for step. More than 24 views (the shader's arrays) are drawn 24 at a time.
+
+**The gradient on the GPU.** The gradient is central differences: each parameter nudged either way, the pieces it
+touches rebuilt, and every slope point (edge pixels, depth entries, overlap samples) measured again in the field and pose
+it then has. The measuring was half of a step on the CPU (more than drawing the views). With a tracer, `Loss::Gradient`
+prepares on the CPU (the nudged pieces rebuilt, their GLSL numbers taken: a nudge changes only a field's numbers, never
+its code, so each piece's shader serves all its nudges) and hands every measurement over in one `EvalRequest`: the slope
+points (and weights) in one float texture, and a job per (parameter, side, piece, pose) that touches them, its field's
+numbers as uniforms and its pose. The shader sums weight · distance over 32 points a pixel; one read back, summed per job
+here. Shades, the hinge and surface terms stay on the CPU (few evaluations). Against the CPU's gradient: cosine 1.00000,
+magnitude within 0.02%. If the tracer can't measure, the same jobs are measured on the CPU's cores. `AutoScore::ms*` say
+where each step's time went; the editor shows it under the progress bar.
 
 The semantic pictures (`Loss::DrawSemantic`) use the same tracer, asking for every piece rather than the one covering a pixel most (`TraceRequest::everyPiece`). Each piece gets a band of its own in the target, and the shader also gives where the ray enters the piece (the CPU's bisection, step for step). The rays are what costs: up to 64 field evaluations a pixel and piece, more on edges. What is left on the CPU is the per-layer work: the normal and the slope along the ray (8 field evaluations per covered layer), the shade, and compositing the layers. On the CPU's cores that was about a quarter of drawing the pictures. DINOv3 itself runs where its own CUDA option says. `Loss::SemanticPictures` draws them either way without DINOv3, for testing: the two agree to 0.0001 (silhouette, depth) and 0.004 (shaded) of full brightness, at 224 pixels a view.
 
