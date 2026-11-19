@@ -7,7 +7,7 @@ if [ "$#" -ne 1 ]; then
     exit 1
 fi
 
-OBJECT="$(realpath -- "$1")"
+INPUT_SHAPE="$1"
 
 # Find directory containing this script
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,7 +33,7 @@ if [ "${#FILES[@]}" -eq 0 ]; then
     exit 1
 fi
 
-echo "Found ${#FILES[@]} configurations"
+echo "Found ${#FILES[@]} config files"
 
 # Check if session is already running
 if tmux has-session -t "$SESSION" 2>/dev/null; then
@@ -60,10 +60,10 @@ for i in "${!PANES[@]}"; do
     pane="${PANES[$i]}"
     config="${FILES[$i]}"
 
-    echo "Launching $OBJECT with $config"
+    echo "Launching $INPUT_SHAPE with $config"
 
     tmux send-keys -t "$pane" "cd ../../" C-m
-    tmux send-keys -t "$pane" "tiny -r optimize \"../../assets/test_shapes/$INPUT_SHAPE\" -c \"../../multirun_configs/$config\"" C-m
+    tmux send-keys -t "$pane" "tiny -r optimize \"../../assets/test_shapes/$INPUT_SHAPE\" -c \"$config\"" C-m
 done
 
 # Attach
