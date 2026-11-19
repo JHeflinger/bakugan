@@ -445,6 +445,7 @@ namespace Bakugan {
             }
             Normalize(e.mesh, p.meshSize);
             AutoParams ap = p.generate;
+            ap.startFrom = nullptr;                          // (every mesh starts from its own sphere)
             auto search = std::make_shared<AutoLive>();
             search->recordFrames = p.video ? searchFrames : 0;      // (snapshots are only for the video)
             show([&](SuiteLive& s) { s.search = search; });
@@ -464,7 +465,7 @@ namespace Bakugan {
                 e.frames = search->frames;
             }
             if (e.frames.empty()) e.frames.push_back({ r.design, r.carving, r.score, ap.steps });
-            std::ofstream(outDir / (e.name + ".txt")) << r.design.Serialize();
+            std::ofstream(outDir / (e.name + ".txt")) << SerializeWithTarget(r.design, r.score);
             std::ofstream(outDir / (e.name + ".report.txt")) << r.message << "\n";
             if (p.preview) {
                 std::string perr;

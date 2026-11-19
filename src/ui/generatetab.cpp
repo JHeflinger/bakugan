@@ -185,6 +185,33 @@ namespace Bakugan {
     void App::GenerateStart() {
         AutoParams& p = m_AutoParams;
         ImGui::SeparatorText("Start from");
+        int from = (int)m_AutoStartFrom;
+        if (ImGui::RadioButton("The sphere", from == 0)) from = 0;
+        ImGui::SetItemTooltip("The sphere, whole: one piece, cut up from there");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("This design", from == 1)) from = 1;
+        ImGui::SetItemTooltip("Carry the search on from the design in the editor (one the generator made: a result, or a\n"
+                              "loaded one). What finishing added (hinge hardware, ledges, carving, a latch) is left out\n"
+                              "and done again at the end, as the Finishing settings say.");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("A design file", from == 2)) from = 2;
+        ImGui::SetItemTooltip("Carry the search on from a saved design (.txt): a result the generator saved, the command\n"
+                              "line's <name>.txt or <name>.partial.txt, or one saved from here after generating");
+        m_AutoStartFrom = (AutoStartFrom)from;
+        if (m_AutoStartFrom == AutoStartFrom::File) {
+            char buf[1024];
+            snprintf(buf, sizeof(buf), "%s", m_AutoStartPath.c_str());
+            ImGui::SetNextItemWidth(WidthBeside("..."));
+            if (ImGui::InputTextWithHint("##startdesign", "design to start from (.txt)", buf, sizeof(buf))) m_AutoStartPath = buf;
+            ImGui::SetItemTooltip("The search starts from this design's pieces, cuts and hinges. It is moved and scaled onto this\n"
+                                  "run's sphere; the mesh starts where the file says it was placed for it (when it says).");
+            ImGui::SameLine();
+            std::string chosen;
+            if (ImGui::Button("...##startdesign") && FileDialog(false, "txt", m_AutoStartPath.empty() ? std::string(m_DesignPath) : m_AutoStartPath, &chosen))
+                m_AutoStartPath = chosen;
+        }
+        if (m_AutoStartFrom != AutoStartFrom::Sphere)
+            Hint("Overlaps start cheap again (Collisions: ... by the end), as in any run: lower that, or the steps, to refine gently.");
         ImGui::DragFloat("Sphere size", &p.sphereDiameter, 0.5f, 0.0f, 500.0f, p.sphereDiameter > 0.0f ? "%.1f mm across" : "auto");
         ImGui::SetItemTooltip("The sphere that's carved, at the mesh's centre of volume. Auto: the mesh's volume (the open\n"
                               "design then has the mesh's volume too: pieces only move).");
@@ -339,8 +366,11 @@ namespace Bakugan {
         ImGui::SetItemTooltip("The sphere that's carved, in the output view (the design closes into it)");
         if (!m_AutoJob.Busy()) {
             ImGui::BeginDisabled(!m_HasReference || m_SuiteJob.Busy());
-            if (ImGui::Button("Generate", ImVec2(HalfWidth(), 30))) StartAuto(false);
-            ImGui::SetItemTooltip("Replace the design with a carved sphere (Ctrl+Z brings it back)");
+            if (ImGui::Button(m_AutoStartFrom == AutoStartFrom::Sphere ? "Generate" : "Continue", ImVec2(HalfWidth(), 30))) StartAuto(false);
+            ImGui::SetItemTooltip("%s", m_AutoStartFrom == AutoStartFrom::Sphere
+                                            ? "Replace the design with a carved sphere (Ctrl+Z brings it back)"
+                                            : "Carry the search on from the design chosen in Start from, and replace the design with\n"
+                                              "the result (Ctrl+Z brings it back)");
             ImGui::SameLine();
             ImGui::BeginDisabled(m_Design.shapes.empty());
             if (ImGui::Button("Score this design", ImVec2(-FLT_MIN, 30))) StartAuto(true);

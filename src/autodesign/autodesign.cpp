@@ -99,10 +99,53 @@ namespace Bakugan {
             return res;
         }
 
-        // 2. the start: the sphere, whole
+        // 2. the start: the sphere, whole (or the carving of a design to carry on from)
         State cur;
         cur.carving = Carving::Sphere(loss.SphereCentre(), loss.SphereRadius());
+        std::string started;                                 // what the result's message says about the start
+        if (p.startFrom) {
+            c.SetStage("Reading the design to start from");
+            const AutoStart& from = *p.startFrom;
+            Carving k;
+            std::string err, notes;
+            if (!CarvingFromDesign(from.design, &k, &err, &notes)) {
+                res.message = "Can't start from " + from.source + ": " + err + ".";
+                return res;
+            }
+            // onto this run's sphere: the same carving, moved and scaled with it (the identity for a design made for this
+            // mesh with these settings; another mesh size or sphere size maps over)
+            const Vector3 was = k.centre;
+            const float s = loss.SphereRadius() / k.radius;
+            auto map = [&](Vector3 q) { return Vector3Add(loss.SphereCentre(), Vector3Scale(Vector3Subtract(q, was), s)); };
+            for (Cutter& u : k.cutters) {
+                u.sf.position = map(u.sf.position);
+                u.sf.size = Vector3Scale(u.sf.size, s);
+                u.sf.dilation *= s;
+                u.sf.onion *= s;
+            }
+            for (Joint& j : k.joints) j.pivot = map(j.pivot);
+            k.centre = loss.SphereCentre();
+            k.radius = loss.SphereRadius();
+            cur.carving = k;
+            // where the mesh was placed for it, carried over: its offset from the sphere grows with the sphere; its scale is
+            // relative to the mesh's own size, so it stays unless the sphere changed size against the mesh
+            if (from.hasTarget) {
+                const float meshRatio = from.meshSize > 0.0f ? loss.L() / from.meshSize : s;
+                if (p.moveTarget) cur.target.offset = Vector3Scale(from.target.offset, s);
+                if (p.scaleTarget) cur.target.scale = std::clamp(from.target.scale * s / meshRatio, expf(-1.2f), expf(1.2f));
+                cur.target = loss.KeepTargetInFrame(cur.target);
+            }
+            int hollows = k.Hollows();
+            started = Utils::Format("Started from %s (%d piece%s, %d joint%s, %d hollow%s", from.source.c_str(), (int)k.pieces.size(),
+                                    k.pieces.size() == 1 ? "" : "s", (int)k.joints.size(), k.joints.size() == 1 ? "" : "s", hollows, hollows == 1 ? "" : "s");
+            if (fabsf(s - 1.0f) > 1e-3f || Vector3Distance(was, loss.SphereCentre()) > 1e-3f * loss.SphereRadius())
+                started += Utils::Format("; its %.1f mm sphere moved and scaled onto this run's %.1f mm one", 2.0f * k.radius / s, 2.0f * loss.SphereRadius());
+            started += from.hasTarget ? ")." : "; it had no saved mesh placement, so the mesh starts where it is).";
+            if (!notes.empty()) started += " " + notes;
+            started += " ";
+        }
         cur.carving.ordered = p.orderHinges || p.dependencies;
+        Tidy(cur.carving);
         cur.adam.lr = p.learningRate;
         int reordered = 0;
         // the opening order looked at again: taken when the carving does better with it (both scored alike)
@@ -246,7 +289,7 @@ namespace Bakugan {
         res.carving = best;
         res.score = bestScore;
         const Placement& t = bestScore.target;
-        res.message = Utils::Format("%s the sphere into %d pieces on %d joints: silhouettes cover %.0f%% of the mesh's (+%.0f%% extra), "
+        res.message = started + Utils::Format("%s the sphere into %d pieces on %d joints: silhouettes cover %.0f%% of the mesh's (+%.0f%% extra), "
                                     "worst view %.0f%%; the mesh moved %.1f mm and scaled %.2fx (loss %.3f; %d steps, %d of %d rewrite "
                                     "rounds changed it%s).",
                                     res.cancelled ? "Stopped, kept the best so far: carved" : "Carved", (int)best.pieces.size(), (int)best.joints.size(),

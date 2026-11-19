@@ -18,6 +18,7 @@ The editor and the test suite call one function, `AutoDesign`, declared in `auto
 | `semantic.cpp` | the semantic part of the loss: the views drawn as pictures and compared by DINOv3 |
 | `dino.hpp/.cpp` | DINOv3 through ONNX Runtime, loaded at run time (its C API header is in `src/vendor/onnxruntime`) |
 | `grammar.hpp/.cpp` | the rewrite rules: add or remove a cut (and its hinge), add or remove a hollow |
+| `resume.cpp` | starting from a design instead of the sphere: the carving a design was built from, and the mesh's saved placement |
 | `suite*.cpp/hpp` | the test suite: every mesh in a folder, into one video |
 
 ## The carving
@@ -39,7 +40,10 @@ Pieces are joined by **joints**, one per cut. A joint turns its child piece abou
 1. **Target.** The mesh, drawn finely from `views` directions. The sphere sits at the mesh's centre of volume and has its volume (or `sphereDiameter`).
    - The mesh may be moved and scaled about its centre of volume (`moveTarget`, `scaleTarget`): its offset and log scale are four more Adam parameters. It's kept where the views see all of it, and between 0.3× and 3.3×.
    - Their gradient comes from the targets drawn again (resampled from the fine drawing) with each nudged two units either way, against the design as drawn.
-2. **Start.** The sphere, whole: one piece.
+2. **Start.** The sphere, whole: one piece. Or (`AutoParams::startFrom`) a design the generator made, taken back to its carving
+   (`CarvingFromDesign`: `Carving::Build` the other way round, finishing left out), moved and scaled onto this run's sphere,
+   with the mesh placed where the design's file says it was (`SerializeWithTarget` writes that; `ParseAutoStart` reads it).
+   The editor's Start from section and the command line's `--start` set it.
 3. **Steps.** Until the step budget runs out:
    - Every step is one Adam step on every parameter: the cutters', the joints' and the placement's.
    - What overlaps cost rises steadily over the run, from `collisionWeight` to `collisionRamp` times it: early on the search may try things, by the end the pieces have to be clear of each other. Carvings from different times are compared as they'd score at the end of the ramp.

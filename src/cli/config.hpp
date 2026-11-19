@@ -19,6 +19,7 @@ namespace Bakugan::Cli {
     struct InputParams {
         std::string mesh;                // the .obj to fit (optimize, score)
         float meshSize = 0.0f;           // mm: centre it and scale its longest side to this (0: as the file has it)
+        std::string startDesign;         // optimize: a saved design (.txt) to carry the search on from (empty: the sphere)
     };
 
     struct OutputParams {

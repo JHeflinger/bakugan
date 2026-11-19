@@ -24,6 +24,7 @@ namespace Bakugan {
         AutoParams p = m_AutoParams;
         p.gpu = m_AutoUseGpu && m_Gpu->Ok() ? m_Gpu : nullptr;
         if (scoreOnly) p.steps = 0;      // only score the current design (against the mesh where it is)
+        else if (!AutoStartFor(p)) return;
         Design start = m_Design;
         m_AutoLive = std::make_shared<AutoLive>();
         m_AutoLive->ruleWeights = p.ruleWeights;      // the Grammar sliders change these while it runs
@@ -40,7 +41,34 @@ namespace Bakugan {
         }
         m_AutoJob.Start([mesh, start, p, live](JobControl& c) { return AutoDesign(*mesh, start, p, c, live); });
         m_Status = scoreOnly ? "Scoring the design against " + m_ReferenceName + "..."
-                             : "Carving a sphere into " + m_ReferenceName + "...";
+                   : p.startFrom ? "Carrying " + p.startFrom->source + " on into " + m_ReferenceName + "..."
+                                 : "Carving a sphere into " + m_ReferenceName + "...";
+    }
+
+    // The design the search starts from, as chosen in the Start from section: checked here, so a design the generator
+    // can't carry on from is said at once, not after drawing the mesh's views.
+    bool App::AutoStartFor(AutoParams& p) {
+        p.startFrom = nullptr;
+        if (m_AutoStartFrom == AutoStartFrom::Sphere) return true;
+        auto s = std::make_shared<AutoStart>();
+        std::string err;
+        if (m_AutoStartFrom == AutoStartFrom::Current) {
+            if (m_Design.shapes.empty()) { m_Status = "Nothing to start from: the design is empty."; return false; }
+            s->design = m_Design;
+            s->source = "the current design";
+            if (m_HasAutoScore && m_AutoScoreFor == m_Design && m_AutoScore.valid) {      // where the mesh was placed for it
+                s->hasTarget = true;
+                s->target = m_AutoScore.target;
+                s->meshSize = m_AutoScore.meshSize;
+            }
+        } else {
+            if (m_AutoStartPath.empty()) { m_Status = "Choose the design file to start from (Generate > Start from)."; return false; }
+            if (!ReadAutoStart(m_AutoStartPath, s.get(), &err)) { m_Status = "Can't start from " + m_AutoStartPath + ": " + err; return false; }
+        }
+        Carving k;
+        if (!CarvingFromDesign(s->design, &k, &err)) { m_Status = "Can't start from " + s->source + ": " + err + "."; return false; }
+        p.startFrom = s;
+        return true;
     }
 
     // The scored silhouettes of the best design, as a texture for the Generate tab (on this thread: it has the GL

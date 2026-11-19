@@ -5,6 +5,7 @@ sliders set is a line in a settings file.
 
 ```
 foldaball optimize bunny.obj -c settings.ini -o results/bunny     # one mesh (the Generate button)
+foldaball optimize bunny.obj --start results/bunny/bunny_1/bunny.txt   # carry a saved design's search on
 foldaball suite meshes/ -c settings.ini -o results/suite           # every .obj in a folder
 foldaball score results/bunny/bunny.txt bunny.obj                  # score a saved design, no search
 foldaball config > settings.ini                                    # every setting, with its value and a comment
@@ -55,7 +56,7 @@ settings: goal.views: must be between 1 and 64, got 0
 |---|---|---|
 | `[input]` | `mesh`, `mesh_size` (centre and scale to this many mm; 0 = as the file is) | Model tab |
 | `[goal]` | views, collisions, hinges, dependencies, surface, mesh move/scale | Goal |
-| `[start]` | `sphere_diameter` | Start from |
+| `[start]` | `sphere_diameter`; `design`: a saved design to carry on from (`--start`) | Start from |
 | `[semantic]` | DINOv3 loss, silhouette weight | Semantic loss |
 | `[optimizer]` | steps, learning rate, rounds, lookahead, limits, seed | Optimizer |
 | `[grammar]` | one weight per rewrite rule | Grammar |
@@ -73,7 +74,7 @@ Relative paths are relative to where you run foldaball. The suite uses the same 
 
 | file | what |
 |---|---|
-| `<name>.txt` | the design: open it in the editor |
+| `<name>.txt` | the design: open it in the editor, or carry the search on from it (`--start`) |
 | `<name>.png` | the result open, a third and two thirds closed, and closed |
 | `<name>.report.txt` | the message and score in words |
 | `<name>.result.json` | the same, for scripts |
@@ -86,6 +87,26 @@ Relative paths are relative to where you run foldaball. The suite uses the same 
 `suite` writes to `-o DIR` (default `<folder>/autodesign_suite`): per mesh `<name>.txt`, `.png`, `.report.txt`, plus
 `summary.csv` (one row per mesh, written as each finishes), `suite.config.ini` and, with `suite.video = true`, `suite.mp4`.
 **ffmpeg is only needed for the video**: `--no-video` (or `suite.video = false`) skips it, and so the check for it.
+
+## Carrying a search on
+
+`--start design.txt` (or `start.design` in the settings) starts `optimize` from a design the generator made instead of the
+whole sphere: a result's `<name>.txt`, a `<name>.partial.txt` checkpoint from a run that was killed, or a design saved from
+the editor. The run is otherwise an ordinary one: its own steps, seed, settings and output folder.
+
+- **What is read.** The carving the design was built from: its pieces, cutters, hollows and joints, recognised by the
+  generator's names (`Sphere`, `Cutter N`, `Hollow N`, `Outside cutter N`, `Joint N`). Whatever finishing added (hinge
+  hardware, ledges, clearances, a latch) is left out and done again at the end, as `[finishing]` says. A design the
+  generator didn't make (a template, one built by hand) is refused, with the reason.
+- **Where the mesh was.** Designs written now end with an `autodesign-target` line: where the mesh was placed (moved and
+  scaled) when the design was scored. The search picks up from there. Older files lack it; they still work, but the mesh
+  starts where it is and the first steps spend themselves finding it again. (`Design::Deserialize`, and older builds, skip
+  the line.)
+- **Another frame.** The carving is moved and scaled onto this run's sphere, so a design made at another `mesh_size`, or in
+  the editor, carries over. A different `sphere_diameter` against the mesh changes the problem, not just the frame.
+- **The collision ramp starts again**, as in any run: overlaps cost `collision_weight` at first and `collision_ramp` times
+  that by the end. To refine a finished design gently, lower the ramp or the steps.
+- `suite` refuses `start.design`: every mesh starts from its own sphere.
 
 ## Running on a server
 

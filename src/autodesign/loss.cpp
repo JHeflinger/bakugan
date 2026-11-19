@@ -289,6 +289,7 @@ namespace Bakugan {
         s.target.centre = m_MeshCentre;
         s.centre = m_SphereCentre;
         s.radius = m_SphereRadius;
+        s.meshSize = m_L;
         if (target.offset.x != m_Placed.offset.x || target.offset.y != m_Placed.offset.y || target.offset.z != m_Placed.offset.z ||
             target.scale != m_Placed.scale) {
             m_Placed = target;

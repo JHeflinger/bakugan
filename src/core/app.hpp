@@ -268,6 +268,10 @@ namespace Bakugan {
         bool m_HasAutoChecked = false;
         std::shared_ptr<GpuSilhouettes> m_Gpu;        // draws the generator's silhouettes with this thread's GL context
         bool m_AutoUseGpu = false;
+        enum class AutoStartFrom { Sphere, Current, File };
+        AutoStartFrom m_AutoStartFrom = AutoStartFrom::Sphere;     // what Generate starts the search from
+        std::string m_AutoStartPath;                  // ... the design file, with AutoStartFrom::File
+        bool AutoStartFor(AutoParams& p);             // sets p.startFrom as chosen; false (and says why) when it can't be had
 
         // finishing passes on the current design (Generate tab)
         Job<FinishResult> m_FinishJob;

@@ -307,7 +307,8 @@ namespace Bakugan {
     }
 
     void App::SaveDesign() {
-        std::string text = m_Design.Serialize();
+        // with the mesh's placement when the shown score is this design's, so Generate can carry on from the file
+        std::string text = m_HasAutoScore && m_AutoScoreFor == m_Design ? SerializeWithTarget(m_Design, m_AutoScore) : m_Design.Serialize();
         std::string err;
         if (Utils::WriteTextFile(m_DesignPath, text, &err)) m_Status = std::string("Saved the design to ") + m_DesignPath;
         else m_Status = err;

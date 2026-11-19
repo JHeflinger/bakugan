@@ -212,6 +212,9 @@ namespace Bakugan::Cli {
 
         section = "start";
         Float("sphere_diameter", p.sphereDiameter, 0, 100000, "The sphere that's carved, mm across, at the mesh's centre of volume.", "auto: the mesh's volume");
+        Str("design", input.startDesign,
+            "optimize: a design the generator made (a .txt it wrote, e.g. a result or a .partial.txt) to carry the search on from, "
+            "instead of the whole sphere. Its carving is moved and scaled onto this run's sphere. Empty: the sphere.");
 
         section = "semantic";
         Float("semantic_weight", p.semanticWeight, 0, 1000, "What the views looking different to DINOv3 costs. Needs the model and ONNX Runtime below.", "off");

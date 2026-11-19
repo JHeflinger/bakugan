@@ -27,9 +27,14 @@ namespace Bakugan {
                                          // and right), on a dark grey background
     };
 
+    struct AutoStart;
+
     struct AutoParams {
         // what is wanted
         float sphereDiameter = 0.0f;     // mm; 0: a sphere of the mesh's volume (it sits at the mesh's centre of volume)
+        // where the search starts: null, the sphere whole; otherwise a design the generator made (a saved .txt, or the
+        // editor's), carried on from (resume.cpp)
+        std::shared_ptr<const AutoStart> startFrom;
         bool moveTarget = true;          // the mesh it's compared with may be moved, to wherever suits the design best
         bool scaleTarget = true;         // ... and scaled (0.3x .. 3.3x, about its centre of volume)
         int views = 32;                   // directions the silhouettes are compared from
@@ -117,6 +122,7 @@ namespace Bakugan {
         Placement target;                // where the mesh was placed when this was scored
         Vector3 centre = { 0, 0, 0 };    // the sphere's (the closed pose)
         float radius = 0.0f;
+        float meshSize = 0.0f;           // the mesh's size (the loss's L), in the frame it was scored in
     };
 
     struct AutoFrame {                   // a snapshot of the best design, for recordings
@@ -163,7 +169,31 @@ namespace Bakugan {
     };
     std::vector<AutoRuleInfo> AutoRules();
 
-    // A carving from the sphere up (steps > 0), or (steps == 0) the score of `start` as it is, against the mesh as it is.
+    // A carving from the sphere up (steps > 0; or from p.startFrom), or (steps == 0) the score of `start` as it is,
+    // against the mesh as it is.
     AutoResult AutoDesign(const TriMesh& mesh, const Design& start, const AutoParams& p, JobControl& c,
                           std::shared_ptr<AutoLive> live = nullptr);
+
+    // ---- starting from a design (resume.cpp) -------------------------------------------------------------------------
+    // A design the generator made, to carry the search on from, and (when it was saved with one) where the mesh was
+    // placed for it.
+    struct AutoStart {
+        Design design;
+        std::string source;              // what it is, for messages ("bunny.txt", "the current design")
+        bool hasTarget = false;
+        Placement target;                // the mesh's placement it was scored with ...
+        float meshSize = 0.0f;           // ... and the mesh's size then (0: unknown), so another frame can be mapped
+    };
+
+    // A design's text with the placement it was scored with: Design::Serialize, plus an "autodesign-target" line that
+    // Design::Deserialize (and older builds) skip. Only the design when the score isn't valid.
+    std::string SerializeWithTarget(const Design& d, const AutoScore& score);
+    // Reads such a text (or any design file: then without a placement).
+    bool ParseAutoStart(const std::string& text, const std::string& source, AutoStart* out, std::string* err);
+    bool ReadAutoStart(const std::string& path, AutoStart* out, std::string* err);
+    // The carving a design was built from (Carving::Build, the other way round): bodies with the generator's sphere,
+    // "Cutter N" / "Hollow N" cuts and "Outside cutter N" features, hinges between them. Whatever finishing added
+    // (hinge hardware, ledges, clearances, a latch) is left out, and listed in `notes`. False, and why, for a design the
+    // generator didn't make (or one edited past recognising).
+    bool CarvingFromDesign(const Design& d, Carving* out, std::string* err, std::string* notes = nullptr);
 }

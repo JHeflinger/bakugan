@@ -113,6 +113,7 @@ namespace {
         "  -j, --threads N        worker threads (runtime.threads; default: every core)\n"
         "      --steps N          optimizer.steps\n"
         "      --seed N           optimizer.seed\n"
+        "      --start FILE       optimize: carry the search on from a saved design (.txt) instead of the sphere (start.design)\n"
         "      --no-video         suite: skip the video (and so ffmpeg)\n"
         "  -q, --quiet            no progress lines\n"
         "  -h, --help             this text\n"
@@ -145,6 +146,7 @@ namespace {
             else if (flag == "-j" || flag == "--threads") { if (!value(i, arg, &v)) return false; a->sets.push_back({ "runtime.threads", v }); }
             else if (flag == "--steps") { if (!value(i, arg, &v)) return false; a->sets.push_back({ "optimizer.steps", v }); }
             else if (flag == "--seed") { if (!value(i, arg, &v)) return false; a->sets.push_back({ "optimizer.seed", v }); }
+            else if (flag == "--start") { if (!value(i, arg, &v)) return false; a->sets.push_back({ "start.design", v }); }
             else if (arg.size() > 1 && arg[0] == '-') { *error = "unknown option " + arg + " (see --help)"; return false; }
             else if (a->command.empty()) a->command = arg;
             else a->positional.push_back(arg);
@@ -270,6 +272,21 @@ namespace {
             return 2;
         }
         if (cfg.input.mesh.empty()) { fprintf(stderr, "usage: foldaball optimize <mesh.obj> (or input.mesh in the settings)\n"); return 2; }
+        // a design to carry on from: read and checked now, before anything is written
+        std::shared_ptr<AutoStart> startFrom;
+        if (!cfg.input.startDesign.empty()) {
+            auto s = std::make_shared<AutoStart>();
+            Carving k;
+            std::string notes;
+            if (!ReadAutoStart(cfg.input.startDesign, s.get(), &err) || !CarvingFromDesign(s->design, &k, &err, &notes)) {
+                fprintf(stderr, "can't start from %s: %s\n", cfg.input.startDesign.c_str(), err.c_str());
+                return 1;
+            }
+            startFrom = s;
+            if (!a.quiet)
+                printf("Starting from %s: %d pieces, %d joints, %d hollows%s.\n", cfg.input.startDesign.c_str(), (int)k.pieces.size(),
+                       (int)k.joints.size(), k.Hollows(), s->hasTarget ? "" : " (no saved mesh placement: the mesh starts where it is)");
+        }
         TriMesh mesh;
         if (!LoadMesh(cfg.input.mesh, cfg.input.meshSize, &mesh, &err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
         const fs::path baseDir = cfg.output.dir.empty() ? fs::path("foldaball_out") : fs::path(cfg.output.dir);
@@ -280,6 +297,7 @@ namespace {
 
         AutoParams p = cfg.generate;
         p.gpu = nullptr;                                     // (the editor's GL context is the only tracer there is)
+        p.startFrom = startFrom;
         auto live = std::make_shared<AutoLive>();
         live->ruleWeights = p.ruleWeights;
         if (!a.quiet)
@@ -306,14 +324,16 @@ namespace {
                     auto now = Clock::now();
                     if (now - lastWritten < std::chrono::seconds(cfg.output.checkpointSeconds)) return;
                     Design best;
+                    AutoScore score;
                     {
                         std::lock_guard<std::mutex> l(live->mutex);
                         if (live->version == 0 || live->version == lastCheckpoint) return;
                         lastCheckpoint = live->version;
                         best = live->best;
+                        score = live->score;
                     }
                     lastWritten = now;
-                    Write(outDir / (name + ".partial.txt"), best.Serialize());
+                    Write(outDir / (name + ".partial.txt"), SerializeWithTarget(best, score));      // (--start carries on from it)
                 });
             r = AutoDesign(mesh, Design{}, p, control, live);
         }
@@ -326,10 +346,11 @@ namespace {
         // ---- the results
         std::vector<std::string> written;
         auto file = [&](const std::string& suffix) { return outDir / (name + suffix); };
-        if (Write(file(".txt"), r.design.Serialize())) written.push_back(file(".txt").string());
+        if (Write(file(".txt"), SerializeWithTarget(r.design, r.score))) written.push_back(file(".txt").string());
         {
-            std::string t = Utils::Format("Mesh: %s (%d triangles)\nSteps: %d   seed %u   time %s\n%s\n\n%s\n", cfg.input.mesh.c_str(),
-                                          (int)mesh.indices.size() / 3, p.steps, p.seed, Watcher::Duration(seconds).c_str(),
+            std::string t = Utils::Format("Mesh: %s (%d triangles)\nStart: %s\nSteps: %d   seed %u   time %s\n%s\n\n%s\n", cfg.input.mesh.c_str(),
+                                          (int)mesh.indices.size() / 3, startFrom ? cfg.input.startDesign.c_str() : "the sphere, whole",
+                                          p.steps, p.seed, Watcher::Duration(seconds).c_str(),
                                           r.cancelled ? "STOPPED EARLY: this is the best design found so far." : "Finished.",
                                           r.message.c_str());
             t += "\nScore\n" + ScoreLines(r.score);
@@ -339,7 +360,8 @@ namespace {
         }
         {
             std::ostringstream j;
-            j << "{\n  \"mesh\": " << Json(cfg.input.mesh) << ",\n  \"ok\": true,\n  \"cancelled\": " << (r.cancelled ? "true" : "false")
+            j << "{\n  \"mesh\": " << Json(cfg.input.mesh) << ",\n  \"start\": " << (startFrom ? Json(cfg.input.startDesign) : std::string("null"))
+              << ",\n  \"ok\": true,\n  \"cancelled\": " << (r.cancelled ? "true" : "false")
               << ",\n  \"seconds\": " << Utils::Format("%.1f", seconds) << ",\n  \"steps\": " << p.steps << ",\n  \"seed\": " << p.seed
               << ",\n  \"pieces\": " << r.carving.pieces.size() << ",\n  \"joints\": " << r.carving.joints.size()
               << ",\n  \"score\": " << ScoreJson(r.score) << ",\n  \"motion_check\": "
@@ -432,6 +454,10 @@ namespace {
         if (!a.positional.empty()) cfg.suite.folder = a.positional[0];
         std::string err;
         if (!cfg.Validate(&err)) { fprintf(stderr, "settings: %s\n", err.c_str()); return 2; }
+        if (!cfg.input.startDesign.empty()) {
+            fprintf(stderr, "start.design (--start) is for optimize: a suite starts every mesh from its sphere. Clear it (-s start.design=).\n");
+            return 2;
+        }
         const std::string folder = cfg.suite.folder;
         std::error_code ec;
         if (folder.empty() || !fs::is_directory(folder, ec)) { fprintf(stderr, "suite: '%s' is not a folder of .obj files.\n", folder.c_str()); return 2; }
