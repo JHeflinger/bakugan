@@ -2,6 +2,7 @@
 // Software drawing for the test suite's video (it runs on a worker thread, away from the GPU): a canvas with text,
 // designs meshed from their fields, and a small depth tested rasterizer with outlines.
 #include "data/design.hpp"
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,19 @@ namespace Bakugan::Suite {
         void Rgb24(std::vector<unsigned char>* out) const;                  // what ffmpeg is fed
     };
     int TextWidth(const std::string& s, int scale);
+
+    // ffmpeg reading raw RGB frames (w x h, both even) on its standard input, writing an H.264 mp4.
+    class Encoder {
+    public:
+        bool Open(const std::string& path, int w, int h, int fps);
+        bool Write(const std::vector<unsigned char>& rgb);
+        bool Close();                    // true when ffmpeg finished cleanly
+        bool IsOpen() const { return m_Pipe != nullptr; }
+        ~Encoder() { if (m_Pipe) Close(); }
+    private:
+        FILE* m_Pipe = nullptr;
+        void (*m_OldPipe)(int) = nullptr;
+    };
     std::string FitText(std::string s, int width, int scale);              // cut to fit, with an ellipsis
 
     // A design's bodies as triangle meshes, in the design pose (moved per frame by their transforms).

@@ -107,6 +107,11 @@ namespace Bakugan {
         box.size = Vector3Scale({ 1, 1, 1 }, 2.2f * radius);
 
         std::vector<int> body(pieces.size());
+        Design::NameIndex names;                          // (d is built from nothing: its names, kept as they're given)
+        for (const Shape& s : d.shapes) names.used.insert(s.name);
+        for (const Group& g : d.groups) names.used.insert(g.name);
+        for (const Hinge& h : d.hinges) names.used.insert(h.name);
+        d.names = &names;
         for (size_t k = 0; k < pieces.size(); k++) {
             const Piece& p = pieces[k];
             body[k] = d.groups[d.AddGroup("Piece " + std::to_string(k + 1), -1)].id;
@@ -141,6 +146,7 @@ namespace Bakugan {
             h.t1 = j.t1;
             h.hardware = false;
         }
+        d.names = nullptr;
         if (bodyOf) *bodyOf = body;
         return d;
     }

@@ -1,4 +1,6 @@
 #pragma once
+#include <unordered_map>
+#include <unordered_set>
 #include <cstdint>
 #include "data/superfrustum.hpp"
 #include <string>
@@ -169,6 +171,14 @@ namespace Bakugan {
         void Repair();
         std::string UniqueName(const std::string& base) const;
         Color NextColor() const;
+        // While set (by a builder adding many items, and nothing else), every name in the design, and per name the next
+        // number to try after it: UniqueName then gives the same names without looking through every item each time.
+        // Only good while items are only added. Not part of the design (not copied with it, not compared).
+        struct NameIndex {
+            std::unordered_set<std::string> used;
+            std::unordered_map<std::string, int> next;
+        };
+        NameIndex* names = nullptr;
 
         std::string Serialize() const;
         bool Deserialize(const std::string& text, std::string* err);

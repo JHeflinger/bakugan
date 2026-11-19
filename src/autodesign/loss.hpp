@@ -156,6 +156,7 @@ namespace Bakugan {
         // The placed mesh's front depth per pixel (along the view, from the frame's centre; where it covers nothing: 0)
         std::vector<std::vector<float>> TargetDepths(const Placement& t) const;
         float DepthCost(float dz, float* slope) const;   // a covered pixel's depth mismatch cost, and its slope
+        void OnePiece(const Bodies& b, AutoScore& s, Slopes& slopes);   // the one-piece term (AutoParams::onePiece)
         void Collisions(const Design& d, const Bodies& b, AutoScore& s, Slopes& slopes, float phase);
         // What one sample inside two pieces costs, and its slope against its depth.
         float ClashCost(float depth, float* slope) const;
@@ -172,6 +173,7 @@ namespace Bakugan {
         float HingeCost(const Hinge& h, const BodyField& parent, const BodyField& child, float* farthest = nullptr) const;
         float HingeWeight() const { return m_P.hingeWeight; }
         float SurfaceTerm(const Carving& c, float* carved = nullptr) const;
+        float SurfaceTermWith(const Carving& c, const std::vector<float>& others, const SuperFrustum& changed) const;
         bool Gradient(const Carving& c, const Placement& target, const std::vector<int>& bodyOf, const Bodies& b, const Slopes& slopes,
                       const Shades& shades, const std::vector<Param>& ps, std::vector<float>& grad, AutoScore* s = nullptr);
         // A ray through the frame at (sx, sy) (from its centre, in mm) against one body (moved by xf), sphere traced

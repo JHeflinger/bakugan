@@ -311,6 +311,7 @@ namespace {
         t += Utils::Format("  hinges off pieces    %.4f   (farthest a piece is from an axis: %.2f mm)\n", s.hinges, s.hingeGap);
         if (s.dependents > 0) t += Utils::Format("  held hinges          %d of %d have a holder in reach\n", s.holdable, s.dependents);
         if (s.depth > 0.0f) t += Utils::Format("  depth mismatch       %.4f\n", s.depth);
+        if (s.fragmentParts > 0) t += Utils::Format("  apart from bodies    %.4f of the sphere (%d parts)\n", s.fragments, s.fragmentParts);
         if (s.semantic > 0.0f) t += Utils::Format("  DINOv3               %.4f   (worst view %.4f)\n", s.semantic, s.worstSemantic);
         t += Utils::Format("  mesh placed          scaled %.3fx, moved %.2f mm\n", s.target.scale, Vector3Length(s.target.offset));
         return t;
@@ -334,9 +335,9 @@ namespace {
     std::string ScoreJson(const AutoScore& s) {
         return Utils::Format("{\"loss\": %.6g, \"fit\": %.6g, \"cover\": %.6g, \"extra\": %.6g, \"worst_view\": %.6g, \"collision\": %.6g, "
                              "\"overlap_open\": %.6g, \"overlap_motion\": %.6g, \"surface_carved\": %.6g, \"hinges\": %.6g, "
-                             "\"dependency\": %.6g, \"depth\": %.6g, \"semantic\": %.6g, \"mesh_scale\": %.6g, \"mesh_moved_mm\": %.6g}",
+                             "\"dependency\": %.6g, \"depth\": %.6g, \"fragments\": %.6g, \"semantic\": %.6g, \"mesh_scale\": %.6g, \"mesh_moved_mm\": %.6g}",
                              s.total, s.fit, s.viewCover, s.viewExtra, s.worstView, s.collision, s.clashOpen, s.clashMotion,
-                             s.surfaceCarved, s.hinges, s.dependency, s.depth, s.semantic, s.target.scale, Vector3Length(s.target.offset));
+                             s.surfaceCarved, s.hinges, s.dependency, s.depth, s.fragments, s.semantic, s.target.scale, Vector3Length(s.target.offset));
     }
 
     // Nearest neighbour enlargement, so a 64 pixel view is something to look at.
@@ -385,6 +386,13 @@ namespace {
         SaveSettings(cfg, outDir / (name + ".config.ini"));
 
         AutoParams p = cfg.generate;
+        if (cfg.output.semanticVideo) {
+            const std::string video = (outDir / (name + ".semantic.mp4")).string();
+            if (p.semanticWeight <= 0.0f) fprintf(stderr, "warning: output.semantic_video is on, but the semantic loss is off: no video.\n");
+            else if (!FfmpegAvailable()) fprintf(stderr, "warning: no semantic video: ffmpeg isn't on the PATH (Arch: pacman -S ffmpeg).\n");
+            else if (video.find('"') != std::string::npos) fprintf(stderr, "warning: no semantic video: its path has a quote in it.\n");
+            else p.semanticVideo = video;
+        }
         CliGpu gpu(cfg.runtime.gpu, cfg.runtime.gpuDevice, a.quiet);
         p.gpu = gpu.Tracer();                                // (null: the CPU)
         p.startFrom = startFrom;
@@ -476,6 +484,7 @@ namespace {
             vw = live->viewsWidth;
             vh = live->viewsHeight;
         }
+        if (!r.semanticVideo.empty()) written.push_back(r.semanticVideo);
         if (cfg.output.history && !history.empty()) {
             std::string t = "evaluation,loss\n";
             for (size_t k = 0; k < history.size(); k++) t += Utils::Format("%d,%.6f\n", (int)k + 1, history[k]);

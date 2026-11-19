@@ -1,4 +1,7 @@
+#include "util/fastmath.hpp"
 #include "loss.hpp"
+#include <map>
+#include "data/build.hpp"
 #include "dino.hpp"
 #include "util/box.hpp"
 #include "data/clash.hpp"
@@ -15,26 +18,24 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 
 namespace Bakugan {
     namespace {
-        // f(0) .. f(n - 1) on every core.
+        // f(0) .. f(n - 1) on every core (TBB's threads: kept between calls, as many as runtime.threads allows, and
+        // nested loops share them rather than each starting its own).
         void ParallelFor(int n, const std::function<void(int)>& f) {
-            int workers = std::min(n, std::max(1, (int)std::thread::hardware_concurrency()));
-            std::atomic<int> next{ 0 };
-            auto work = [&] {
-                for (int i = next++; i < n; i = next++) f(i);
-            };
-            std::vector<std::thread> threads;
-            for (int k = 1; k < workers; k++) threads.emplace_back(work);
-            work();
-            for (std::thread& t : threads) t.join();
+            if (n <= 0) return;
+            tbb::parallel_for(tbb::blocked_range<int>(0, n, 1), [&](const tbb::blocked_range<int>& r) {
+                for (int i = r.begin(); i != r.end(); i++) f(i);
+            }, tbb::simple_partitioner());
         }
 
         // Fills a triangle into a supersampled coverage grid (pixel coordinates times ss).
         void FillTriangle(Vector2 a, Vector2 b, Vector2 c, int n, std::vector<unsigned char>& hit) {
-            int x0 = std::max(0, (int)floorf(fminf(a.x, fminf(b.x, c.x)))), x1 = std::min(n - 1, (int)ceilf(fmaxf(a.x, fmaxf(b.x, c.x))));
-            int y0 = std::max(0, (int)floorf(fminf(a.y, fminf(b.y, c.y)))), y1 = std::min(n - 1, (int)ceilf(fmaxf(a.y, fmaxf(b.y, c.y))));
+            int x0 = std::max(0, (int)floorf(Fmin(a.x, Fmin(b.x, c.x)))), x1 = std::min(n - 1, (int)ceilf(Fmax(a.x, Fmax(b.x, c.x))));
+            int y0 = std::max(0, (int)floorf(Fmin(a.y, Fmin(b.y, c.y)))), y1 = std::min(n - 1, (int)ceilf(Fmax(a.y, Fmax(b.y, c.y))));
             for (int y = y0; y <= y1; y++)
                 for (int x = x0; x <= x1; x++) {
                     float px = x + 0.5f, py = y + 0.5f;
@@ -49,8 +50,8 @@ namespace Bakugan {
         void FillTriangleDepth(Vector2 a, Vector2 b, Vector2 c, float za, float zb, float zc, int n, std::vector<float>& depth) {
             const float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
             if (fabsf(area) < 1e-12f) return;
-            int x0 = std::max(0, (int)floorf(fminf(a.x, fminf(b.x, c.x)))), x1 = std::min(n - 1, (int)ceilf(fmaxf(a.x, fmaxf(b.x, c.x))));
-            int y0 = std::max(0, (int)floorf(fminf(a.y, fminf(b.y, c.y)))), y1 = std::min(n - 1, (int)ceilf(fmaxf(a.y, fmaxf(b.y, c.y))));
+            int x0 = std::max(0, (int)floorf(Fmin(a.x, Fmin(b.x, c.x)))), x1 = std::min(n - 1, (int)ceilf(Fmax(a.x, Fmax(b.x, c.x))));
+            int y0 = std::max(0, (int)floorf(Fmin(a.y, Fmin(b.y, c.y)))), y1 = std::min(n - 1, (int)ceilf(Fmax(a.y, Fmax(b.y, c.y))));
             for (int y = y0; y <= y1; y++)
                 for (int x = x0; x <= x1; x++) {
                     float px = x + 0.5f, py = y + 0.5f;
@@ -70,7 +71,7 @@ namespace Bakugan {
     Loss::Loss(const TriMesh& mesh, const AutoParams& p) : m_P(p) {
         Vector3 lo = { FLT_MAX, FLT_MAX, FLT_MAX }, hi = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
         for (unsigned i : mesh.indices) { lo = Vector3Min(lo, mesh.positions[i]); hi = Vector3Max(hi, mesh.positions[i]); }
-        m_L = fmaxf(Vector3Distance(lo, hi), 1e-3f);
+        m_L = Fmax(Vector3Distance(lo, hi), 1e-3f);
         m_Centre = Vector3Scale(Vector3Add(lo, hi), 0.5f);
         m_Half = 0.7f * m_L;                     // the mesh, and room to move and grow it a little, stays in the frame
         m_Res = std::clamp(p.viewResolution, 16, 256);
@@ -79,7 +80,7 @@ namespace Bakugan {
         // views spread over the upper half of a sphere (from the other half they would be mirror images)
         int n = std::clamp(p.views, 1, 24);
         for (int i = 0; i < n; i++) {
-            float y = 1.0f - (i + 0.5f) / n, r = sqrtf(fmaxf(0.0f, 1.0f - y * y)), phi = i * 2.39996323f + 0.6f;
+            float y = 1.0f - (i + 0.5f) / n, r = sqrtf(Fmax(0.0f, 1.0f - y * y)), phi = i * 2.39996323f + 0.6f;
             View w;
             w.dir = Vector3Negate({ r * cosf(phi), y, r * sinf(phi) });
             Vector3 up = fabsf(w.dir.y) < 0.99f ? Vector3{ 0, 1, 0 } : Vector3{ 0, 0, -1 };
@@ -104,7 +105,7 @@ namespace Bakugan {
         m_SphereRadius = p.sphereDiameter > 0.0f ? 0.5f * p.sphereDiameter : (closed ? (float)cbrt(3.0 * fabs(volume) / (4.0 * PI)) : 0.25f * m_L);
         m_Hinge = PlanHinge(m_SphereRadius, p.hinges);
         m_MeshReach = 0.0f;
-        for (unsigned i : mesh.indices) m_MeshReach = fmaxf(m_MeshReach, Vector3Distance(mesh.positions[i], m_MeshCentre));
+        for (unsigned i : mesh.indices) m_MeshReach = Fmax(m_MeshReach, Vector3Distance(mesh.positions[i], m_MeshCentre));
 
         // the mesh's silhouette in each view, finely (4 samples a pixel across), where it is: placements resample it
         m_Fine = m_Res * 4;
@@ -152,7 +153,7 @@ namespace Bakugan {
         std::uniform_real_distribution<float> u01(0.0f, 1.0f);
         for (int i = 0; i < 128; i++) m_PairUnit.push_back({ u01(rng), u01(rng), u01(rng) });
         for (int i = 0; i < 1024; i++) {                 // a Fibonacci sphere
-            float y = 1.0f - (i + 0.5f) / 512.0f, r = sqrtf(fmaxf(0.0f, 1.0f - y * y)), phi = i * 2.39996323f;
+            float y = 1.0f - (i + 0.5f) / 512.0f, r = sqrtf(Fmax(0.0f, 1.0f - y * y)), phi = i * 2.39996323f;
             m_SurfaceDirs.push_back({ r * cosf(phi), y, r * sinf(phi) });
         }
         if (p.semanticWeight > 0.0f) SetUpSemantic(mesh);
@@ -173,7 +174,7 @@ namespace Bakugan {
 
     Vector2 Loss::Unplace(const View& w, float sx, float sy, const Placement& t) const {
         Vector3 at = Vector3Add(m_Centre, Vector3Add(Vector3Scale(w.u, sx), Vector3Scale(w.v, sy)));
-        Vector3 q = Vector3Add(m_MeshCentre, Vector3Scale(Vector3Subtract(Vector3Subtract(at, m_MeshCentre), t.offset), 1.0f / fmaxf(t.scale, 1e-6f)));
+        Vector3 q = Vector3Add(m_MeshCentre, Vector3Scale(Vector3Subtract(Vector3Subtract(at, m_MeshCentre), t.offset), 1.0f / Fmax(t.scale, 1e-6f)));
         Vector3 r = Vector3Subtract(q, m_Centre);
         return { Vector3DotProduct(r, w.u), Vector3DotProduct(r, w.v) };
     }
@@ -193,17 +194,21 @@ namespace Bakugan {
     std::vector<std::vector<float>> Loss::TargetSilhouettes(const Placement& t) const {
         const int nv = (int)m_Views.size();
         std::vector<std::vector<float>> out(nv, std::vector<float>((size_t)m_Res * m_Res, 0.0f));
-        for (int v = 0; v < nv; v++)
-            for (int y = 0; y < m_Res; y++)
-                for (int x = 0; x < m_Res; x++) {
-                    float sum = 0.0f;
-                    for (int k = 0; k < 4; k++) {                // 2 x 2 samples a pixel
-                        float sx = ((x + 0.25f + 0.5f * (k & 1)) / m_Res * 2.0f - 1.0f) * m_Half, sy = (1.0f - (y + 0.25f + 0.5f * (k >> 1)) / m_Res * 2.0f) * m_Half;
-                        Vector2 b = Unplace(m_Views[v], sx, sy, t);
-                        sum += Bilinear(m_MeshFine[v], m_Fine, (b.x / m_Half + 1.0f) * 0.5f * m_Fine, (1.0f - b.y / m_Half) * 0.5f * m_Fine);
-                    }
-                    out[v][(size_t)y * m_Res + x] = 0.25f * sum;
+        ParallelFor(nv * m_Res, [&](int task) {                  // every row of every view
+            const int v = task / m_Res, y = task % m_Res;
+            // Unplace is affine in (sx, sy): b = b0 + sx bu + sy bv
+            const Vector2 b0 = Unplace(m_Views[v], 0.0f, 0.0f, t), b1 = Unplace(m_Views[v], 1.0f, 0.0f, t), b2 = Unplace(m_Views[v], 0.0f, 1.0f, t);
+            const Vector2 bu = Vector2Subtract(b1, b0), bv = Vector2Subtract(b2, b0);
+            for (int x = 0; x < m_Res; x++) {
+                float sum = 0.0f;
+                for (int k = 0; k < 4; k++) {                    // 2 x 2 samples a pixel
+                    float sx = ((x + 0.25f + 0.5f * (k & 1)) / m_Res * 2.0f - 1.0f) * m_Half, sy = (1.0f - (y + 0.25f + 0.5f * (k >> 1)) / m_Res * 2.0f) * m_Half;
+                    Vector2 b = { b0.x + sx * bu.x + sy * bv.x, b0.y + sx * bu.y + sy * bv.y };
+                    sum += Bilinear(m_MeshFine[v], m_Fine, (b.x / m_Half + 1.0f) * 0.5f * m_Fine, (1.0f - b.y / m_Half) * 0.5f * m_Fine);
                 }
+                out[v][(size_t)y * m_Res + x] = 0.25f * sum;
+            }
+        });
         return out;
     }
 
@@ -211,12 +216,13 @@ namespace Bakugan {
         const int nv = (int)m_Views.size();
         std::vector<std::vector<float>> out(nv, std::vector<float>((size_t)m_Res * m_Res, 0.0f));
         if (m_MeshFineZ.size() != (size_t)nv) return out;
-        for (int v = 0; v < nv; v++) {
+        ParallelFor(nv * m_Res, [&](int task) {
+            const int v = task / m_Res, y = task % m_Res;
             const View& w = m_Views[v];
             // a point of the mesh at depth z (unplaced) is, placed, at shift + scale · (z - zc)
             const float zc = Vector3DotProduct(Vector3Subtract(m_MeshCentre, m_Centre), w.dir);
             const float shift = Vector3DotProduct(Vector3Subtract(Vector3Add(m_MeshCentre, t.offset), m_Centre), w.dir);
-            for (int y = 0; y < m_Res; y++)
+            {
                 for (int x = 0; x < m_Res; x++) {
                     float cover = 0.0f, coverZ = 0.0f;
                     for (int k = 0; k < 4; k++) {                // 2 x 2 samples a pixel, as for the silhouettes
@@ -228,12 +234,40 @@ namespace Bakugan {
                     }
                     out[v][(size_t)y * m_Res + x] = cover > 1e-6f ? shift + t.scale * (coverZ / cover - zc) : 0.0f;
                 }
-        }
+            }
+        });
         return out;
     }
 
+    // ---- one piece -------------------------------------------------------------------------------------------------------
+
+    // Each body's parts (6-connected in voxels of radius / onePieceVoxels): what lies apart from its largest costs
+    //   onePieceWeight · volume apart / the sphere's volume
+    // and its slope: raising a part's distance by e on its surface takes e · area off it, so each surface cell (about a
+    // voxel^2 of surface) pushes its point outward with d loss / d distance = -weight · voxel^2 / sphere. Adam then
+    // shrinks the parts, by whatever cutters shape them, until they're gone (or join up). Single voxels are left out: a
+    // sharp edge sampled apart looks like one.
+    void Loss::OnePiece(const Bodies& b, AutoScore& s, Slopes& slopes) {
+        const float voxel = m_SphereRadius / (float)std::max(8, m_P.onePieceVoxels);
+        const double sphere = 4.0 / 3.0 * PI * m_SphereRadius * m_SphereRadius * m_SphereRadius;
+        const float slope = (float)(-m_P.onePieceWeight * voxel * voxel / sphere);
+        std::vector<Fragments> found(b.fields.size());
+        ParallelFor((int)b.fields.size(), [&](int i) {
+            const BodyField& f = b.fields[i];
+            if (!f.Empty()) found[i] = FindFragments([&](Vector3 q) { return f.Distance(q); }, f.bounds, voxel, 2);
+        });
+        for (size_t i = 0; i < b.fields.size(); i++) {
+            const Fragments& fr = found[i];
+            if (fr.counted == 0) continue;
+            s.fragments += (float)(fr.fragments / sphere);
+            s.fragmentParts += fr.counted;
+            const Rigid& open = b.xf[0][b.group[i]];
+            for (const Vector3& q : fr.surface) slopes[i].push_back({ 0, open.Apply(q), slope });
+        }
+    }
+
     float Loss::DepthCost(float dz, float* slope) const {
-        const float s = fmaxf(m_P.depthScale, 1e-4f) * m_L, s2 = s * s, d2 = dz * dz;
+        const float s = Fmax(m_P.depthScale, 1e-4f) * m_L, s2 = s * s, d2 = dz * dz;
         if (slope) *slope = 2.0f * dz * s2 / ((d2 + s2) * (d2 + s2));
         return d2 / (d2 + s2);
     }
@@ -241,9 +275,9 @@ namespace Bakugan {
     Placement Loss::KeepTargetInFrame(Placement t) const {
         t.scale = std::clamp(t.scale, 0.3f, 3.3f);
         float room = 0.98f * m_Half;                     // the mesh's reach around its centre, inside the frame
-        t.scale = fminf(t.scale, room / fmaxf(m_MeshReach, 1e-6f));
+        t.scale = Fmin(t.scale, room / Fmax(m_MeshReach, 1e-6f));
         Vector3 at = Vector3Add(m_MeshCentre, t.offset), off = Vector3Subtract(at, m_Centre);
-        float l = Vector3Length(off), free = fmaxf(0.0f, room - t.scale * m_MeshReach);
+        float l = Vector3Length(off), free = Fmax(0.0f, room - t.scale * m_MeshReach);
         if (l > free) t.offset = Vector3Subtract(Vector3Add(m_Centre, Vector3Scale(off, free / l)), m_MeshCentre);
         return t;
     }
@@ -267,8 +301,8 @@ namespace Bakugan {
             }
             float t0 = (l - oa) / da, t1 = (h - oa) / da;
             if (t0 > t1) std::swap(t0, t1);
-            tn = fmaxf(tn, t0);
-            tf = fminf(tf, t1);
+            tn = Fmax(tn, t0);
+            tf = Fmin(tf, t1);
             if (tn > tf) return FLT_MAX;
         }
         float t = tn, dmin = FLT_MAX, tmin = tn, outside = -1.0f, inside = -1.0f;   // outside: the last t outside
@@ -328,11 +362,16 @@ namespace Bakugan {
 
         // the placement: the targets drawn again with it nudged two units either way, against the design as drawn
         const float silhouette = std::max(0.0f, m_P.silhouetteWeight);
-        for (size_t j = 0; j < ps.size(); j++) {
-            if (ps[j].kind != Param::Target) continue;
-            double loss[2] = { 0.0, 0.0 };
-            float value[2];
-            for (int side = 0; side < 2; side++) {
+        std::vector<int> targets;
+        for (size_t j = 0; j < ps.size(); j++)
+            if (ps[j].kind == Param::Target) targets.push_back((int)j);
+        std::vector<std::array<double, 2>> losses(targets.size(), { 0.0, 0.0 });
+        std::vector<std::array<float, 2>> values(targets.size());
+        ParallelFor((int)targets.size() * 2, [&](int task) {
+            const int j = targets[task / 2], side = task % 2;
+            double* loss = losses[task / 2].data();
+            float* value = values[task / 2].data();
+            {
                 Carving cc = c;
                 Placement t = target;
                 Set(cc, t, ps[j], Get(c, target, ps[j]) + (side == 0 ? 2.0f : -2.0f) * ps[j].unit, m_L);   // (2 units: the silhouettes wiggle finer)
@@ -349,8 +388,11 @@ namespace Bakugan {
                         for (size_t k = 0; k < px; k++) loss[side] += m_SemGradTarget[v * px + k] * pictures[v][k];
                 }
             }
-            float step = value[0] - value[1];
-            if (step > 0.0f) (*grad)[j] = (float)((loss[0] - loss[1]) / step) * ps[j].unit;
+        });
+        for (size_t q = 0; q < targets.size(); q++) {
+            const int j = targets[q];
+            float step = values[q][0] - values[q][1];
+            if (step > 0.0f) (*grad)[j] = (float)((losses[q][0] - losses[q][1]) / step) * ps[j].unit;
         }
         s.msPlacement = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - placing).count();
         return s;
@@ -416,8 +458,11 @@ namespace Bakugan {
         s.msCollisions = ms(t0);
         Hinges(d, b, s);
         if (m_P.dependencies) Dependencies(d, b, s, slopes);
+        if (m_P.onePiece && m_P.onePieceWeight > 0.0f) OnePiece(b, s, slopes);
+        s.msOnePiece = ms(t0);
         s.total = std::max(0.0f, m_P.silhouetteWeight) * (s.fit + s.coveragePenalty) + (m_Dino ? m_P.semanticWeight * s.semantic : 0.0f) +
-                  CollisionWeight() * s.collision + HingeWeight() * s.hinges + (m_P.dependencies ? m_P.dependencyWeight * s.dependency : 0.0f);
+                  CollisionWeight() * s.collision + HingeWeight() * s.hinges + (m_P.dependencies ? m_P.dependencyWeight * s.dependency : 0.0f) +
+                  (m_P.onePiece ? m_P.onePieceWeight * s.fragments : 0.0f);
         s.collisionScale = m_CollisionScale;
         s.valid = true;
         if (slopesOut) *slopesOut = std::move(slopes);
@@ -632,8 +677,8 @@ namespace Bakugan {
             double tsum = 0.0, hit = 0.0, spill = 0.0;
             for (int k = 0; k < px; k++) {
                 tsum += T[k];
-                hit += fminf(T[k], D[k]);
-                spill += fmaxf(0.0f, D[k] - T[k]);
+                hit += Fmin(T[k], D[k]);
+                spill += Fmax(0.0f, D[k] - T[k]);
             }
             if (tsum <= 0.0) continue;
             float cover = (float)(hit / tsum), extra = (float)(spill / tsum);
@@ -646,7 +691,7 @@ namespace Bakugan {
                     const float A = m_ZA[kk];
                     if (T[k] <= 0.0f || A <= 0.0f) continue;
                     float slope;
-                    const float cost = DepthCost(m_Z[kk] - Tz[k], &slope), cover = fminf(T[k], A);
+                    const float cost = DepthCost(m_Z[kk] - Tz[k], &slope), cover = Fmin(T[k], A);
                     mismatch += cover * cost;
                     if (silhouette <= 0.0f) continue;
                     // slopes, per layer i (nearest first): through its depth z_i (at where its ray enters it), and its
@@ -697,8 +742,8 @@ namespace Bakugan {
             coverSum += cover;
             extraSum += extra;
             bool shortOf = cover < minCover;
-            s.worstView = fminf(s.worstView, cover);
-            s.coveragePenalty += 10.0f * fmaxf(0.0f, minCover - cover);
+            s.worstView = Fmin(s.worstView, cover);
+            s.coveragePenalty += 10.0f * Fmax(0.0f, minCover - cover);
             if (silhouette <= 0.0f) continue;
             for (int k = 0; k < px; k++) {
                 size_t kk = (size_t)v * px + k;
@@ -729,10 +774,10 @@ namespace Bakugan {
             for (int k = 0; k < px; k++) {
                 float t = target[v][k];
                 tsum += t;
-                hit += fminf(t, D[k]);
-                spill += fmaxf(0.0f, D[k] - t);
+                hit += Fmin(t, D[k]);
+                spill += Fmax(0.0f, D[k] - t);
                 size_t kk = (size_t)v * px + k;
-                if (z && t > 0.0f && m_ZA[kk] > 0.0f) mismatch += fminf(t, m_ZA[kk]) * DepthCost(m_Z[kk] - (*depth)[v][k], nullptr);
+                if (z && t > 0.0f && m_ZA[kk] > 0.0f) mismatch += Fmin(t, m_ZA[kk]) * DepthCost(m_Z[kk] - (*depth)[v][k], nullptr);
             }
             if (tsum <= 0.0) continue;
             double cover = hit / tsum;
@@ -754,7 +799,7 @@ namespace Bakugan {
     float Loss::ClashCost(float depth, float* slope) const {
         const float d0 = 0.02f * m_L, w = 0.25f * d0;
         if (slope) *slope = 1.0f + (depth < w ? d0 / w : 0.0f);
-        return depth + d0 * fminf(depth / w, 1.0f);
+        return depth + d0 * Fmin(depth / w, 1.0f);
     }
 
     // In the open pose, every two pieces; in a pose of a hinge's turn, every two that move against each other there
@@ -880,7 +925,7 @@ namespace Bakugan {
             if (Vector3DotProduct(v, m_SurfaceDirs[k]) < 0.2f * l) continue;   // it doesn't lift off there
             held.push_back((int)k);
             lever.push_back(l);
-            farthest = fmaxf(farthest, l);
+            farthest = Fmax(farthest, l);
         }
         float best = FLT_MAX;
         for (size_t i = 0; i < held.size(); i++) {
@@ -897,7 +942,7 @@ namespace Bakugan {
         }
         if (best == FLT_MAX) return FLT_MAX;
         // neighbours on the surface are a spacing apart: touching pieces are no gap
-        return fmaxf(0.0f, best * m_SphereRadius - 1.5f * SurfaceSpacing());
+        return Fmax(0.0f, best * m_SphereRadius - 1.5f * SurfaceSpacing());
     }
 
     // Per hinge after the first to open: how far the nearest holder is, over the sphere's radius (1 at most, and when
@@ -920,7 +965,7 @@ namespace Bakugan {
             if (r > 0) {
                 int from = -1, to = -1;
                 float gap = HoldGap(d, b, under, owner, order[r], earlier, &from, &to);
-                s.dependency += (gap == FLT_MAX ? 1.0f : fminf(1.0f, gap / R)) / s.dependents;
+                s.dependency += (gap == FLT_MAX ? 1.0f : Fmin(1.0f, gap / R)) / s.dependents;
                 if (gap <= reach) s.holdable++;
                 if (gap != FLT_MAX && gap > 0.0f && closed >= 0) {
                     const int steps = 6;
@@ -1016,7 +1061,7 @@ namespace Bakugan {
             if (pi < 0 || ci < 0) continue;
             float farthest = 0.0f;
             s.hinges += HingeCost(h, b.fields[pi], b.fields[ci], &farthest);
-            s.hingeGap = fmaxf(s.hingeGap, farthest);
+            s.hingeGap = Fmax(s.hingeGap, farthest);
         }
     }
 
@@ -1027,10 +1072,10 @@ namespace Bakugan {
         for (float w : { -half, 0.0f, half }) {
             Vector3 q = Vector3Add(h.pivot, Vector3Scale(a, w));
             float dp = parent.Distance(q), dc = child.Distance(q);
-            sum += (fmaxf(0.0f, dp - slack) + fmaxf(0.0f, dc - slack)) / 3.0f;
-            if (farthest) *farthest = fmaxf(*farthest, fmaxf(dp, dc));
+            sum += (Fmax(0.0f, dp - slack) + Fmax(0.0f, dc - slack)) / 3.0f;
+            if (farthest) *farthest = Fmax(*farthest, Fmax(dp, dc));
         }
-        if (m_P.buildHinges && m_P.hinges.flush) sum += fmaxf(0.0f, Vector3Distance(h.pivot, m_SphereCentre) - m_Hinge.pivotRadius);
+        if (m_P.buildHinges && m_P.hinges.flush) sum += Fmax(0.0f, Vector3Distance(h.pivot, m_SphereCentre) - m_Hinge.pivotRadius);
         return sum / m_L;
     }
 
@@ -1049,12 +1094,29 @@ namespace Bakugan {
                 Vector3 p = Vector3Add(c.centre, Vector3Scale(dir, under));
                 float d = FLT_MAX;
                 for (const Cutter& k : c.cutters)
-                    if (k.hollow) d = fminf(d, k.sf.Distance(p));
+                    if (k.hollow && Vector3Distance(p, k.sf.position) < k.sf.BoundingRadius()) d = Fmin(d, PreparedFrustum(k.sf).Distance(p));
                 if (d >= 0.0f) continue;
                 in++;
                 sum += -d / (-d + scale);
             }
         if (carved) *carved = (float)in / m_SurfaceDirs.size();
+        return (float)(sum / m_SurfaceDirs.size());
+    }
+
+    // The surface term with one hollow changed, from every other hollow's nearest at each point (SurfaceTerm's
+    // points; FLT_MAX where there's none): only the changed one is measured, and only where it can reach.
+    float Loss::SurfaceTermWith(const Carving& c, const std::vector<float>& others, const SuperFrustum& changed) const {
+        const float scale = 0.01f * m_L, under = c.radius * 0.997f;
+        const PreparedFrustum f(changed);
+        const float reach = changed.BoundingRadius();
+        double sum = 0.0;
+        for (size_t k = 0; k < m_SurfaceDirs.size(); k++) {
+            const Vector3 p = Vector3Add(c.centre, Vector3Scale(m_SurfaceDirs[k], under));
+            float d = others[k];
+            if (Vector3Distance(p, changed.position) - reach < 0.0f) d = Fmin(d, f.Distance(p));
+            if (d >= 0.0f) continue;
+            sum += -d / (-d + scale);
+        }
         return (float)(sum / m_SurfaceDirs.size());
     }
 
@@ -1107,6 +1169,48 @@ namespace Bakugan {
         };
         std::vector<std::array<Side, 2>> work(ps.size());
         std::vector<char> live(ps.size(), 0);
+        // (CPU) every primitive's distance at every slope point, once: a cutter's nudge then measures only its own
+        // primitives there and puts the piece's distance together from the rest (BodyField::Recombine)
+        std::vector<std::vector<float>> leaves(gpu ? 0 : nf);
+        if (!gpu)
+            ParallelFor((int)nf, [&](int i) {
+                const BodyField& f = b.fields[i];
+                if (!f.Simple()) return;
+                const int np = f.Primitives();
+                leaves[i].resize(slopes[i].size() * np);
+                for (size_t k = 0; k < slopes[i].size(); k++) {
+                    const Slope& sl = slopes[i][k];
+                    f.Leaves(b.xf[sl.pose][b.group[i]].ApplyInverse(sl.at), leaves[i].data() + k * np);
+                }
+            });
+        // the surface term's points against every hollow, once: each hollow's parameters then only measure it
+        std::map<int, std::vector<float>> othersOf;     // hollow id: the nearest of the other hollows, per point
+        if (m_P.surfaceWeight > 0.0f) {
+            std::vector<int> hollows;
+            for (const Cutter& k : c.cutters)
+                if (k.hollow) hollows.push_back(k.id);
+            const size_t np = m_SurfaceDirs.size(), nh = hollows.size();
+            std::vector<float> first(np, FLT_MAX), second(np, FLT_MAX);
+            std::vector<int> who(np, -1);
+            const float under = c.radius * 0.997f;
+            for (const Cutter& k : c.cutters) {
+                if (!k.hollow) continue;
+                const PreparedFrustum f(k.sf);
+                const float reach = k.sf.BoundingRadius();
+                for (size_t q = 0; q < np; q++) {
+                    const Vector3 p = Vector3Add(c.centre, Vector3Scale(m_SurfaceDirs[q], under));
+                    if (Vector3Distance(p, k.sf.position) >= reach) continue;
+                    const float d = f.Distance(p);
+                    if (d < first[q]) { second[q] = first[q]; first[q] = d; who[q] = k.id; }
+                    else if (d < second[q]) second[q] = d;
+                }
+            }
+            for (size_t h = 0; h < nh; h++) {
+                std::vector<float>& o = othersOf[hollows[h]];
+                o.resize(np);
+                for (size_t q = 0; q < np; q++) o[q] = who[q] == hollows[h] ? second[q] : first[q];
+            }
+        }
 
         ParallelFor((int)ps.size(), [&](int j) {
             const Param& p = ps[j];
@@ -1123,7 +1227,10 @@ namespace Bakugan {
                 w.value = Get(e, t, p);
                 Tidy(e);
                 Design de = e.Build();
-                for (float time : b.times) w.xf.push_back(de.Transforms(time, true));
+                // (a cutter moves no hinge: the poses are the design's)
+                if (p.kind == Param::Cutter) w.xf = b.xf;
+                else
+                    for (float time : b.times) w.xf.push_back(de.Transforms(time, true));
                 // a cutter's parameter changes the fields of the pieces it shapes
                 w.changedOf.assign(nf, -1);
                 if (p.kind == Param::Cutter)
@@ -1139,15 +1246,25 @@ namespace Bakugan {
                         size_t i = std::find(w.changedOf.begin(), w.changedOf.end(), (int)k) - w.changedOf.begin();
                         w.code.push_back(code == baseCode[i] ? std::string() : code);
                     }
+                std::vector<int> differ;
+                std::vector<float> scratch;
                 for (size_t i = 0; i < nf; i++) {
-                    if (!gpu)
-                        for (const Slope& sl : slopes[i]) {
+                    if (!gpu) {
+                        // its field changed, with the same structure: only the changed primitives measured
+                        const bool recombine = w.changedOf[i] >= 0 && !leaves[i].empty() && b.fields[i].Differences(field(i), &differ);
+                        const int np = b.fields[i].Primitives();
+                        if (recombine) scratch.resize(np);
+                        for (size_t k = 0; k < slopes[i].size(); k++) {
+                            const Slope& sl = slopes[i][k];
                             const Rigid& before = b.xf[sl.pose][b.group[i]];
                             const Rigid& after = w.xf[sl.pose][b.group[i]];
                             bool poseMoves = memcmp(&before, &after, sizeof(Rigid)) != 0;
                             if (w.changedOf[i] < 0 && !poseMoves) continue;   // this parameter doesn't touch it
-                            w.sum += sl.weight * field(i).Distance(after.ApplyInverse(sl.at));
+                            const Vector3 q = after.ApplyInverse(sl.at);
+                            w.sum += sl.weight * (recombine && !poseMoves ? field(i).Recombine(leaves[i].data() + k * np, q, differ, scratch.data())
+                                                                         : field(i).Distance(q));
                         }
+                    }
                     // the semantic pixels' shades: the surface point slid along its ray, and shaded again
                     for (const Shade& sh : shades[i]) {
                         const Rigid& before = b.xf[sh.pose][b.group[i]];
@@ -1160,7 +1277,10 @@ namespace Bakugan {
                 // the surface term, for a hollow's parameter
                 if (p.kind == Param::Cutter && m_P.surfaceWeight > 0.0f) {
                     int k = e.CutterIndex(p.id);
-                    if (k >= 0 && e.cutters[k].hollow) w.sum += m_P.surfaceWeight * SurfaceTerm(e);
+                    if (k >= 0 && e.cutters[k].hollow) {
+                        auto o = othersOf.find(p.id);
+                        w.sum += m_P.surfaceWeight * (o != othersOf.end() ? SurfaceTermWith(e, o->second, e.cutters[k].sf) : SurfaceTerm(e));
+                    }
                 }
                 // the hinge term, for the joints this parameter touches: a pivot it moves, or a piece whose field it changes
                 if (m_P.hingeWeight > 0.0f)
@@ -1266,7 +1386,7 @@ namespace Bakugan {
             for (int k = 0; k < px; k++) {
                 int x = k % m_Res, y = k / m_Res;
                 float t = m_Target[v][k], dd = m_Cover[(size_t)v * px + k];
-                float ov = fminf(t, dd), ms = t - ov, ex = dd - ov, rest = 1.0f - fmaxf(t, dd);
+                float ov = Fmin(t, dd), ms = t - ov, ex = dd - ov, rest = 1.0f - Fmax(t, dd);
                 unsigned char* out = &(*rgba)[((size_t)(gap + y) * *w + gap + v * (m_Res + gap) + x) * 4];
                 for (int c = 0; c < 3; c++) out[c] = (unsigned char)std::clamp(lroundf(ov * both[c] + ms * miss[c] + ex * extra[c] + rest * 255.0f), 0L, 255L);
             }

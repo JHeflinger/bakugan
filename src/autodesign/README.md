@@ -58,14 +58,27 @@ With 0 steps it only scores the editor's design as it is: its open pose against 
 - **Add a cut** (adds). A small cap sliced off a piece where it meets the sphere's surface: a box whose inner face is a little under the surface. The cap is hinged to the rest of the piece along the edge of that face, like a lid. The joint's open angle starts at 0, so nothing looks different (`rulecheck`: the open pose's field is unchanged to 0.0000 mm) until Adam opens it. The joints the piece had go with whichever part their pivot is in. No more than `maxPieces` pieces.
 - **Add a hollow** (adds). At a pixel where the open design shows outside the placed mesh (`Loss::ExtraSpots`, from the last evaluation), a rounded bar through its piece along the view that saw it, as long as the piece is deep there, so the pixel clears at once. Where the bar reaches the sphere's surface the surface term weighs it, and Adam reshapes and moves it from there. No more than `maxHollows`. A hollow inside the sphere only changes the silhouettes where an opened piece shows the sphere's inside (a cut face); the outline of the sphere's own surface only shrinks by carving through it, which the surface term charges for. In the runs so far (robot, creature) hollows were kept now and then, carving under 2% of the surface, without making the fit better on average than carving with cuts alone, which is why they're drawn half as often by default.
 - **Remove a hollow** (simplifies). Any hollow.
-- **Split** (adds). The biggest piece (by sampled volume) is cut into two halves of equal volume (the median of points
-  sampled in it, along a random direction: of 24 drawn, the one least edge on to every view) by a box past the sphere on
-  one side of the plane, and the halves are hinged at angle 0, on the cut face where both are along the barrel's length.
+- **Split** (adds). A random piece (any with material in it, all equally likely; one too slight to sample falls through
+  to the next drawn) is cut into two halves of equal volume (the median of points sampled in it along a direction) by a
+  box past the sphere on one side of the plane, and the halves are hinged at angle 0. Of 24 random directions, the one
+  whose cut face has a place where the new hinge's barrel lies in both halves and fits under the surface, and where the
+  piece's own hinges' barrels stay on the side they go with, is taken; among those that fit, the one least edge on to
+  every view. (A small piece has few such places: with one direction drawn, the hinge term jumped by up to 0.007.)
   The design doesn't change: the halves fill what the piece did and move as one, so the loss is the same before and after
-  (the one thing the loss can see is the new seam, a pixel wide, in views that look along it: at 192 pixels a view a split
-  moved the fit by under 0.0002, against 0.002-0.003 for a new cut), and every parameter that was there keeps its Adam memory
-  (memory is per parameter id; only the new cutter's and joint's are fresh). Adam then opens the hinge, or moves the plane,
-  as the loss asks. Its weight is last in `AutoRules()` order, so settings and editors from before keep theirs.
+  bar the new seam, a pixel wide, in views that look along it (on the tee, 20 random splits at 192 pixels a view: the
+  loss moved by at most 0.001, most under 0.0001), and every parameter that was there keeps its Adam memory (memory is
+  per parameter id; only the new cutter's and joint's are fresh). Adam then opens the hinge, or moves the plane, as the
+  loss asks.
+- **Remove a piece** (simplifies). A piece too thin, small or slight to matter goes, with its material (and the cutters
+  only it used). Every piece a hinge turns (not the root) is scored by sampled volume share times mean depth in radii,
+  plus how far removing it would move the rest; the k-th lowest is drawn with weight 2^-k. The pieces that hung from it
+  are hung from its parent instead, each by one hinge standing in for the two it had: the two turns compose to a turn
+  plus a slide along its axis, which no hinge makes, so the new hinge is that turn about the nearest axis line, or a
+  least-squares fit (Nelder-Mead) to points over the child and everything below it where that misses by clearly less.
+  Candidates whose children would move more than a fifth of a radius in the open pose aren't drawn. The child keeps its
+  hinge id (and Adam memory); it turns when the first of the two did. On a leaf nothing else moves (0.000 mm); in the
+  tests a piece with one child moved it 0.9 mm (R = 20 mm), loss 0.4815 -> 0.4863, while one with three children,
+  whose re-hinging would have moved them up to 37 mm (loss 0.48 -> 6.4), was left alone. Last in `AutoRules()`.
 - **Remove a cut** (simplifies). Two pieces that one cutter split, and that no later cut has split since, joined by a joint (likelier the less it opens), become one piece again; the cutter and the joint go. The joints of the piece that hung from the other go to it.
 
 How often each rule is drawn is its weight (`AutoParams::ruleWeights`, in `AutoRules()` order; empty means the table's defaults). The Grammar section of the Generate tab sets them, and a running job picks up changes at its next rewrite round (through `AutoLive::ruleWeights`). A weight of 0 switches a rule off.
@@ -89,11 +102,16 @@ Only the open pose and the motion are scored. Closed, the pieces are the sphere.
 - **Silhouettes.** Per view, with T the placed mesh's coverage of a pixel and D the design's: covered = Σ min(T, D) / Σ T, extra = Σ max(0, D − T) / Σ T, and the view's loss is (1 − covered) + extra. `fit` is the mean over the views. A view covered less than `minViewCoverage` costs 10 per whole share short.
 - **Semantics** (below), when `semanticWeight` > 0.
 - **Collisions**, weighted by `collisionWeight` (times the ramp).
+- **One piece** (with `onePiece`): material of a body apart from its largest connected part (voxels of
+  radius/`onePieceVoxels`, OpenVDB labelling), as a share of the sphere, weighted by `onePieceWeight`. Its gradient pushes
+  the apart parts' surfaces inward, so they shrink away. On its own over 30 steps it took a design from 28 apart parts
+  (0.29% of the sphere) to 2 (0.01%). It costs one labelling per body per evaluation (about 0.3 s a step on 2 cores at 24
+  voxels; fewer voxels is cheaper). Whatever is left at the end is removed by finishing (remove floating bits, every part).
 - **Holding** (with `dependencies`): hinges nothing could hold shut, weighted by `dependencyWeight`.
 - **Hinges**: pivots away from their pieces, weighted by `hingeWeight`.
 - **Surface**: hollows reaching the sphere's surface, weighted by `surfaceWeight`. Over 1024 points spread just under the surface, the mean of d / (d + 1% of the mesh's size), d how deep the point is inside a hollow: about the share of the surface carved away, rising smoothly as a hollow reaches it (so it has a gradient). Its gradient is measured directly, by nudging the hollows' parameters.
 
-total = `silhouetteWeight` · (fit + coverage penalty) + `semanticWeight` · semantic + `collisionWeight` · collision + `hingeWeight` · hinges + `surfaceWeight` · surface + `dependencyWeight` · holding.
+total = `silhouetteWeight` · (fit + coverage penalty) + `semanticWeight` · semantic + `collisionWeight` · collision + `hingeWeight` · hinges + `surfaceWeight` · surface + `dependencyWeight` · holding + `onePieceWeight` · apart.
 
 ## The semantic loss
 
@@ -105,6 +123,8 @@ Off by default (`semanticWeight` 0). On, each view of the open design is also dr
 3. In the Generate tab's Semantic loss section, set a weight and pick the two files.
 
 If either file can't be loaded, the run stops and says why, rather than carry on without the loss you asked for.
+
+**Watching it over a run** (`semanticVideo`, `semvideo.cpp`). With a path set (the Semantic loss section's *Record a video*, or `output.semantic_video` in the CLI), every `semanticVideoEvery` steps of the search the pictures DINOv3 just compared (the mesh's above, the design's below, as `Loss::SemanticPicture` draws them) go into an .mp4 with the step, the loss, the semantic score and its worst view, and a progress bar; the lookahead tries aren't filmed. The best design ends it, held for two seconds. Frames are streamed into ffmpeg as they're made (`Suite::Encoder`), so a long run takes no memory for them.
 
 **What's compared.** `semanticLook` sets how both pictures are drawn:
 - **Silhouette:** white on black.
@@ -237,6 +257,19 @@ For each of those pixels:
 The last part is measured by nudging one parameter either way, building the carving again, and re-evaluating the distances at those points: for a cutter, the fields of the pieces it shapes (a hollow's: every piece's); for a joint, the poses. Collision samples work the same way: each sample's slope goes to the piece whose distance sets the overlap depth there. The times of the poses between are held fixed while the gradient is taken.
 
 `tools/autodesign/gradcheck` compares this gradient against brute-force differences of the whole loss, for a carving of three pieces and a hollow. Over the cutters' and joints' 64 parameters it points the same way: cosine 0.995. The placement's four are themselves differences of the targets, so they agree with brute force at the same step. Run with `MINCOVER=0` to leave out the coverage penalty's kink, which brute force with a large step jumps across.
+
+## Speed
+
+Nearly all the time goes into measuring the pieces' distance fields, so most of what keeps it fast is there:
+
+- **Prepared primitives** (`PreparedFrustum`, `data/superfrustum.hpp`). A body field keeps each superfrustum with its rotation as a matrix and its bend and cross section worked out once; the bend's angle (`atan2f`) is only taken for points on the arc. `Fmin`/`Fmax` (`util/fastmath.hpp`) stand in for `fminf`/`fmaxf` in the hot code, which the default flags leave as library calls.
+- **The gradient's nudges** (CPU). Every primitive's distance at every slope point is measured once (`BodyField::Leaves`); a cutter's nudge then measures only the primitives it changed and puts each piece's distance together from the rest (`BodyField::Recombine`, the same answer as `Distance`). A cutter's nudge reuses the design's poses. The surface term's points are measured against every hollow once, so a hollow's nudge measures only that hollow. `Carving::Build` names its items through a `Design::NameIndex` (the same names, without searching every item for each).
+- **One piece.** Each body's inside is filled by an octree descent that only measures the field near the surface (`LabelSolid`, also used by finishing's floating bits), and the bodies run in parallel.
+- **Collisions.** The overlap grid is culled two cells by two by two first.
+- **The placement's gradient.** The target views are resampled in parallel, every nudge at once.
+- **Threads.** The loops run on TBB's threads, kept between calls and limited by `runtime.threads`.
+
+On the tee test design (8 pieces, 249 parameters, 2 cores, CPU only): a step went from 759 ms to 186 ms at 6 views of 48 px, and from 1976 ms to 652 ms at 12 views of 128 px, with the same loss and gradient to 6 digits. 200 steps with rewrites went from 205 s to 56 s.
 
 ## Extending it
 

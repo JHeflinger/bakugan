@@ -61,7 +61,19 @@ namespace Bakugan {
         // appended to `params`. The code depends only on the structure (which shapes, groups, ops, knuckles), so
         // editing values only changes the parameters. See ui/raymarch.cpp for the functions it calls.
         std::string Glsl(std::vector<Vector4>* params) const;
+
+        // Measuring the same points again with a primitive or two changed (the gradient's nudges): every primitive's
+        // distance at a point, once (Leaves), then the distance with some of them measured afresh in `other`, a field
+        // of the same structure (Recombine). Exactly Distance's answer. Only for a body of shapes alone (no hinge
+        // hardware or clearances, as while designing): Simple() says so.
+        bool Simple() const { return m_Root >= 0 && !m_Mask && m_Sweeps.empty() && m_Late.empty() && m_Hardware.empty(); }
+        int Primitives() const { return (int)m_Fast.size(); }
+        void Leaves(Vector3 p, float* out) const;
+        // the primitives that differ in `other` (empty and false when its structure isn't this one's)
+        bool Differences(const BodyField& other, std::vector<int>* changed) const;
+        float Recombine(const float* leaves, Vector3 p, const std::vector<int>& changed, float* scratch) const;
     private:
+        float EvalLeaves(int node, const float* leaves) const;
         // What a body is when it is a clearance's tool: the whole body less its hingeOnly clearances; or (hinge) its
         // hardware and its material next to its own knuckles. Either as it was up to an id.
         enum class Kind { Full, Tool, HingeTool };
@@ -104,6 +116,7 @@ namespace Bakugan {
         static void HardwareParts(const HingeHardware& h, Vector3 p, std::vector<float>* out);
     private:
         std::vector<SuperFrustum> m_Prims;
+        std::vector<PreparedFrustum> m_Fast;     // the same, ready to measure
         std::vector<int> m_PrimShape;          // shape id per primitive
         std::vector<Op> m_PrimOp;              // effective op (inside a cut feature counts as cut)
         std::vector<Node> m_Nodes;

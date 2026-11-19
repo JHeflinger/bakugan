@@ -1,3 +1,4 @@
+#include "util/fastmath.hpp"
 #include "field.hpp"
 #include "util/utils.hpp"
 #include "util/box.hpp"
@@ -10,16 +11,16 @@
 namespace Bakugan {
     namespace {
         inline float SMin(float a, float b, float k) {
-            float h = fmaxf(k - fabsf(a - b), 0.0f) / k;
-            return fminf(a, b) - h * h * k * 0.25f;
+            float h = Fmax(k - fabsf(a - b), 0.0f) / k;
+            return Fmin(a, b) - h * h * k * 0.25f;
         }
 
         // Capped cylinder about the frame's z axis: radius r, z in [lo, hi].
         inline float Cylinder(float x, float y, float z, float r, float lo, float hi) {
             float dr = sqrtf(x * x + y * y) - r;
-            float dz = fmaxf(lo - z, z - hi);
-            float ox = fmaxf(dr, 0.0f), oz = fmaxf(dz, 0.0f);
-            return fminf(fmaxf(dr, dz), 0.0f) + sqrtf(ox * ox + oz * oz);
+            float dz = Fmax(lo - z, z - hi);
+            float ox = Fmax(dr, 0.0f), oz = Fmax(dz, 0.0f);
+            return Fmin(Fmax(dr, dz), 0.0f) + sqrtf(ox * ox + oz * oz);
         }
 
         inline float Box(float x, float y, float z, Vector3 lo, Vector3 hi) {
@@ -27,8 +28,8 @@ namespace Bakugan {
             float qx = fabsf(x - cx) - (hi.x - lo.x) * 0.5f;
             float qy = fabsf(y - cy) - (hi.y - lo.y) * 0.5f;
             float qz = fabsf(z - cz) - (hi.z - lo.z) * 0.5f;
-            float mx = fmaxf(qx, 0.0f), my = fmaxf(qy, 0.0f), mz = fmaxf(qz, 0.0f);
-            return sqrtf(mx * mx + my * my + mz * mz) + fminf(fmaxf(qx, fmaxf(qy, qz)), 0.0f);
+            float mx = Fmax(qx, 0.0f), my = Fmax(qy, 0.0f), mz = Fmax(qz, 0.0f);
+            return sqrtf(mx * mx + my * my + mz * mz) + Fmin(Fmax(qx, Fmax(qy, qz)), 0.0f);
         }
 
         // Point in the hinge frame: x along the leaf, y along the side, z along the axis.
@@ -42,12 +43,12 @@ namespace Bakugan {
         bool EmptyBox(BoundingBox b) { return b.max.x <= b.min.x && b.max.y <= b.min.y && b.max.z <= b.min.z; }
 
         BoundingBox HardwareBounds(const HingeHardware& h) {
-            float rad = h.pinOnly ? fmaxf(h.pinRadius, h.headRadius) : fmaxf(h.radius + h.clearance, h.leafLength + h.leafThickness);
+            float rad = h.pinOnly ? Fmax(h.pinRadius, h.headRadius) : Fmax(h.radius + h.clearance, h.leafLength + h.leafThickness);
             Vector3 lo = { 1e30f, 1e30f, 1e30f }, hi = { -1e30f, -1e30f, -1e30f };
             for (int a = 0; a < 3; a++) {
                 float w = (&h.axis.x)[a];
                 float c = (&h.pivot.x)[a] + w * (h.lo + h.hi) * 0.5f;
-                float e = fabsf(w) * (h.hi - h.lo) * 0.5f + sqrtf(fmaxf(0.0f, 1.0f - w * w)) * rad + h.clearance;
+                float e = fabsf(w) * (h.hi - h.lo) * 0.5f + sqrtf(Fmax(0.0f, 1.0f - w * w)) * rad + h.clearance;
                 (&lo.x)[a] = c - e;
                 (&hi.x)[a] = c + e;
             }
@@ -58,9 +59,9 @@ namespace Bakugan {
     // A sphere around the knuckles, leaves, clearances, bore and head pocket: a point outside it by more than the
     // current distance can't be changed by this hardware.
     void HingeHardware::Bound() {
-        float lo2 = lo - clearance, hi2 = fmaxf(hi, headTo) + clearance;
-        float rad = fmaxf(fmaxf(radius + clearance, leafLength + leafThickness), headRadius + clearance);
-        if (pinOnly) rad = fmaxf(pinRadius, headRadius);
+        float lo2 = lo - clearance, hi2 = Fmax(hi, headTo) + clearance;
+        float rad = Fmax(Fmax(radius + clearance, leafLength + leafThickness), headRadius + clearance);
+        if (pinOnly) rad = Fmax(pinRadius, headRadius);
         centre = Vector3Add(pivot, Vector3Scale(axis, (lo2 + hi2) * 0.5f));
         float half = (hi2 - lo2) * 0.5f;
         reach = sqrtf(half * half + rad * rad) + 0.01f;
@@ -84,6 +85,7 @@ namespace Bakugan {
             leaf.centre = d.shapes[s].sf.position;
             leaf.radius = Vector3Length(d.shapes[s].sf.LocalBounds().max);
             m_Prims.push_back(d.shapes[s].sf);
+            m_Fast.emplace_back(d.shapes[s].sf);
             m_PrimShape.push_back(d.shapes[s].id);
             m_PrimOp.push_back(leaf.op);
             m_Nodes.push_back(leaf);
@@ -165,6 +167,7 @@ namespace Bakugan {
                 leaf.centre = d.shapes[s].sf.position;
                 leaf.radius = Vector3Length(d.shapes[s].sf.LocalBounds().max);
                 f.m_Prims.push_back(d.shapes[s].sf);
+                f.m_Fast.emplace_back(d.shapes[s].sf);
                 f.m_PrimShape.push_back(d.shapes[s].id);
                 f.m_PrimOp.push_back(leaf.op);
                 f.m_Late.push_back((int)f.m_Nodes.size());
@@ -242,7 +245,7 @@ namespace Bakugan {
                     float far = 0.0f;
                     for (int k = 0; k < 8; k++) {
                         Vector3 q = Vector3Subtract({ k & 1 ? own.max.x : own.min.x, k & 2 ? own.max.y : own.min.y, k & 4 ? own.max.z : own.min.z }, lc);
-                        far = fmaxf(far, Vector3Length(Vector3Subtract(q, Vector3Scale(lu, Vector3DotProduct(q, lu)))));
+                        far = Fmax(far, Vector3Length(Vector3Subtract(q, Vector3Scale(lu, Vector3DotProduct(q, lu)))));
                     }
                     return far;
                 };
@@ -268,7 +271,7 @@ namespace Bakugan {
                     float moved = 0.0f;                                    // how far K moves this body's farthest corner
                     for (int j = 0; j < 8; j++) {
                         Vector3 cq = { j & 1 ? own.max.x : own.min.x, j & 2 ? own.max.y : own.min.y, j & 4 ? own.max.z : own.min.z };
-                        moved = fmaxf(moved, Vector3Distance(K.Apply(cq), cq));
+                        moved = Fmax(moved, Vector3Distance(K.Apply(cq), cq));
                     }
                     if (moved < 0.01f * step) continue;                    // still (as far as a sample could tell): nothing new
                     if (angle < 1e-5f) {
@@ -371,7 +374,7 @@ namespace Bakugan {
 
     float BodyField::Eval(int n, Vector3 p) const {
         const Node& nd = m_Nodes[n];
-        if (nd.prim >= 0) return m_Prims[nd.prim].Distance(p);
+        if (nd.prim >= 0) return m_Fast[nd.prim].Distance(p);
         float u = FLT_MAX;
         bool any = false;
         for (int c : nd.children) {
@@ -379,7 +382,7 @@ namespace Bakugan {
             if (ch.op != Op::Union) continue;
             if (nd.blend <= 0.0f && any && ch.radius > 0.0f && Vector3Distance(p, ch.centre) - ch.radius > u) continue;
             float d = Eval(c, p);
-            u = (any && nd.blend > 0.0f) ? SMin(u, d, nd.blend) : fminf(u, d);
+            u = (any && nd.blend > 0.0f) ? SMin(u, d, nd.blend) : Fmin(u, d);
             any = true;
         }
         if (!any) return FLT_MAX;
@@ -388,9 +391,50 @@ namespace Bakugan {
             if (ch.op != Op::Cut) continue;
             // a cut only matters where it reaches deeper than -u
             if (ch.radius > 0.0f && Vector3Distance(p, ch.centre) - ch.radius >= -u) continue;
-            u = fmaxf(u, -Eval(c, p));
+            u = Fmax(u, -Eval(c, p));
         }
         return u;
+    }
+
+    void BodyField::Leaves(Vector3 p, float* out) const {
+        for (size_t i = 0; i < m_Fast.size(); i++) out[i] = m_Fast[i].Distance(p);
+    }
+
+    bool BodyField::Differences(const BodyField& o, std::vector<int>* changed) const {
+        changed->clear();
+        if (!Simple() || !o.Simple() || m_Root != o.m_Root || m_Prims.size() != o.m_Prims.size() || m_Nodes.size() != o.m_Nodes.size()) return false;
+        for (size_t n = 0; n < m_Nodes.size(); n++) {
+            const Node &a = m_Nodes[n], &b = o.m_Nodes[n];
+            if (a.prim != b.prim || a.op != b.op || a.blend != b.blend || a.children != b.children) return false;
+        }
+        for (size_t i = 0; i < m_Prims.size(); i++)
+            if (m_Prims[i] != o.m_Prims[i]) changed->push_back((int)i);
+        return true;
+    }
+
+    // Eval from the primitives' distances, with no culling (the culling only ever skips what can't change the answer:
+    // a union's child farther than the union so far, a cut that can't reach as deep as it is inside)
+    float BodyField::EvalLeaves(int n, const float* leaves) const {
+        const Node& nd = m_Nodes[n];
+        if (nd.prim >= 0) return leaves[nd.prim];
+        float u = FLT_MAX;
+        bool any = false;
+        for (int c : nd.children) {
+            if (m_Nodes[c].op != Op::Union) continue;
+            float d = EvalLeaves(c, leaves);
+            u = (any && nd.blend > 0.0f) ? SMin(u, d, nd.blend) : Fmin(u, d);
+            any = true;
+        }
+        if (!any) return FLT_MAX;
+        for (int c : nd.children)
+            if (m_Nodes[c].op == Op::Cut) u = Fmax(u, -EvalLeaves(c, leaves));
+        return u;
+    }
+
+    float BodyField::Recombine(const float* leaves, Vector3 p, const std::vector<int>& changed, float* scratch) const {
+        std::copy(leaves, leaves + m_Fast.size(), scratch);
+        for (int i : changed) scratch[i] = m_Fast[i].Distance(p);
+        return Fmin(EvalLeaves(m_Root, scratch), 1e6f);
     }
 
     float BodyField::HardwareDistance(float d, Vector3 p) const {
@@ -408,7 +452,7 @@ namespace Bakugan {
             float x, y, z;
             ToFrame(h, p, &x, &y, &z);
             for (const Knuckle& k : h.own)
-                d = fminf(d, Box(x, y, z, { 0.0f, -h.leafThickness * 0.5f, k.lo }, { h.leafLength, h.leafThickness * 0.5f, k.hi }));
+                d = Fmin(d, Box(x, y, z, { 0.0f, -h.leafThickness * 0.5f, k.lo }, { h.leafLength, h.leafThickness * 0.5f, k.hi }));
         }
         for (size_t i = 0; i < m_Hardware.size(); i++) {
             const HingeHardware& h = m_Hardware[i];
@@ -416,7 +460,7 @@ namespace Bakugan {
             float x, y, z;
             ToFrame(h, p, &x, &y, &z);
             for (const Knuckle& k : h.other)
-                d = fmaxf(d, -Cylinder(x, y, z, h.radius + h.clearance, k.lo - h.clearance, k.hi + h.clearance));
+                d = Fmax(d, -Cylinder(x, y, z, h.radius + h.clearance, k.lo - h.clearance, k.hi + h.clearance));
         }
         for (size_t i = 0; i < m_Hardware.size(); i++) {
             const HingeHardware& h = m_Hardware[i];
@@ -424,18 +468,18 @@ namespace Bakugan {
             float x, y, z;
             ToFrame(h, p, &x, &y, &z);
             if (!h.pinOnly)
-                for (const Knuckle& k : h.own) d = fminf(d, Cylinder(x, y, z, h.radius, k.lo, k.hi));
-            if (h.pin) d = fminf(d, Cylinder(x, y, z, h.pinRadius, h.lo, h.hi));
-            if (h.pinOnly && h.headRadius > 0.0f) d = fminf(d, Cylinder(x, y, z, h.headRadius, h.headFrom, h.headTo));
+                for (const Knuckle& k : h.own) d = Fmin(d, Cylinder(x, y, z, h.radius, k.lo, k.hi));
+            if (h.pin) d = Fmin(d, Cylinder(x, y, z, h.pinRadius, h.lo, h.hi));
+            if (h.pinOnly && h.headRadius > 0.0f) d = Fmin(d, Cylinder(x, y, z, h.headRadius, h.headFrom, h.headTo));
         }
         for (size_t i = 0; i < m_Hardware.size(); i++) {
             const HingeHardware& h = m_Hardware[i];
             if (!h.bore || far(i) >= -d) continue;
             float x, y, z;
             ToFrame(h, p, &x, &y, &z);
-            d = fmaxf(d, -Cylinder(x, y, z, h.pinRadius + h.clearance, h.lo - h.clearance, h.hi + h.clearance));
+            d = Fmax(d, -Cylinder(x, y, z, h.pinRadius + h.clearance, h.lo - h.clearance, h.hi + h.clearance));
             // a pocket for a separate pin's head
-            if (h.headRadius > 0.0f) d = fmaxf(d, -Cylinder(x, y, z, h.headRadius + h.clearance, h.headFrom - h.clearance, h.headTo + h.clearance));
+            if (h.headRadius > 0.0f) d = Fmax(d, -Cylinder(x, y, z, h.headRadius + h.clearance, h.headFrom - h.clearance, h.headTo + h.clearance));
         }
         return d;
     }
@@ -447,7 +491,7 @@ namespace Bakugan {
             if (Vector3Distance(p, h.centre) - h.reach - KnuckleZone > z) continue;
             float x, y, w;
             ToFrame(h, p, &x, &y, &w);
-            for (const Knuckle& k : h.own) z = fminf(z, Cylinder(x, y, w, h.leafLength + KnuckleZone, k.lo, k.hi));
+            for (const Knuckle& k : h.own) z = Fmin(z, Cylinder(x, y, w, h.leafLength + KnuckleZone, k.lo, k.hi));
         }
         return z;
     }
@@ -482,7 +526,7 @@ namespace Bakugan {
             float w = FLT_MAX;
             for (const Segment& g : s.segments) {
                 if (w <= deep) break;
-                if (Vector3Distance(p, g.centre) - g.radius - s.margin >= fminf(fminf(w, needed), far)) continue;
+                if (Vector3Distance(p, g.centre) - g.radius - s.margin >= Fmin(Fmin(w, needed), far)) continue;
                 const Vector3 x = Vector3Subtract(p, g.c);
                 const float r = Vector3Length(Vector3Subtract(x, Vector3Scale(g.u, Vector3DotProduct(x, g.u))));
                 // per sample, the tool's distance changes by at most ds, and the margin (how far the point has moved
@@ -492,25 +536,25 @@ namespace Bakugan {
                     const Vector3 q = g.base.Apply(g.n > 0 ? Turn(p, g.c, g.u, g.angle * i / g.n) : p);
                     const float fromRest = Vector3Distance(q, rest);
                     const float v = s.tool->Distance(q);
-                    const float wi = fmaxf(v - fminf(s.margin, fromRest), 0.5f * (v + d0));
-                    w = fminf(w, wi);
+                    const float wi = Fmax(v - Fmin(s.margin, fromRest), 0.5f * (v + d0));
+                    w = Fmin(w, wi);
                     if (ds <= 1e-7f || w <= deep) break;
-                    const float room = fmaxf(0.0f, wi - fminf(fminf(w, needed), far));
+                    const float room = Fmax(0.0f, wi - Fmin(Fmin(w, needed), far));
                     const float ahead = room <= fromRest - s.margin ? room / ds : room / (2.0f * ds);
-                    i += 1 + (int)fminf(ahead, 1e7f);
+                    i += 1 + (int)Fmin(ahead, 1e7f);
                 }
             }
-            w = fminf(w, far);                          // what was skipped is at least this far
+            w = Fmin(w, far);                          // what was skipped is at least this far
             if (w >= needed) continue;
             if (!zoned) { zone = ZoneDistance(p); zoned = true; }
-            d = fmaxf(d, fminf(-w, zone));
+            d = Fmax(d, Fmin(-w, zone));
         }
         return d;
     }
 
     float BodyField::Distance(Vector3 p) const {
         float d = m_Root >= 0 ? Eval(m_Root, p) : FLT_MAX;
-        if (m_Mask) d = fmaxf(d, ZoneDistance(p));
+        if (m_Mask) d = Fmax(d, ZoneDistance(p));
         // (outside the body, clearances can only take it further away: its distance is a safe answer as it is)
         if (!m_Sweeps.empty() && d < 0.0f) d = SweepDistance(d, p);
         if (!m_Late.empty()) {
@@ -518,13 +562,13 @@ namespace Bakugan {
             for (int n : m_Late)
                 if (m_Nodes[n].op == Op::Union) {
                     float v = Eval(n, p);
-                    d = blend > 0.0f && d < 1e30f ? SMin(d, v, blend) : fminf(d, v);
+                    d = blend > 0.0f && d < 1e30f ? SMin(d, v, blend) : Fmin(d, v);
                 }
             for (int n : m_Late)
-                if (m_Nodes[n].op == Op::Cut) d = fmaxf(d, -Eval(n, p));
+                if (m_Nodes[n].op == Op::Cut) d = Fmax(d, -Eval(n, p));
         }
         if (!m_Hardware.empty()) d = HardwareDistance(d, p);
-        return fminf(d, 1e6f);
+        return Fmin(d, 1e6f);
     }
 
     Vector3 BodyField::Gradient(Vector3 p, float e) const {
@@ -541,13 +585,13 @@ namespace Bakugan {
         ToFrame(h, p, &x, &y, &z);
         float best = FLT_MAX;
         if (!h.pinOnly) {
-            for (const Knuckle& k : h.own) best = fminf(best, Cylinder(x, y, z, h.radius, k.lo, k.hi));
+            for (const Knuckle& k : h.own) best = Fmin(best, Cylinder(x, y, z, h.radius, k.lo, k.hi));
             if (h.leafLength > 0.0f)
                 for (const Knuckle& k : h.own)
-                    best = fminf(best, Box(x, y, z, { 0.0f, -h.leafThickness * 0.5f, k.lo }, { h.leafLength, h.leafThickness * 0.5f, k.hi }));
+                    best = Fmin(best, Box(x, y, z, { 0.0f, -h.leafThickness * 0.5f, k.lo }, { h.leafLength, h.leafThickness * 0.5f, k.hi }));
         }
-        if (h.pin) best = fminf(best, Cylinder(x, y, z, h.pinRadius, h.lo, h.hi));
-        if (h.pinOnly && h.headRadius > 0.0f) best = fminf(best, Cylinder(x, y, z, h.headRadius, h.headFrom, h.headTo));
+        if (h.pin) best = Fmin(best, Cylinder(x, y, z, h.pinRadius, h.lo, h.hi));
+        if (h.pinOnly && h.headRadius > 0.0f) best = Fmin(best, Cylinder(x, y, z, h.headRadius, h.headFrom, h.headTo));
         out->push_back(best);
     }
 

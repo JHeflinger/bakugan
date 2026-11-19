@@ -67,6 +67,17 @@ namespace Bakugan {
     std::vector<Island> FindIslands(const std::function<float(Vector3)>& f, BoundingBox box, float voxel, double removeShare,
                                     const JobControl* control = nullptr, float* voxelUsed = nullptr);
 
+    // How much of a solid is apart from its largest piece (6-connected at `voxel`): its volume, its largest piece's, the
+    // pieces apart from it of at least minCells cells, and their surface (centres of their cells with a neighbour
+    // outside: a voxel^2 of surface each, near enough). What the loss's one-piece term measures, and moves.
+    struct Fragments {
+        double total = 0.0, largest = 0.0, fragments = 0.0;   // mm^3
+        int parts = 0, counted = 0;                   // pieces found; pieces apart counted (minCells or more)
+        float voxel = 0.0f;
+        std::vector<Vector3> surface;
+    };
+    Fragments FindFragments(const std::function<float(Vector3)>& f, BoundingBox box, float voxel, int minCells = 2);
+
     // Meshes every body (and separate pin) of the design. samples > 0 also takes up to that many surface points per part.
     // With a pose (transforms indexed like the groups) and gap > 0, every body is trimmed back by gap / 2 from the bodies
     // it touches in that pose, so parts printed together come out apart.

@@ -162,36 +162,64 @@ namespace Bakugan {
 
     // ---- islands ----------------------------------------------------------------------------------------------------------
 
-    std::vector<Island> FindIslands(const std::function<float(Vector3)>& f, BoundingBox box, float voxel, double removeShare,
-                                    const JobControl* control, float* voxelUsed) {
-        std::vector<Island> out;
-        // a dense grid of inside / outside covers the box: no finer than 32M cells
-        {
-            Vector3 e = Vector3Subtract(box.max, box.min);
-            double cells = (double)(e.x / voxel + 10) * (e.y / voxel + 10) * (e.z / voxel + 10);
-            if (cells > 32e6) voxel *= (float)cbrt(cells / 32e6) * 1.02f;
-        }
-        if (voxelUsed) *voxelUsed = voxel;
-        Vector3 origin;
+    // A solid's inside cells, labelled by the separate piece they belong to (6-connected), and each piece's cells.
+    namespace {
+        struct Labelled {
+            Vector3 origin = { 0, 0, 0 };
+            size_t nx = 0, ny = 0, nz = 0;
+            std::vector<int> label;                      // 0 outside, else its piece + 1
+            std::vector<std::vector<size_t>> cells;
+        };
+    }
+
+    static bool LabelSolid(const std::function<float(Vector3)>& f, BoundingBox box, float voxel, const JobControl* control, Labelled* L) {
+        // the grid SparseLevelSet would use (the same points), but only each point's sign is needed: a cube of points
+        // the field shows the surface can't pass through is filled without measuring them (octree descent), so the
+        // field is only measured near the surface, and not in a band around it as a level set needs
+        const int pad = 3, T = 16;
+        const Vector3 jitter = { 0.3713f, 0.2847f, 0.4129f };
+        const Vector3 origin = Vector3Subtract(box.min, { (pad + jitter.x) * voxel, (pad + jitter.y) * voxel, (pad + jitter.z) * voxel });
         int n[3];
-        openvdb::FloatGrid::Ptr grid = SparseLevelSet(f, box, voxel, control, {}, &origin, n);
-        if (!grid) return out;
+        for (int a = 0; a < 3; a++) n[a] = (int)ceilf(((&box.max.x)[a] - (&box.min.x)[a]) / voxel) + 2 * pad + 2;
+        L->origin = origin;
         const size_t nx = n[0], ny = n[1], nz = n[2], N = nx * ny * nz;
+        L->nx = nx;
+        L->ny = ny;
+        L->nz = nz;
         auto index = [&](size_t i, size_t j, size_t k) { return (k * ny + j) * nx + i; };
-
-        // inside: the level set's sign (flood filled, so deep inside is negative too)
-        std::vector<int> label(N, 0);                    // 0 outside, -1 inside (not yet labelled), else its piece + 1
-        tbb::parallel_for(tbb::blocked_range<size_t>(0, nz), [&](const tbb::blocked_range<size_t>& r) {
-            auto acc = grid->getConstAccessor();
-            for (size_t k = r.begin(); k != r.end(); k++)
-                for (size_t j = 0; j < ny; j++)
-                    for (size_t i = 0; i < nx; i++)
-                        if (acc.getValue(openvdb::Coord((int)i, (int)j, (int)k)) < 0.0f) label[index(i, j, k)] = -1;
+        std::vector<int>& label = L->label;
+        label.assign(N, 0);                              // (-1 while inside but not yet labelled)
+        auto at = [&](float i, float j, float k) { return Vector3{ origin.x + i * voxel, origin.y + j * voxel, origin.z + k * voxel }; };
+        std::function<void(int, int, int, int)> visit = [&](int i0, int j0, int k0, int s) {
+            if (i0 >= n[0] || j0 >= n[1] || k0 >= n[2]) return;
+            if (s == 1) {
+                if (f(at((float)i0, (float)j0, (float)k0)) < 0.0f) label[index(i0, j0, k0)] = -1;
+                return;
+            }
+            const float half = 0.5f * (s - 1);
+            const float d = f(at(i0 + half, j0 + half, k0 + half));
+            if (fabsf(d) > 1.7320508f * half * voxel * 1.25f + voxel) {   // (and a voxel spare)
+                if (d < 0.0f)
+                    for (int k = k0; k < std::min(k0 + s, n[2]); k++)
+                        for (int j = j0; j < std::min(j0 + s, n[1]); j++)
+                            for (int i = i0; i < std::min(i0 + s, n[0]); i++) label[index(i, j, k)] = -1;
+                return;
+            }
+            const int h = s / 2;
+            for (int c = 0; c < 8; c++) visit(i0 + (c & 1) * h, j0 + ((c >> 1) & 1) * h, k0 + ((c >> 2) & 1) * h, h);
+        };
+        const int nt[3] = { (n[0] + T - 1) / T, (n[1] + T - 1) / T, (n[2] + T - 1) / T };
+        const size_t tiles = (size_t)nt[0] * nt[1] * nt[2];
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, tiles, 1), [&](const tbb::blocked_range<size_t>& r) {
+            for (size_t t = r.begin(); t != r.end(); t++) {
+                if (control && control->Cancelled()) return;
+                const int ti = (int)(t % nt[0]), tj = (int)((t / nt[0]) % nt[1]), tk = (int)(t / ((size_t)nt[0] * nt[1]));
+                visit(ti * T, tj * T, tk * T, T);
+            }
         });
-        if (control && control->Cancelled()) return out;
-
+        if (control && control->Cancelled()) return false;
         // the pieces: flood fills, 6-connected
-        std::vector<std::vector<size_t>> cells;
+        std::vector<std::vector<size_t>>& cells = L->cells;
         std::vector<size_t> stack;
         for (size_t s = 0; s < N; s++) {
             if (label[s] != -1) continue;
@@ -217,6 +245,55 @@ namespace Bakugan {
                     if (label[nb[q]] == -1) { label[nb[q]] = id; stack.push_back(nb[q]); }
             }
         }
+        return true;
+    }
+
+    Fragments FindFragments(const std::function<float(Vector3)>& f, BoundingBox box, float voxel, int minCells) {
+        Fragments out;
+        out.voxel = voxel;
+        Labelled L;
+        if (!LabelSolid(f, box, voxel, nullptr, &L) || L.cells.empty()) return out;
+        const double cell = (double)voxel * voxel * voxel;
+        size_t largest = 0;
+        for (size_t p = 0; p < L.cells.size(); p++) {
+            out.total += L.cells[p].size() * cell;
+            if (L.cells[p].size() > L.cells[largest].size()) largest = p;
+        }
+        out.largest = L.cells[largest].size() * cell;
+        out.parts = (int)L.cells.size();
+        const size_t nx = L.nx, ny = L.ny, nz = L.nz;
+        for (size_t p = 0; p < L.cells.size(); p++) {
+            if (p == largest || (int)L.cells[p].size() < minCells) continue;
+            out.fragments += L.cells[p].size() * cell;
+            out.counted++;
+            for (size_t c : L.cells[p]) {                // its surface: cells with a neighbour outside
+                size_t i = c % nx, j = (c / nx) % ny, k = c / (nx * ny);
+                bool edge = i == 0 || j == 0 || k == 0 || i + 1 == nx || j + 1 == ny || k + 1 == nz || L.label[c - 1] == 0 || L.label[c + 1] == 0 ||
+                            L.label[c - nx] == 0 || L.label[c + nx] == 0 || L.label[c - nx * ny] == 0 || L.label[c + nx * ny] == 0;
+                if (edge)
+                    out.surface.push_back({ L.origin.x + (float)(i * voxel), L.origin.y + (float)(j * voxel), L.origin.z + (float)(k * voxel) });
+            }
+        }
+        return out;
+    }
+
+    std::vector<Island> FindIslands(const std::function<float(Vector3)>& f, BoundingBox box, float voxel, double removeShare,
+                                    const JobControl* control, float* voxelUsed) {
+        std::vector<Island> out;
+        // a dense grid of inside / outside covers the box: no finer than 32M cells
+        {
+            Vector3 e = Vector3Subtract(box.max, box.min);
+            double cells = (double)(e.x / voxel + 10) * (e.y / voxel + 10) * (e.z / voxel + 10);
+            if (cells > 32e6) voxel *= (float)cbrt(cells / 32e6) * 1.02f;
+        }
+        if (voxelUsed) *voxelUsed = voxel;
+        Labelled L;
+        if (!LabelSolid(f, box, voxel, control, &L)) return out;
+        const Vector3 origin = L.origin;
+        const size_t nx = L.nx, ny = L.ny, nz = L.nz;
+        auto index = [&](size_t i, size_t j, size_t k) { return (k * ny + j) * nx + i; };
+        const std::vector<int>& label = L.label;
+        const std::vector<std::vector<size_t>>& cells = L.cells;
 
         // every inside cell, summed: how many lie in any box of cells, at once
         const size_t px = nx + 1, py = ny + 1, pz = nz + 1;

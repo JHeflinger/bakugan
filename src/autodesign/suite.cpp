@@ -151,37 +151,6 @@ namespace Bakugan {
             return w;
         }
 
-        // ffmpeg reading raw RGB frames on its standard input, writing an H.264 mp4.
-        class Encoder {
-        public:
-            bool Open(const std::string& path, int size, int fps) {
-                std::string cmd = Utils::Format("ffmpeg -y -loglevel error -f rawvideo -pix_fmt rgb24 -s %dx%d -r %d -i - -an -c:v libx264 "
-                                                "-preset veryfast -crf 18 -pix_fmt yuv420p -movflags +faststart \"%s\"", size, size, fps, path.c_str());
-#ifndef _WIN32
-                m_OldPipe = signal(SIGPIPE, SIG_IGN);     // a dying ffmpeg must not take the editor with it
-                m_Pipe = SUITE_POPEN(cmd.c_str(), "w");
-#else
-                m_Pipe = SUITE_POPEN(cmd.c_str(), "wb");
-#endif
-                return m_Pipe != nullptr;
-            }
-            bool Write(const std::vector<unsigned char>& rgb) { return fwrite(rgb.data(), 1, rgb.size(), m_Pipe) == rgb.size(); }
-            // True when ffmpeg finished cleanly.
-            bool Close() {
-                int status = m_Pipe ? SUITE_PCLOSE(m_Pipe) : -1;
-                m_Pipe = nullptr;
-#ifndef _WIN32
-                signal(SIGPIPE, m_OldPipe);
-#endif
-                return status == 0;
-            }
-            ~Encoder() { if (m_Pipe) Close(); }
-        private:
-            FILE* m_Pipe = nullptr;
-#ifndef _WIN32
-            void (*m_OldPipe)(int) = SIG_DFL;
-#endif
-        };
 
         // Step 3 for one mesh: everything it will show, from the search to the motion, stays in the picture (search
         // snapshots stay near the mesh, so the mesh's box and the result's whole motion frame it).
@@ -504,7 +473,7 @@ namespace Bakugan {
 
         // 4. the video, frame by frame into ffmpeg
         Encoder encoder;
-        if (!encoder.Open(vpath, L.S, fps)) { res.message = "Could not start ffmpeg."; return res; }
+        if (!encoder.Open(vpath, L.S, L.S, fps)) { res.message = "Could not start ffmpeg."; return res; }
         Canvas cv;
         cv.Resize(L.S, L.S);
         std::vector<unsigned char> bytes;

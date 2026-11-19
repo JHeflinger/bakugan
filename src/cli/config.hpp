@@ -29,6 +29,7 @@ namespace Bakugan::Cli {
         int previewSize = 360;           // pixels across each pose in it
         bool viewsImage = true;          // <name>.views.png: the silhouettes scored last, against the mesh's
         bool history = true;             // <name>.history.csv: the loss over the run
+        bool semanticVideo = false;      // <name>.semantic.mp4: the semantic comparison over the run (needs ffmpeg)
         int checkpointSeconds = 60;      // <name>.partial.txt: the best design so far, this often (0: never)
         bool stl = false;                // also export the result as STL parts (needs OpenVDB, as the editor's export does)
         ExportParams stlParams;          // ... how (pose, voxel size, ...)

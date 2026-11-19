@@ -5,6 +5,15 @@
 #include <cfloat>
 #include <cmath>
 #include <functional>
+#include "util/utils.hpp"
+#ifdef _WIN32
+#define SUITE_POPEN _popen
+#define SUITE_PCLOSE _pclose
+#else
+#include <csignal>
+#define SUITE_POPEN popen
+#define SUITE_PCLOSE pclose
+#endif
 
 namespace Bakugan::Suite {
     namespace {
@@ -286,5 +295,28 @@ namespace Bakugan::Suite {
             for (int x = 0; x + 1 < w; x++)
                 if (r.Edge((size_t)y * w + x)) out[(size_t)y * w + x] = outline;
         return out;
+    }
+
+    bool Encoder::Open(const std::string& path, int w, int h, int fps) {
+        std::string cmd = Utils::Format("ffmpeg -y -loglevel error -f rawvideo -pix_fmt rgb24 -s %dx%d -r %d -i - -an -c:v libx264 "
+                                        "-preset veryfast -crf 18 -pix_fmt yuv420p -movflags +faststart \"%s\"", w, h, fps, path.c_str());
+#ifndef _WIN32
+        m_OldPipe = signal(SIGPIPE, SIG_IGN);     // a dying ffmpeg must not take the editor with it
+        m_Pipe = SUITE_POPEN(cmd.c_str(), "w");
+#else
+        m_Pipe = SUITE_POPEN(cmd.c_str(), "wb");
+#endif
+        return m_Pipe != nullptr;
+    }
+
+    bool Encoder::Write(const std::vector<unsigned char>& rgb) { return m_Pipe && fwrite(rgb.data(), 1, rgb.size(), m_Pipe) == rgb.size(); }
+
+    bool Encoder::Close() {
+        int status = m_Pipe ? SUITE_PCLOSE(m_Pipe) : -1;
+        m_Pipe = nullptr;
+#ifndef _WIN32
+        if (m_OldPipe) signal(SIGPIPE, m_OldPipe);
+#endif
+        return status == 0;
     }
 }

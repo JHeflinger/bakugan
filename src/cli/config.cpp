@@ -173,6 +173,11 @@ namespace Bakugan::Cli {
         Int("preview_size", output.previewSize, 64, 2048, "Pixels across each pose in that picture.");
         Bool("views_image", output.viewsImage, "Write <name>.views.png: the silhouettes scored last, against the placed mesh's (as in the Generate tab).");
         Bool("history", output.history, "Write <name>.history.csv: the loss at every step of the run.");
+        Bool("semantic_video", output.semanticVideo,
+             "Write <name>.semantic.mp4: the views DINOv3 compares (the mesh's above, the design's below) as the run goes, with the step and "
+             "the scores, ending on the best design. Needs the semantic loss on and ffmpeg on the PATH.");
+        Int("semantic_video_every", generate.semanticVideoEvery, 1, 100000, "A frame every this many steps of the search.");
+        Int("semantic_video_fps", generate.semanticVideoFps, 1, 120, "The video's frames per second.");
         Int("checkpoint_seconds", output.checkpointSeconds, 0, 86400,
             "Save the best design so far to <name>.partial.txt this often, so a killed run loses little. 0: never.");
         Bool("stl", output.stl, "Also export the result as STL parts (<name>_<pose>_<part>.stl). Slow for fine voxels.");
@@ -198,6 +203,11 @@ namespace Bakugan::Cli {
 
         // -- the Generate tab -----------------------------------------------------------------------------------------------
         section = "goal";
+        Bool("one_piece", p.onePiece,
+             "Every body one piece: what lies apart from a body's largest piece costs (and is shrunk away while the search runs), "
+             "and whatever is still apart when it ends is taken away.");
+        Float("one_piece_weight", p.onePieceWeight, 0, 1000, "... its weight: the cost of a sphere's volume apart.");
+        Int("one_piece_voxels", p.onePieceVoxels, 8, 128, "... voxels to the sphere's radius it looks in (finer: thinner bridges count as joined).");
         Choice("fit_look", p.fitLook, { { "silhouette", (int)FitLook::Silhouette }, { "depth", (int)FitLook::Depth } },
                "How each view of the open design is compared with the mesh's: silhouette (outlines), or depth (outlines, plus how far "
                "apart the front surfaces are where both cover a pixel: depth rasters, so each view sees some 3D).");

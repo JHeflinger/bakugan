@@ -1,3 +1,4 @@
+#include "util/fastmath.hpp"
 #include "superfrustum.hpp"
 #include <raymath.h>
 #include <algorithm>
@@ -25,7 +26,7 @@ namespace Bakugan {
                 const float* b = v[(i + 1) % 4];
                 float d2, side;
                 Segment(px, py, a[0], a[1], b[0], b[1], &d2, &side);
-                best = fminf(best, d2);
+                best = Fmin(best, d2);
                 inside &= side >= 0.0f;
             }
             float d = sqrtf(best);
@@ -37,7 +38,7 @@ namespace Bakugan {
         void BendMap(float& x, float& z, float h, float bulge) {
             float s = bulge < 0.0f ? -1.0f : 1.0f;
             x *= s;
-            float theta = fmaxf(fminf(fabsf(bulge), 1.0f) * (PI * 0.5f), 1e-4f);
+            float theta = Fmax(Fmin(fabsf(bulge), 1.0f) * (PI * 0.5f), 1e-4f);
             float st = sinf(theta), ct = cosf(theta);
             float c = h * ct / st;                           // arc centre at (c, 0)
             float rho = sqrtf(c * c + h * h);
@@ -67,11 +68,11 @@ namespace Bakugan {
         if (fabsf(bulge) > 1e-4f) BendMap(x, z, h, bulge);
 
         // rounded rectangle cross section
-        float inner = fminf(hx, hy);
+        float inner = Fmin(hx, hy);
         float r = rounding * inner;
         float qx = fabsf(x) - hx + r, qy = fabsf(p.y) - hy + r;
-        float mx = fmaxf(qx, 0.0f), my = fmaxf(qy, 0.0f);
-        float u = sqrtf(mx * mx + my * my) + fminf(fmaxf(qx, qy), 0.0f) - r;
+        float mx = Fmax(qx, 0.0f), my = Fmax(qy, 0.0f);
+        float u = sqrtf(mx * mx + my * my) + Fmin(Fmax(qx, qy), 0.0f) - r;
 
         // revolve a trapezoid in (u, z): the right edge leans inward by (1 - taper) * inner over the height.
         float x3 = -(1.0f - taper) * inner;
@@ -86,6 +87,95 @@ namespace Bakugan {
         }
         const float quad[4][2] = { { leftBottom, -h }, { 0.0f, -h }, { x3, h }, { leftTop, h } };
         return ConvexQuad(u, z, quad) - dilation;
+    }
+
+    PreparedFrustum::PreparedFrustum(const SuperFrustum& f) {
+        const Quaternion q = QuaternionNormalize(f.rotation);
+        // local = R^T (world - position): the rows of R^T are R's columns, the local axes in the world
+        const Vector3 X = Vector3RotateByQuaternion({ 1, 0, 0 }, q), Y = Vector3RotateByQuaternion({ 0, 1, 0 }, q),
+                      Z = Vector3RotateByQuaternion({ 0, 0, 1 }, q);
+        m[0] = X.x; m[1] = X.y; m[2] = X.z;
+        m[3] = Y.x; m[4] = Y.y; m[5] = Y.z;
+        m[6] = Z.x; m[7] = Z.y; m[8] = Z.z;
+        position = f.position;
+        hx = f.size.x * 0.5f;
+        hy = f.size.y * 0.5f;
+        h = f.size.z * 0.5f;
+        dilation = f.dilation;
+        bent = fabsf(f.bulge) > 1e-4f;
+        if (bent) {
+            sign = f.bulge < 0.0f ? -1.0f : 1.0f;
+            theta = Fmax(Fmin(fabsf(f.bulge), 1.0f) * (PI * 0.5f), 1e-4f);
+            st = sinf(theta);
+            ct = cosf(theta);
+            c = h * ct / st;
+            rho = sqrtf(c * c + h * h);
+            thetaInv = 1.0f / theta;
+        }
+        const float inner = Fmin(hx, hy);
+        r = f.rounding * inner;
+        const float x3 = -(1.0f - f.taper) * inner;
+        float leftBottom, leftTop;
+        if (f.onion > 1e-3f) {
+            leftBottom = -inner * (1.0f - f.onion);
+            leftTop = -inner + (x3 + inner) * f.onion;
+        } else {
+            leftBottom = leftTop = -inner - 4.0f * (h + inner) - 1.0f;
+        }
+        const float v[4][2] = { { leftBottom, -h }, { 0.0f, -h }, { x3, h }, { leftTop, h } };
+        for (int i = 0; i < 4; i++) {
+            const float* a = v[i];
+            const float* b = v[(i + 1) % 4];
+            ax[i] = a[0];
+            ay[i] = a[1];
+            ex[i] = b[0] - a[0];
+            ey[i] = b[1] - a[1];
+            inv[i] = 1.0f / (ex[i] * ex[i] + ey[i] * ey[i] + 1e-20f);
+        }
+    }
+
+    float PreparedFrustum::Distance(Vector3 w) const {
+        const float dx = w.x - position.x, dy = w.y - position.y, dz = w.z - position.z;
+        float x = m[0] * dx + m[1] * dy + m[2] * dz;
+        const float y = m[3] * dx + m[4] * dy + m[5] * dz;
+        float z = m[6] * dx + m[7] * dy + m[8] * dz;
+        if (bent) {
+            // BendMap, with the angle of (c - x, z) only worked out where it's needed (on the arc): which side of the
+            // arc's two end rays the point is on is a cross product
+            x *= sign;
+            float nx, nz;
+            const float vx = c - x;
+            if (z >= 0.0f && ct * z - st * vx > 0.0f) {             // past the top end (phi > theta)
+                const float ddz = z - h;
+                nz = h + x * st + ddz * ct;
+                nx = x * ct - ddz * st;
+            } else if (z < 0.0f && -st * vx - ct * z > 0.0f) {      // past the bottom end (phi < -theta)
+                const float ddz = z + h;
+                nz = -h - (x * st - ddz * ct);
+                nx = x * ct + ddz * st;
+            } else {
+                const float ux = x - c;
+                nz = atan2f(z, vx) * thetaInv * h;
+                nx = rho - sqrtf(ux * ux + z * z);
+            }
+            x = nx * sign;
+            z = nz;
+        }
+        const float qx = fabsf(x) - hx + r, qy = fabsf(y) - hy + r;
+        const float mx = Fmax(qx, 0.0f), my = Fmax(qy, 0.0f);
+        const float u = sqrtf(mx * mx + my * my) + Fmin(Fmax(qx, qy), 0.0f) - r;
+        float best = 1e30f;
+        bool inside = true;
+        for (int i = 0; i < 4; i++) {
+            const float wx = u - ax[i], wy = z - ay[i];
+            float t = (wx * ex[i] + wy * ey[i]) * inv[i];
+            t = Fmin(Fmax(t, 0.0f), 1.0f);
+            const float px = wx - ex[i] * t, py = wy - ey[i] * t;
+            best = Fmin(best, px * px + py * py);
+            inside &= ex[i] * wy - ey[i] * wx >= 0.0f;
+        }
+        const float d = sqrtf(best);
+        return (inside ? -d : d) - dilation;
     }
 
     Vector3 SuperFrustum::Gradient(Vector3 w, float e) const {
@@ -115,7 +205,7 @@ namespace Bakugan {
     float SuperFrustum::Sagitta() const {
         if (fabsf(bulge) <= 1e-4f) return 0.0f;
         float h = size.z * 0.5f;
-        float theta = fminf(fabsf(bulge), 1.0f) * (PI * 0.5f);
+        float theta = Fmin(fabsf(bulge), 1.0f) * (PI * 0.5f);
         float c = h * cosf(theta) / sinf(theta);
         return sqrtf(c * c + h * h) - c;
     }
@@ -127,7 +217,7 @@ namespace Bakugan {
 
     BoundingBox SuperFrustum::LocalBounds() const {
         float sag = Sagitta();
-        float tilt = fabsf(bulge) > 1e-4f ? sinf(fminf(fabsf(bulge), 1.0f) * PI * 0.5f) * size.x * 0.5f : 0.0f;
+        float tilt = fabsf(bulge) > 1e-4f ? sinf(Fmin(fabsf(bulge), 1.0f) * PI * 0.5f) * size.x * 0.5f : 0.0f;
         Vector3 e = { size.x * 0.5f + sag + dilation, size.y * 0.5f + dilation, size.z * 0.5f + tilt + dilation };
         return { Vector3Negate(e), e };
     }
@@ -145,9 +235,9 @@ namespace Bakugan {
     }
 
     void SuperFrustum::Repair(float minSize) {
-        size.x = fmaxf(size.x, minSize);
-        size.y = fmaxf(size.y, minSize);
-        size.z = fmaxf(size.z, minSize);
+        size.x = Fmax(size.x, minSize);
+        size.y = Fmax(size.y, minSize);
+        size.z = Fmax(size.z, minSize);
         rounding = std::clamp(rounding, 0.0f, 1.0f);
         taper = std::clamp(taper, 0.0f, 1.0f);
         bulge = std::clamp(bulge, -1.0f, 1.0f);

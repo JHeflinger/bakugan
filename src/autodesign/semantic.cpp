@@ -10,6 +10,8 @@
 //   d I / d s_k = T_k c_k                                                         -> a Shade, measured again per parameter
 // Shades are many (every covered pixel), and each costs a few field evaluations per parameter, so the gradient takes a
 // fixed number of them, drawn by how much they matter (|slope|) and weighted to stay unbiased. Edges are all kept.
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 #include "loss.hpp"
 #include "dino.hpp"
 #include "util/box.hpp"
@@ -25,16 +27,11 @@
 
 namespace Bakugan {
     namespace {
-        void ParallelFor(int n, const std::function<void(int)>& f) {
-            int workers = std::min(n, std::max(1, (int)std::thread::hardware_concurrency()));
-            std::atomic<int> next{ 0 };
-            auto work = [&] {
-                for (int i = next++; i < n; i = next++) f(i);
-            };
-            std::vector<std::thread> threads;
-            for (int k = 1; k < workers; k++) threads.emplace_back(work);
-            work();
-            for (std::thread& t : threads) t.join();
+        void ParallelFor(int n, const std::function<void(int)>& f) {     // (TBB's threads, kept between calls)
+            if (n <= 0) return;
+            tbb::parallel_for(tbb::blocked_range<int>(0, n, 1), [&](const tbb::blocked_range<int>& r) {
+                for (int i = r.begin(); i != r.end(); i++) f(i);
+            }, tbb::simple_partitioner());
         }
 
         Quaternion Conjugate(Quaternion q) { return { -q.x, -q.y, -q.z, q.w }; }
@@ -148,10 +145,11 @@ namespace Bakugan {
             return (1 - ay) * ((1 - ax) * at(x0, y0) + ax * at(x0 + 1, y0)) + ay * ((1 - ax) * at(x0, y0 + 1) + ax * at(x0 + 1, y0 + 1));
         };
         std::vector<std::vector<float>> out(nv, std::vector<float>((size_t)S * S, bg));
-        for (int v = 0; v < nv; v++) {
+        ParallelFor(nv * S, [&](int task) {                       // every row of every view
+            const int v = task / S, y = task % S;
             const View& w = m_Views[v];
             const float shift = Vector3DotProduct(Vector3Subtract(Vector3Add(m_MeshCentre, t.offset), m_Centre), w.dir);
-            for (int y = 0; y < S; y++)
+            {
                 for (int x = 0; x < S; x++) {
                     float sum = 0.0f;
                     for (int k = 0; k < 4; k++) {
@@ -167,7 +165,8 @@ namespace Bakugan {
                     }
                     out[v][(size_t)y * S + x] = 0.25f * sum;
                 }
-        }
+            }
+        });
         return out;
     }
 

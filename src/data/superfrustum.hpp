@@ -42,4 +42,20 @@ namespace Bakugan {
         bool operator==(const SuperFrustum& o) const;
         bool operator!=(const SuperFrustum& o) const { return !(*this == o); }
     };
+
+    // A SuperFrustum ready to be measured many times: its rotation as a matrix, and everything about its shape that
+    // doesn't depend on the point worked out once (the bend's arc, the cross section, the revolved quad's edges).
+    // Distance() is SuperFrustum::Distance to float rounding, several times faster: the distance fields use these.
+    struct PreparedFrustum {
+        PreparedFrustum() = default;
+        explicit PreparedFrustum(const SuperFrustum& f);
+        float Distance(Vector3 world) const;
+    private:
+        float m[9] = {};                 // world to local (rows)
+        Vector3 position = { 0, 0, 0 };
+        float hx = 0, hy = 0, h = 0, r = 0, dilation = 0;
+        bool bent = false;
+        float sign = 1, theta = 0, st = 0, ct = 1, c = 0, rho = 0, thetaInv = 0;
+        float ax[4] = {}, ay[4] = {}, ex[4] = {}, ey[4] = {}, inv[4] = {};   // the quad's edges: start, direction, 1/|e|²
+    };
 }

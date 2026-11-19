@@ -18,6 +18,9 @@
 #include "autodesign.hpp"
 #include "adam.hpp"
 #include "grammar.hpp"
+#include "loss.hpp"
+#include "semvideo.hpp"
+#include <memory>
 #include "util/utils.hpp"
 #include <raymath.h>
 #include <algorithm>
@@ -94,8 +97,9 @@ namespace Bakugan {
             else d += "; the gradient on the CPU";
             d += "; collisions, shading and rebuilding the pieces on the CPU";
             if (s.msViews + s.msPrepare + s.msMeasure > 0.0f)
-                d += Utils::Format(". Last step: views %.0f ms, semantic %.0f, collisions %.0f, gradient %.0f preparing + %.0f measuring, placement %.0f",
-                                   s.msViews, s.msSemantic, s.msCollisions, s.msPrepare, s.msMeasure, s.msPlacement);
+                d += Utils::Format(". Last step: views %.0f ms, semantic %.0f, collisions %.0f, one piece %.0f, gradient %.0f preparing + %.0f measuring, "
+                                   "placement %.0f",
+                                   s.msViews, s.msSemantic, s.msCollisions, s.msOnePiece, s.msPrepare, s.msMeasure, s.msPlacement);
             return d;
         };
         if (live) {
@@ -232,6 +236,15 @@ namespace Bakugan {
             live->version++;
         };
 
+        // the semantic video, frame by frame as the search goes
+        std::unique_ptr<SemanticVideo> video;
+        std::string videoNote;
+        if (!p.semanticVideo.empty()) {
+            if (loss.Semantic()) video = std::make_unique<SemanticVideo>(p.semanticVideo, p.semanticVideoFps);
+            else videoNote = " No semantic video: the semantic loss is off (it needs semantic weight > 0, the model and ONNX Runtime).";
+        }
+        const int videoEvery = std::max(1, p.semanticVideoEvery);
+
         c.SetStage("Optimizing");
         while (steps < budget && !c.Cancelled()) {
             // 3. an Adam step
@@ -241,6 +254,8 @@ namespace Bakugan {
             steps++;
             consider(before, s);                             // the score is of the carving before the step
             c.SetProgress((float)steps / budget);
+            if (video && (steps == 1 || steps % videoEvery == 0))     // (the pictures are the carving's before the step, as the score)
+                video->Add(loss, Utils::Format("Step %d / %d", steps, budget), s, (float)steps / budget);
 
             // ... and now and then a rewrite round
             if (steps % std::max(1, p.stepsPerRound) != 0 || steps + p.lookahead > budget) continue;
@@ -287,6 +302,13 @@ namespace Bakugan {
         consider(cur.carving, last);
         reorder(best, bestScore.target);
         bestScore = loss.Evaluate(best, bestScore.target);
+        if (video) {
+            c.SetStage("Finishing the semantic video");
+            video->Add(loss, Utils::Format("Best design (after %d steps)", steps), bestScore, 1.0f, 2 * video->Fps());
+            if (video->Finish(&videoNote)) res.semanticVideo = p.semanticVideo;
+            videoNote = " " + videoNote;
+            video.reset();
+        }
         Design design = best.Build();
         // ... finished
         std::string finished;
@@ -303,8 +325,12 @@ namespace Bakugan {
             if (p.carveWhenDone) finish("Carving collisions away", [&] { return CarveCollisions(design, p.carve, &c); });
             if (p.latchWhenDone) finish("Adding the latch", [&] { return AddLatch(design, p.latch, &c); });
         }
-        if (bestScore.valid && p.removeFloatingWhenDone)
-            finish("Removing floating bits", [&] { return RemoveFloatingBits(design, p.floating, &c); });
+        if (bestScore.valid && (p.removeFloatingWhenDone || p.onePiece)) {
+            // one piece: whatever is still apart goes, however big (the term above should have left little)
+            FloatingParams q = p.floating;
+            if (p.onePiece) q.share = 1.0f;
+            finish(p.onePiece ? "Making every body one piece" : "Removing floating bits", [&] { return RemoveFloatingBits(design, q, &c); });
+        }
         // ... and its motion checked once more, more closely than the search could afford to
         c.SetStage("Checking the motion");
         const double sphereVolume = 4.0 / 3.0 * PI * pow(loss.SphereRadius(), 3.0);
@@ -331,6 +357,9 @@ namespace Bakugan {
                                     Vector3Length(t.offset), t.scale, bestScore.total, steps, accepted, rounds,
                                     reordered > 0 ? Utils::Format(", the opening order changed %d times", reordered).c_str() : "");
         if (p.fitLook == FitLook::Depth) res.message += Utils::Format(" Depth mismatch %.3f.", bestScore.depth);
+        if (p.onePiece && bestScore.fragmentParts > 0)
+            res.message += Utils::Format(" Before finishing, %d part%s (%.2f%% of the sphere) lay apart from their bodies.", bestScore.fragmentParts,
+                                         bestScore.fragmentParts == 1 ? "" : "s", 100.0f * bestScore.fragments);
         res.message += Utils::Format(" Checked at %d poses: overlapping %.2f%% of the sphere open, %.2f%% at worst on the way", res.checked.poses,
                                      100.0 * res.checked.openVolume / sphereVolume, 100.0 * res.checked.worstVolume / sphereVolume);
         if (res.checked.worstHinge >= 0 && res.checked.worstVolume > 0.0)
@@ -350,6 +379,7 @@ namespace Bakugan {
             res.message += " Kept:";
             for (const auto& [rule, n] : kept) res.message += Utils::Format(" %s x%d", rule.c_str(), n);
         }
+        res.message += videoNote;
         if (!loss.Error().empty()) res.message += " " + loss.Error();
         return res;
     }

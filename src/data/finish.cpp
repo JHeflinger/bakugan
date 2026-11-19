@@ -1,3 +1,5 @@
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 #include "finish.hpp"
 #include "data/clash.hpp"
 #include "data/field.hpp"
@@ -17,16 +19,11 @@
 namespace Bakugan {
     namespace {
         // f(0) .. f(n - 1) on every core.
-        void ParallelFor(int n, const std::function<void(int)>& f) {
-            int workers = std::min(n, std::max(1, (int)std::thread::hardware_concurrency()));
-            std::atomic<int> next{ 0 };
-            auto work = [&] {
-                for (int i = next++; i < n; i = next++) f(i);
-            };
-            std::vector<std::thread> threads;
-            for (int k = 1; k < workers; k++) threads.emplace_back(work);
-            work();
-            for (std::thread& t : threads) t.join();
+        void ParallelFor(int n, const std::function<void(int)>& f) {     // (TBB's threads, kept between calls)
+            if (n <= 0) return;
+            tbb::parallel_for(tbb::blocked_range<int>(0, n, 1), [&](const tbb::blocked_range<int>& r) {
+                for (int i = r.begin(); i != r.end(); i++) f(i);
+            }, tbb::simple_partitioner());
         }
 
         bool Turns(const Hinge& h) { return fabsf(h.end - h.start) > 1e-4f && h.t1 - h.t0 > 1e-5f; }

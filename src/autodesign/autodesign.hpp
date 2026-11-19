@@ -45,6 +45,12 @@ namespace Bakugan {
         std::shared_ptr<const AutoStart> startFrom;
         bool moveTarget = true;          // the mesh it's compared with may be moved, to wherever suits the design best
         bool scaleTarget = true;         // ... and scaled (0.3x .. 3.3x, about its centre of volume)
+        // every body one piece: the volume of what lies apart from each body's largest piece (seen in voxels of
+        // onePieceVoxels to the sphere's radius) costs onePieceWeight per sphere's volume, and its gradient shrinks those
+        // parts away; when the search ends, what is still apart is taken away (RemoveFloatingBits: all of it)
+        bool onePiece = true;
+        float onePieceWeight = 10.0f;
+        int onePieceVoxels = 24;
         FitLook fitLook = FitLook::Silhouette;
         float depthScale = 0.05f;        // FitLook::Depth: a depth mismatch this big (a share of the mesh's size) costs a
                                          // covered pixel half as much as a missing one; more costs up to as much (robust:
@@ -87,6 +93,12 @@ namespace Bakugan {
         bool semanticGpu = false;        // run DINOv3 with CUDA, if this ONNX Runtime has it
         SemanticLook semanticLook = SemanticLook::Shaded;
         float patchWeight = 0.0f;        // 0: compare the global (CLS) embeddings .. 1: the patch embeddings, place by place
+        // A video of the semantic comparison over the run (the mesh's views DINOv3 sees against the design's): written
+        // to this .mp4 (needs ffmpeg; empty: none). A frame every semanticVideoEvery steps of the search (its lookahead
+        // tries aside), then the best design held for two seconds.
+        std::string semanticVideo;
+        int semanticVideoEvery = 5;
+        int semanticVideoFps = 15;
         int semanticSamples = 4000;      // shaded pixels sampled for the gradient each step (their rest is the edges)
         // the silhouettes drawn on the GPU instead of every core (tracer.hpp); null: on the CPU
         std::shared_ptr<SilhouetteTracer> gpu;
@@ -110,6 +122,8 @@ namespace Bakugan {
                                          //           + surface weight * surface + dependency weight * dependency
         float fit = 0.0f;                // open pose against the placed mesh: mean over views of (1 - covered) + extra
                                          // (+ depth, with FitLook::Depth)
+        float fragments = 0.0f;          // one piece: the volume apart from each body's largest piece, over the sphere's
+        int fragmentParts = 0;           // ... how many parts that is
         float depth = 0.0f;              // FitLook::Depth: mean over views of the depth mismatch, sum over pixels both
                                          // cover of min(T, D) · d² / (d² + scale²), over sum(T)
         float coveragePenalty = 0.0f;    // 10 per whole share a view is covered less than minViewCoverage
@@ -131,7 +145,7 @@ namespace Bakugan {
         // where the step's time went (ms): drawing and comparing the views, the semantic loss (drawing, DINOv3, its
         // slopes), collisions, the gradient's preparing (every parameter nudged: the pieces rebuilt; shades, hinges) and
         // measuring (every slope point measured again), and the placement's (its targets drawn again)
-        float msViews = 0, msSemantic = 0, msCollisions = 0, msPrepare = 0, msMeasure = 0, msPlacement = 0;
+        float msViews = 0, msSemantic = 0, msCollisions = 0, msPrepare = 0, msMeasure = 0, msPlacement = 0, msOnePiece = 0;
         bool semanticTraced = false;     // ... and the semantic pictures
         float hinges = 0.0f;             // hinges away from their pieces: per hinge, how far each of its two pieces is
                                          // from its axis (the mean over the barrel's length, beyond a small slack), plus how far it is from fitting under the surface; over the mesh's size
@@ -182,6 +196,7 @@ namespace Bakugan {
         Carving carving;                 // (before finishing: ledges, carving and a latch are in the design only)
         AutoScore score;
         MotionOverlap checked;           // the finished design's motion, checked densely for overlaps
+        std::string semanticVideo;       // the semantic video's path, when one was written
         std::string message;
     };
 

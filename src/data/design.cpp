@@ -363,6 +363,18 @@ namespace Bakugan {
     // ---- editing -----------------------------------------------------------------------------------------------------
 
     std::string Design::UniqueName(const std::string& base) const {
+        if (names) {
+            std::string n = base;
+            if (names->used.count(n)) {
+                int& k = names->next.try_emplace(base, 2).first->second;   // (names only get added: the first free number
+                for (;; k++) {                                              //  after base never goes back)
+                    n = base + " " + std::to_string(k);
+                    if (!names->used.count(n)) break;
+                }
+            }
+            names->used.insert(n);
+            return n;
+        }
         auto used = [&](const std::string& n) {
             for (const Shape& s : shapes) if (s.name == n) return true;
             for (const Group& g : groups) if (g.name == n) return true;

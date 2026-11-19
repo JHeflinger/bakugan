@@ -23,6 +23,10 @@ namespace Bakugan {
         if (mesh->indices.empty()) { m_Status = "The reference mesh has no triangles to fit."; return; }
         AutoParams p = m_AutoParams;
         p.gpu = m_AutoUseGpu && m_Gpu->Ok() ? m_Gpu : nullptr;
+        if (!m_AutoSemanticVideo || scoreOnly || p.semanticWeight <= 0.0f) p.semanticVideo.clear();
+        else if (p.semanticVideo.empty()) { m_Status = "Choose where the semantic video goes (Semantic loss > Record a video), or turn it off."; return; }
+        else if (p.semanticVideo.find('"') != std::string::npos) { m_Status = "The semantic video's path has a quote in it: ffmpeg can't be given it."; return; }
+        else if (!FfmpegAvailable()) { m_Status = "Recording the semantic video needs ffmpeg on the PATH (Arch: pacman -S ffmpeg), or turn it off."; return; }
         if (scoreOnly) p.steps = 0;      // only score the current design (against the mesh where it is)
         else if (!AutoStartFor(p)) return;
         Design start = m_Design;

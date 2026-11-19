@@ -60,7 +60,14 @@ namespace Bakugan {
         Hint("A sphere is cut into pieces and hinged, so that open it looks like the mesh. Closed, the pieces are the sphere "
              "again, always: only the open pose and the motion are scored.");
         {
-            {
+            ImGui::Checkbox("Every body one piece", &p.onePiece);
+        ImGui::SetItemTooltip("No body may fall apart: what lies apart from a body's largest piece costs, and the gradient shrinks it\n"
+                              "away while the search runs; whatever is still apart when it ends is taken away (finishing).");
+        if (p.onePiece) {
+            ImGui::SliderFloat("One-piece weight", &p.onePieceWeight, 0.5f, 100.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
+            ImGui::SetItemTooltip("The cost of a whole sphere's volume lying apart (a part 1%% of the sphere costs a hundredth of this)");
+        }
+        {
             int look = (int)p.fitLook;
             if (ImGui::Combo("Compare", &look, "Silhouettes\0Depth rasters\0")) p.fitLook = (FitLook)look;
             ImGui::SetItemTooltip("How each view of the open design is compared with the mesh's.\n"
@@ -195,6 +202,27 @@ namespace Bakugan {
                               "shading to follow.)");
         ImGui::Checkbox("Use the GPU (CUDA)", &p.semanticGpu);
         ImGui::SetItemTooltip("Run DINOv3 with CUDA, if this ONNX Runtime has it (the onnxruntime-gpu builds); the CPU otherwise");
+
+        ImGui::Checkbox("Record a video", &m_AutoSemanticVideo);
+        ImGui::SetItemTooltip("Save an .mp4 of the views DINOv3 compares as the search goes: the mesh's above, the design's\n"
+                              "below, with the step and the scores, ending on the best design. Needs ffmpeg on the PATH.");
+        if (m_AutoSemanticVideo) {
+            char buf[1024];
+            snprintf(buf, sizeof(buf), "%s", p.semanticVideo.c_str());
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - ImGui::GetFrameHeight() * 2.2f);
+            if (ImGui::InputTextWithHint("##semvideo", "Video file (.mp4)", buf, sizeof(buf))) p.semanticVideo = buf;
+            ImGui::SetItemTooltip("Where the video is written (it is replaced if it's there)");
+            ImGui::SameLine();
+            std::string chosen;
+            if (ImGui::Button("...##semvideo", ImVec2(-FLT_MIN, 0)) && FileDialog(true, "mp4", p.semanticVideo, &chosen)) {
+                if (chosen.size() < 4 || chosen.compare(chosen.size() - 4, 4, ".mp4") != 0) chosen += ".mp4";
+                p.semanticVideo = chosen;
+            }
+            ImGui::SliderInt("Frame every", &p.semanticVideoEvery, 1, 100, "%d steps");
+            ImGui::SetItemTooltip("A frame every this many steps of the search (its lookahead tries aren't filmed)");
+            ImGui::SliderInt("Frames a second", &p.semanticVideoFps, 1, 60);
+            if (p.semanticVideo.empty()) Warn("Choose where the video goes.");
+        }
     }
 
     void App::GenerateStart() {
@@ -510,6 +538,11 @@ namespace Bakugan {
         ImGui::TextColored(s.surfaceCarved > 0.02f ? Amber : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled), "Sphere surface carved: %.1f%%",
                            s.surfaceCarved * 100.0f);
         ImGui::SetItemTooltip("The share of the sphere's surface hollows reach (closed, it shows there)");
+        if (s.fragmentParts > 0) {
+            ImGui::TextDisabled("Apart from their bodies: %d part%s, %.2f%% of the sphere", s.fragmentParts, s.fragmentParts == 1 ? "" : "s",
+                                100.0f * s.fragments);
+            ImGui::SetItemTooltip("Parts of bodies not joined to the body's largest piece (Every body one piece shrinks them away)");
+        }
         if (m_AutoParams.fitLook == FitLook::Depth || s.depth > 0.0f) {
             ImGui::TextDisabled("Depth mismatch %.3f", s.depth);
             ImGui::SetItemTooltip("Where the design and the mesh both cover a pixel, how far apart their front surfaces are (0: none),\n"

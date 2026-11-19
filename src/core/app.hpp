@@ -270,6 +270,7 @@ namespace Bakugan {
         bool m_AutoUseGpu = false;
         enum class AutoStartFrom { Sphere, Current, File };
         AutoStartFrom m_AutoStartFrom = AutoStartFrom::Sphere;     // what Generate starts the search from
+        bool m_AutoSemanticVideo = false;                          // record the semantic comparison (to m_AutoParams.semanticVideo)
         std::string m_AutoStartPath;                  // ... the design file, with AutoStartFrom::File
         bool AutoStartFor(AutoParams& p);             // sets p.startFrom as chosen; false (and says why) when it can't be had
 

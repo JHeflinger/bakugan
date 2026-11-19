@@ -1,3 +1,4 @@
+#include "util/fastmath.hpp"
 #include "clash.hpp"
 #include "util/box.hpp"
 #include <raymath.h>
@@ -78,21 +79,36 @@ namespace Bakugan {
         Vector3 h;
         for (int k = 0; k < 3; k++) {
             n[k] = std::clamp((int)ceilf((&ext.x)[k] / cell), 1, 32);
-            (&h.x)[k] = fmaxf((&ext.x)[k] / n[k], 1e-6f);
+            (&h.x)[k] = Fmax((&ext.x)[k] / n[k], 1e-6f);
         }
         const float reach = 0.5f * Vector3Length(h) * 1.25f;    // (the fields are not exact everywhere: some slack)
         const float volume = h.x * h.y * h.z;
         const BoundingBox boxA = Grow(a.box, reach), boxB = Grow(b.box, reach);
         auto add = [&](Vector3 p, float da, float db, float v) {
-            float dd = fmaxf(da, db);
+            float dd = Fmax(da, db);
             out->volume += v;
             out->depth += (double)-dd * v;
-            out->deepest = fmaxf(out->deepest, -dd);
+            out->deepest = Fmax(out->deepest, -dd);
             if (keep) out->samples.push_back({ p, -dd, v, da > db });
         };
-        for (int k = 0; k <= n[2]; k++)
-            for (int j = 0; j <= n[1]; j++)
-                for (int i = 0; i <= n[0]; i++) {
+        // the cells two by two by two first: a block whose centre is farther from either body than any of its cells'
+        // centres can be (half a cell's diagonal) plus the reach can only hold cells the test below skips
+        const float blockReach = reach + 0.5f * Vector3Length(h) * 1.25f;
+        for (int bk = 0; bk <= n[2]; bk += 2)
+            for (int bj = 0; bj <= n[1]; bj += 2)
+                for (int bi = 0; bi <= n[0]; bi += 2) {
+                    const Vector3 c = { lo.x + (bi + 0.5f + jitter.x - 0.5f) * h.x, lo.y + (bj + 0.5f + jitter.y - 0.5f) * h.y,
+                                        lo.z + (bk + 0.5f + jitter.z - 0.5f) * h.z };
+                    {
+                        const Vector3 ca = a.xf.ApplyInverse(c);
+                        if (!InBox(ca, Grow(boxA, blockReach))) continue;
+                        const Vector3 cb = b.xf.ApplyInverse(c);
+                        if (!InBox(cb, Grow(boxB, blockReach))) continue;
+                        if (a.field->Distance(ca) > blockReach || b.field->Distance(cb) > blockReach) continue;
+                    }
+        for (int k = bk; k <= std::min(bk + 1, n[2]); k++)
+            for (int j = bj; j <= std::min(bj + 1, n[1]); j++)
+                for (int i = bi; i <= std::min(bi + 1, n[0]); i++) {
                     Vector3 p = { lo.x + (i + jitter.x - 0.5f) * h.x, lo.y + (j + jitter.y - 0.5f) * h.y, lo.z + (k + jitter.z - 0.5f) * h.z };
                     Vector3 qa = a.xf.ApplyInverse(p);
                     if (!InBox(qa, boxA)) continue;
@@ -119,6 +135,7 @@ namespace Bakugan {
                         if (eb >= 0.0f) continue;
                         add(s, ea, eb, 0.125f * volume);
                     }
+                }
                 }
     }
 
@@ -155,7 +172,7 @@ namespace Bakugan {
                                   { 0.5f, 0.5f, 0.5f }, &o, false);
                 }
             m.poses++;
-            m.deepest = fmaxf(m.deepest, o.deepest);
+            m.deepest = Fmax(m.deepest, o.deepest);
             if (c.hinge < 0) { m.openVolume = o.volume; continue; }
             m.perHinge[c.hinge] = std::max(m.perHinge[c.hinge], o.volume);
             if (o.volume > m.worstVolume) {
