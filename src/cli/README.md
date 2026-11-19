@@ -63,7 +63,7 @@ settings: goal.views: must be between 1 and 64, got 0
 | `[finishing]` | hinges, carving, latch, `remove_floating` (+ `floating_share`, `floating_voxel`) | Finishing |
 | `[suite]` | folder, mesh size, video | the suite's panel |
 | `[output]` | where results go, which files | new |
-| `[runtime]` | threads, progress interval | new |
+| `[runtime]` | threads, progress interval, `gpu` (`--gpu`) | new |
 
 Relative paths are relative to where you run foldaball. The suite uses the same `[goal]`...`[finishing]` settings as
 `optimize`, as the editor's suite uses the Generate tab's.
@@ -107,6 +107,18 @@ the editor. The run is otherwise an ordinary one: its own steps, seed, settings 
 - **The collision ramp starts again**, as in any run: overlaps cost `collision_weight` at first and `collision_ramp` times
   that by the end. To refine a finished design gently, lower the ramp or the steps.
 - `suite` refuses `start.design`: every mesh starts from its own sphere.
+
+## On the GPU
+
+`runtime.gpu = true` (or `--gpu`) does what the editor's *Draw the views on the GPU* does, for `optimize`, `score` and
+`suite`: every step's views are raymarched on the GPU, and the gradient's field measurements (each parameter nudged, every
+edge point measured again) are made there. Rebuilding the pieces, collisions and shading stay on the CPU. It needs an
+OpenGL 3.3 context, which it gets from a hidden window: so a display (X11, or XWayland under a Wayland compositor). The
+search then runs on a thread of its own while the main thread serves the GPU. Without a context it says why and runs on
+the CPU. Under `xvfb-run` it works, but Xvfb's OpenGL is software (slower than the CPU path). The first progress line says
+where each part ran and how long the last step spent on each.
+
+DINOv3's CUDA is separate: `semantic.semantic_gpu = true`, with an ONNX Runtime built with CUDA (on Arch, `onnxruntime-cuda`).
 
 ## Running on a server
 

@@ -11,6 +11,8 @@
 #include "cli/config.hpp"
 #include "util/utils.hpp"
 #include "core/app.hpp"
+#include "ui/gputrace.hpp"
+#include <raylib.h>
 #include <raymath.h>
 #include <algorithm>
 #include <atomic>
@@ -38,6 +40,62 @@ namespace {
 
     // Watches a running job from another thread: passes a stop on to it, prints a progress line now and then, and calls
     // `tick` (checkpoints) several times a second.
+    // The GPU for the command line (runtime.gpu): the editor's tracer, with an OpenGL context of its own from a hidden
+    // window. The context belongs to the thread that made it (this one), so with it a job runs on a thread of its own and
+    // this one answers the tracer's requests until the job is done. Without it (not asked, or no context to be had: no
+    // display, no OpenGL 3.3, no float targets) jobs run here, on the CPU, as before.
+    class CliGpu {
+    public:
+        CliGpu(bool want, bool quiet) {
+            if (!want) return;
+            SetTraceLogLevel(LOG_ERROR);
+            SetConfigFlags(FLAG_WINDOW_HIDDEN);
+            InitWindow(64, 64, "foldaball (GPU)");
+            if (!IsWindowReady()) {
+                m_Why = "no OpenGL context (no display? run it where there is one, or under xvfb-run, which draws in software)";
+            } else {
+                auto g = std::make_shared<GpuSilhouettes>();
+                if (g->Init()) m_Gpu = g;
+                else {
+                    m_Why = g->Error();
+                    CloseWindow();
+                }
+            }
+            if (!quiet) {
+                if (m_Gpu) printf("GPU: an OpenGL context of its own: the views and the gradient's measurements go there.\n");
+                else printf("GPU asked for, not had: %s. Running on the CPU.\n", m_Why.c_str());
+            }
+        }
+        ~CliGpu() {
+            if (!m_Gpu) return;
+            m_Gpu->Unload();
+            CloseWindow();
+        }
+        std::shared_ptr<SilhouetteTracer> Tracer() const { return m_Gpu; }
+        // f() on a thread of its own while this one serves the GPU; or just f() here, without one
+        void Run(const std::function<void()>& f) {
+            if (!m_Gpu) { f(); return; }
+            std::atomic<bool> done{ false };
+            std::thread job([&] {
+                f();
+                done = true;
+            });
+            while (!done) {
+                m_Gpu->Service(0.05);
+                if (!done) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            job.join();
+        }
+        std::string Summary() const {
+            if (!m_Gpu) return "";
+            return Utils::Format("GPU: %d drawings, %d gradients measured (%.0f ms the last), %d shaders compiled.", m_Gpu->Drawn(), m_Gpu->Evaluated(),
+                                 m_Gpu->LastEvalMs(), m_Gpu->Compiles());
+        }
+    private:
+        std::shared_ptr<GpuSilhouettes> m_Gpu;
+        std::string m_Why;
+    };
+
     class Watcher {
     public:
         Watcher(JobControl& control, int everySeconds, std::function<std::string()> status, std::function<void()> tick = {})
@@ -111,6 +169,7 @@ namespace {
         "  -s, --set KEY=VALUE    one setting, e.g. -s optimizer.steps=3000 (repeatable; beats the files)\n"
         "  -o, --out DIR          where results go (output.dir)\n"
         "  -j, --threads N        worker threads (runtime.threads; default: every core)\n"
+        "      --gpu              draw the views and measure the gradient on the GPU (runtime.gpu)\n"
         "      --steps N          optimizer.steps\n"
         "      --seed N           optimizer.seed\n"
         "      --start FILE       optimize: carry the search on from a saved design (.txt) instead of the sphere (start.design)\n"
@@ -146,6 +205,7 @@ namespace {
             else if (flag == "-j" || flag == "--threads") { if (!value(i, arg, &v)) return false; a->sets.push_back({ "runtime.threads", v }); }
             else if (flag == "--steps") { if (!value(i, arg, &v)) return false; a->sets.push_back({ "optimizer.steps", v }); }
             else if (flag == "--seed") { if (!value(i, arg, &v)) return false; a->sets.push_back({ "optimizer.seed", v }); }
+            else if (flag == "--gpu") a->sets.push_back({ "runtime.gpu", "true" });
             else if (flag == "--start") { if (!value(i, arg, &v)) return false; a->sets.push_back({ "start.design", v }); }
             else if (arg.size() > 1 && arg[0] == '-') { *error = "unknown option " + arg + " (see --help)"; return false; }
             else if (a->command.empty()) a->command = arg;
@@ -297,7 +357,8 @@ namespace {
         SaveSettings(cfg, outDir / (name + ".config.ini"));
 
         AutoParams p = cfg.generate;
-        p.gpu = nullptr;                                     // (the editor's GL context is the only tracer there is)
+        CliGpu gpu(cfg.runtime.gpu, a.quiet);
+        p.gpu = gpu.Tracer();                                // (null: the CPU)
         p.startFrom = startFrom;
         auto live = std::make_shared<AutoLive>();
         live->ruleWeights = p.ruleWeights;
@@ -341,8 +402,9 @@ namespace {
                     lastWritten = now;
                     Write(outDir / (name + ".partial.txt"), SerializeWithTarget(best, score));      // (--start carries on from it)
                 });
-            r = AutoDesign(mesh, Design{}, p, control, live);
+            gpu.Run([&] { r = AutoDesign(mesh, Design{}, p, control, live); });
         }
+        if (!a.quiet && gpu.Tracer()) printf("%s\n", gpu.Summary().c_str());
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
         if (!r.ok) {
             fprintf(stderr, "Failed: %s\n", r.message.c_str());
@@ -440,10 +502,12 @@ namespace {
         TriMesh mesh;
         if (!LoadMesh(a.positional[1], cfg.input.meshSize, &mesh, &err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
         AutoParams p = cfg.generate;
-        p.gpu = nullptr;
+        CliGpu gpu(cfg.runtime.gpu, true);
+        p.gpu = gpu.Tracer();
         p.steps = 0;
         JobControl control;
-        AutoResult r = AutoDesign(mesh, design, p, control, nullptr);
+        AutoResult r;
+        gpu.Run([&] { r = AutoDesign(mesh, design, p, control, nullptr); });
         if (!r.ok) { fprintf(stderr, "Failed: %s\n", r.message.c_str()); return 1; }
         printf("%s\n\nScore\n%s", r.message.c_str(), ScoreLines(r.score).c_str());
         const fs::path outDir = cfg.output.dir.empty() ? fs::path("foldaball_out") : fs::path(cfg.output.dir);
@@ -473,7 +537,8 @@ namespace {
         SuiteParams sp = cfg.suite;
         sp.folder = folder;
         sp.generate = cfg.generate;
-        sp.generate.gpu = nullptr;
+        CliGpu gpu(cfg.runtime.gpu, a.quiet);
+        sp.generate.gpu = gpu.Tracer();
         sp.outDir = cfg.output.dir;
         sp.preview = cfg.output.preview;
         sp.previewSize = cfg.output.previewSize;
@@ -511,7 +576,7 @@ namespace {
                     return Utils::Format("mesh %d/%d %s: step %d/%d, loss %.4f", index + 1, total, name.c_str(), it, n, loss);
                 return Utils::Format("%s: %.0f%%", phase.empty() ? "starting" : phase.c_str(), progress * 100.0f);
             });
-            r = RunSuite(sp, control, live);
+            gpu.Run([&] { r = RunSuite(sp, control, live); });
         }
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
         if (r.ok) {

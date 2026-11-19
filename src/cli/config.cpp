@@ -189,6 +189,10 @@ namespace Bakugan::Cli {
         section = "runtime";
         Int("threads", runtime.threads, 0, 4096, "Worker threads for the search (0: every core).");
         Int("progress_seconds", runtime.progressSeconds, 0, 86400, "Print a progress line this often (0: none).");
+        Bool("gpu", runtime.gpu,
+             "Draw the views and measure the gradient on the GPU, as the editor's Draw the views on the GPU does: an OpenGL 3.3 context "
+             "of its own (a hidden window: it needs a display, X11 or XWayland; under xvfb-run it works but draws in software). "
+             "Without one it says so and runs on the CPU. (DINOv3's CUDA is semantic.semantic_gpu.)");
 
         // -- the Generate tab -----------------------------------------------------------------------------------------------
         section = "goal";
