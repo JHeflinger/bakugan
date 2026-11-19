@@ -7,6 +7,12 @@
 #include <cstdlib>
 
 namespace Bakugan {
+    // seconds, steady (not raylib's GetTime, which is the window's: the command line's headless context has none)
+    static double Now() {
+        using namespace std::chrono;
+        return duration<double>(steady_clock::now().time_since_epoch()).count();
+    }
+
     // ---- the hand-off -----------------------------------------------------------------------------------------------------
 
     bool GpuSilhouettes::Trace(const TraceRequest& request, TraceResult* result) {
@@ -51,11 +57,11 @@ namespace Bakugan {
             if (m_Pending && !m_Done) {
                 m_Success = m_EvalRequest ? DrawEval(*m_EvalRequest, m_EvalSums) : Draw(*m_Request, m_Result);
                 m_Done = true;
-                m_LastAsked = GetTime();
+                m_LastAsked = Now();
                 m_Answered.notify_all();
             }
             // stay for the next one only while a search is at it (it asked within the last quarter second)
-            if (m_Closed || Clock::now() >= until || GetTime() - m_LastAsked > 0.25) break;
+            if (m_Closed || Clock::now() >= until || Now() - m_LastAsked > 0.25) break;
             m_Asked.wait_until(l, until);
         }
     }
@@ -160,7 +166,7 @@ namespace Bakugan {
     bool GpuSilhouettes::Draw(const TraceRequest& rq, TraceResult* out) {
         const int nv = (int)rq.views.size();
         if (nv <= 24) return DrawViews(rq, out);
-        const double start = GetTime();
+        const double start = Now();
         const size_t px = (size_t)rq.res * rq.res;
         const int bands = rq.everyPiece ? (int)rq.pieces.size() : 1;
         const size_t count = (size_t)bands * nv * px;
@@ -185,12 +191,12 @@ namespace Bakugan {
                 }
         }
         m_Drawn++;
-        m_LastMs = (GetTime() - start) * 1000.0;
+        m_LastMs = (Now() - start) * 1000.0;
         return true;
     }
 
     bool GpuSilhouettes::DrawViews(const TraceRequest& rq, TraceResult* out) {
-        const double start = GetTime();
+        const double start = Now();
         const int nv = (int)rq.views.size(), res = rq.res;
         const int bands = rq.everyPiece ? (int)rq.pieces.size() : 1;
         if (!m_Ok || nv < 1 || nv > 24 || res < 1 || bands < 1 || (long long)nv * res > 16384 || (long long)bands * res > 16384) return false;
@@ -271,7 +277,7 @@ namespace Bakugan {
             }
         MemFree(px);
         m_Drawn++;
-        m_LastMs = (GetTime() - start) * 1000.0;
+        m_LastMs = (Now() - start) * 1000.0;
         return true;
     }
 }
@@ -307,7 +313,7 @@ namespace Bakugan {
 
     // Every job's points summed on the GPU, Sdf::EvalChunk to a pixel; read back once and summed here per job.
     bool GpuSilhouettes::DrawEval(const EvalRequest& rq, std::vector<double>* sums) {
-        const double start = GetTime();
+        const double start = Now();
         sums->assign(rq.jobs.size(), 0.0);
         if (!m_Ok) return false;
         if (rq.jobs.empty()) return true;
@@ -406,7 +412,7 @@ namespace Bakugan {
         }
         MemFree(px);
         m_Evaluated++;
-        m_LastEvalMs = (GetTime() - start) * 1000.0;
+        m_LastEvalMs = (Now() - start) * 1000.0;
         return true;
     }
 }

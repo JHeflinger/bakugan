@@ -38,6 +38,7 @@ namespace Bakugan::Cli {
         int threads = 0;                 // worker threads (0: every core)
         int progressSeconds = 10;        // a progress line this often (0: none)
         bool gpu = false;                // draw the views and measure the gradient on the GPU (an OpenGL context of its own)
+        int gpuDevice = -1;              // which GPU (EGL device), -1: the first hardware one
     };
 
     // One setting: where it lives in the file and how to read, write and describe it.

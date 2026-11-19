@@ -9,6 +9,7 @@
 // TBB first: raylib's macros (PI, EPSILON, ...) must not leak into its headers.
 #include <tbb/global_control.h>
 #include "cli/config.hpp"
+#include "cli/headless_gl.hpp"
 #include "util/utils.hpp"
 #include "core/app.hpp"
 #include "ui/gputrace.hpp"
@@ -44,32 +45,50 @@ namespace {
     // window. The context belongs to the thread that made it (this one), so with it a job runs on a thread of its own and
     // this one answers the tracer's requests until the job is done. Without it (not asked, or no context to be had: no
     // display, no OpenGL 3.3, no float targets) jobs run here, on the CPU, as before.
+    // (GLFW, which raylib is built on: asked first whether there is a display at all, because raylib 5.5's InitWindow
+    // carries on without one and crashes)
+    extern "C" int glfwInit(void);
+    extern "C" void glfwTerminate(void);
+
     class CliGpu {
     public:
-        CliGpu(bool want, bool quiet) {
+        CliGpu(bool want, int device, bool quiet) {
             if (!want) return;
             SetTraceLogLevel(LOG_ERROR);
-            SetConfigFlags(FLAG_WINDOW_HIDDEN);
-            InitWindow(64, 64, "foldaball (GPU)");
-            if (!IsWindowReady()) {
-                m_Why = "no OpenGL context (no display? run it where there is one, or under xvfb-run, which draws in software)";
-            } else {
-                auto g = std::make_shared<GpuSilhouettes>();
-                if (g->Init()) m_Gpu = g;
+            // 1. headless: no window, no display (tmux, ssh, a server)
+            std::string headlessWhy, windowWhy;
+            if (m_Headless.Open(device, &headlessWhy)) {
+                Start("headless, " + m_Headless.Renderer());
+                if (!m_Gpu) m_Headless.Close();
+            }
+            // 2. a hidden window, where there is a display
+            if (!m_Gpu && device < 0) {
+                if (!glfwInit()) windowWhy = "no display for a window";
                 else {
-                    m_Why = g->Error();
-                    CloseWindow();
+                    glfwTerminate();
+                    SetConfigFlags(FLAG_WINDOW_HIDDEN);
+                    InitWindow(64, 64, "foldaball (GPU)");
+                    if (IsWindowReady()) {
+                        m_Window = true;
+                        Start("a hidden window");
+                        if (!m_Gpu) {
+                            CloseWindow();
+                            m_Window = false;
+                        }
+                    } else windowWhy = "the window wouldn't open";
                 }
             }
+            if (!m_Gpu && m_Why.empty()) m_Why = "headless: " + headlessWhy + (windowWhy.empty() ? "" : "; " + windowWhy);
             if (!quiet) {
-                if (m_Gpu) printf("GPU: an OpenGL context of its own: the views and the gradient's measurements go there.\n");
-                else printf("GPU asked for, not had: %s. Running on the CPU.\n", m_Why.c_str());
+                if (m_Gpu) printf("GPU: %s: the views and the gradient's measurements go there.\n", m_Where.c_str());
+                else printf("GPU asked for, not had (%s). Running on the CPU.\n", m_Why.c_str());
             }
         }
         ~CliGpu() {
             if (!m_Gpu) return;
             m_Gpu->Unload();
-            CloseWindow();
+            if (m_Window) CloseWindow();
+            m_Headless.Close();
         }
         std::shared_ptr<SilhouetteTracer> Tracer() const { return m_Gpu; }
         // f() on a thread of its own while this one serves the GPU; or just f() here, without one
@@ -92,8 +111,17 @@ namespace {
                                  m_Gpu->LastEvalMs(), m_Gpu->Compiles());
         }
     private:
+        void Start(const std::string& where) {
+            auto g = std::make_shared<GpuSilhouettes>();
+            if (g->Init()) {
+                m_Gpu = g;
+                m_Where = where;
+            } else m_Why = where + ": " + g->Error();
+        }
         std::shared_ptr<GpuSilhouettes> m_Gpu;
-        std::string m_Why;
+        Cli::HeadlessGl m_Headless;
+        bool m_Window = false;
+        std::string m_Why, m_Where;
     };
 
     class Watcher {
@@ -357,7 +385,7 @@ namespace {
         SaveSettings(cfg, outDir / (name + ".config.ini"));
 
         AutoParams p = cfg.generate;
-        CliGpu gpu(cfg.runtime.gpu, a.quiet);
+        CliGpu gpu(cfg.runtime.gpu, cfg.runtime.gpuDevice, a.quiet);
         p.gpu = gpu.Tracer();                                // (null: the CPU)
         p.startFrom = startFrom;
         auto live = std::make_shared<AutoLive>();
@@ -502,7 +530,7 @@ namespace {
         TriMesh mesh;
         if (!LoadMesh(a.positional[1], cfg.input.meshSize, &mesh, &err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
         AutoParams p = cfg.generate;
-        CliGpu gpu(cfg.runtime.gpu, true);
+        CliGpu gpu(cfg.runtime.gpu, cfg.runtime.gpuDevice, true);
         p.gpu = gpu.Tracer();
         p.steps = 0;
         JobControl control;
@@ -537,7 +565,7 @@ namespace {
         SuiteParams sp = cfg.suite;
         sp.folder = folder;
         sp.generate = cfg.generate;
-        CliGpu gpu(cfg.runtime.gpu, a.quiet);
+        CliGpu gpu(cfg.runtime.gpu, cfg.runtime.gpuDevice, a.quiet);
         sp.generate.gpu = gpu.Tracer();
         sp.outDir = cfg.output.dir;
         sp.preview = cfg.output.preview;

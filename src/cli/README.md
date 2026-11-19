@@ -112,11 +112,22 @@ the editor. The run is otherwise an ordinary one: its own steps, seed, settings 
 
 `runtime.gpu = true` (or `--gpu`) does what the editor's *Draw the views on the GPU* does, for `optimize`, `score` and
 `suite`: every step's views are raymarched on the GPU, and the gradient's field measurements (each parameter nudged, every
-edge point measured again) are made there. Rebuilding the pieces, collisions and shading stay on the CPU. It needs an
-OpenGL 3.3 context, which it gets from a hidden window: so a display (X11, or XWayland under a Wayland compositor). The
-search then runs on a thread of its own while the main thread serves the GPU. Without a context it says why and runs on
-the CPU. Under `xvfb-run` it works, but Xvfb's OpenGL is software (slower than the CPU path). The first progress line says
-where each part ran and how long the last step spent on each.
+edge point measured again) are made there. Rebuilding the pieces, collisions and shading stay on the CPU. The search runs
+on a thread of its own while the main thread serves the GPU.
+
+It needs an OpenGL 3.3 context, which it gets, in this order:
+
+1. **Headless** (EGL, `cli/headless_gl.cpp`): no window and no display, so it works in tmux, over ssh and on servers.
+   NVIDIA's driver gives one through its EGL device platform, Mesa through its devices or its surfaceless platform.
+   libEGL is loaded when asked for, so the build needs nothing new. The first GPU that isn't a software renderer is
+   used; `runtime.gpu_device = N` picks the N-th EGL device instead.
+2. **A hidden window**, where there is a display (X11 or XWayland), if the headless context can't be had. GLFW is asked
+   first whether there is a display at all: raylib 5.5's `InitWindow` carries on without one and crashes.
+
+Without either it says why and runs on the CPU. The first line says which it got (and the GPU's name); the first
+progress line says where each part ran and how long the last step spent on each. If the headless context fails on a
+machine with a GPU, check that its EGL is installed (on Arch: `nvidia-utils`, or `mesa`) and that you can open the
+render nodes (`ls -l /dev/dri`, and `/dev/nvidia*`).
 
 DINOv3's CUDA is separate: `semantic.semantic_gpu = true`, with an ONNX Runtime built with CUDA (on Arch, `onnxruntime-cuda`).
 
