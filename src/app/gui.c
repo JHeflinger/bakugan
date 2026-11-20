@@ -99,7 +99,7 @@ typedef struct {
     float yaw, pitch, dist;
     V3 focus;
     float pose;                      // 0 closed .. 1 open
-    bool animate, showTarget, showHinges, showSphere;
+    bool animate, showTarget, showHinges, showSphere, showGrid;
     float animT;
     float scroll;
     bool open[12];
@@ -356,7 +356,7 @@ static void draw_view(Rectangle vp) {
     BeginTextureMode(A.rt);
     ClearBackground((Color){ 22, 24, 29, 255 });
     BeginMode3D(A.cam);
-    DrawGrid(20, 0.25f);
+    if (A.showGrid) DrawGrid(20, 0.25f);
     if (A.haveDesign && A.design) {
         Design* d = A.design;
         Rigid xf[FB_MAX_BODIES];
@@ -695,6 +695,7 @@ static void panel(Rectangle area) {
     ui_checkbox("show the target", &A.showTarget);
     ui_checkbox("show hinges", &A.showHinges);
     ui_checkbox("show the sphere (closed)", &A.showSphere);
+    ui_checkbox("show the grid", &A.showGrid);
 
     ui_section("Finish");
     {
@@ -744,6 +745,7 @@ int gui_run(const char* mesh) {
     A.pose = 1.0f;
     A.showHinges = true;
     A.showSphere = true;
+    A.showGrid = true;
     A.showTarget = true;
     A.open[1] = true;
     snprintf(A.status, sizeof(A.status), "Load a mesh (.obj) or a design (.fold) to start.");

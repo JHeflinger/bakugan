@@ -13,9 +13,9 @@
 #include "core/design.h"
 
 typedef struct {
-    float plane[FB_MAX_PLANES][4];
+    float plane[FB_MAX_PLANES][5];                 // n, d, k
     float hinge[FB_MAX_BODIES][2];       // phi, angle
-    float hollow[FB_MAX_HOLLOWS][7];     // a, b, r
+    float hollow[FB_MAX_HOLLOWS][FB_HOLLOW_PARAMS];     // a, b, r
     float place[4];                      // scale, offset
 } Grad;
 
@@ -57,6 +57,10 @@ typedef struct {
 } Lattice;
 void lattice_build(const Design* d, int M, Lattice* L);
 void lattice_free(Lattice* L);
+// What of each body lies apart from its largest piece (6-connected) on a lattice of labels (-1: no body): flag
+// (optional) 1 there per point; perBody (optional, nlabels long) per body. Returns the count, and the number of
+// separate apart pieces in *parts (optional).
+int lattice_apart(int M, const int* label, int nlabels, unsigned char* flag, int* perBody, int* parts);
 static inline V3 lattice_point(const Lattice* L, int i, int j, int k) {
     return v3(L->origin.x + i * L->cell, L->origin.y + j * L->cell, L->origin.z + k * L->cell);
 }

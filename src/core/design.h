@@ -27,13 +27,46 @@ typedef struct {
     int n;
 } Cell;
 
+// A cut: flat (k = 0, the plane n.q = d) or bent into a piece of a sphere of radius 1/|k| (bulging toward -n for
+// k > 0, toward +n for k < 0) through the same point n d. Its field is the exact signed distance to that surface,
+// positive on the +n side, written so that it stays exact as k goes to 0. A sphere meets the ball's sphere in a circle,
+// so a bent cut's seam is still a circle and its hinges still sit exactly on it.
 typedef struct {
     int id;
     V3 n;
     float d;
-    float m[4], v[4];                // Adam's moments (n, d)
+    float k;                         // bend: 1 / radius (0 flat)
+    float m[5], v[5];                // Adam's moments (n, d, k)
     int t;
 } Plane;
+
+// the cut's field at q: with a = n.q - d and u = q - n d,
+//   (2a - k|u|^2) / (1 + sqrt(1 - 2ak + k^2 |u|^2))
+// (= a when k = 0; otherwise the distance to the sphere through n d with centre n (d + 1/k))
+static inline float cut_field(V3 n, float d, float k, V3 q) {
+    float a = v3dot(n, q) - d;
+    if (k == 0.0f) return a;
+    V3 u = v3sub(q, v3scale(n, d));
+    float u2 = v3dot(u, u);
+    return (2.0f * a - k * u2) / (1.0f + sqrtf(fmaxf(0.0f, 1.0f - 2.0f * a * k + k * k * u2)));
+}
+static inline float plane_field(const Plane* p, V3 q) { return cut_field(p->n, p->d, p->k, q); }
+// its gradient in q: (n - k u) / sqrt(1 - 2ak + k^2 |u|^2)
+static inline V3 plane_grad(const Plane* p, V3 q) {
+    if (p->k == 0.0f) return p->n;
+    float a = v3dot(p->n, q) - p->d;
+    V3 u = v3sub(q, v3scale(p->n, p->d));
+    float S = sqrtf(fmaxf(1e-12f, 1.0f - 2.0f * a * p->k + p->k * p->k * v3dot(u, u)));
+    return v3scale(v3sub(p->n, v3scale(u, p->k)), 1.0f / S);
+}
+// its gradient in the cut's parameters (n.x, n.y, n.z, d, k)
+void plane_param_grad(const Plane* p, V3 q, float g[5]);
+// where the cut meets the sphere of radius r: the circle in the plane n.q = h, of radius rho
+void plane_seam(const Plane* p, float r, float* h, float* rho);
+// the bend nearest p->k (toward flat) at which the cut still crosses the sphere of radius r properly (its seam's
+// plane within max(|d|, 0.9 r) of the centre, and its centre clear: 1 + k d >= 0.2); a cut bent further would close
+// into a bubble inside the ball, which no hinge could reach
+float plane_bend_ok(const Plane* p, float r);
 
 typedef struct {
     int id;
@@ -57,13 +90,21 @@ typedef struct {
     V3 pivot, axis;                  // (derived from the plane and phi: design_hinge_frames)
 } Hinge;
 
+// A hollow: material taken from every body it reaches, a capsule (segment a-b, radius r).
+#define FB_HOLLOW_PARAMS 7
 typedef struct {
     int id;
-    V3 a, b;                         // a capsule: segment and radius
+    V3 a, b;
     float r;
-    float m[7], v[7];
+    float m[FB_HOLLOW_PARAMS], v[FB_HOLLOW_PARAMS];
     int t;
 } Hollow;
+// a hollow's parameters (what Adam moves): a, b, r
+static inline int hollow_params(Hollow* h, float** out) {
+    float* p[FB_HOLLOW_PARAMS] = { &h->a.x, &h->a.y, &h->a.z, &h->b.x, &h->b.y, &h->b.z, &h->r };
+    for (int k = 0; k < FB_HOLLOW_PARAMS; k++) out[k] = p[k];
+    return FB_HOLLOW_PARAMS;
+}
 
 typedef enum { EX_BOX = 0, EX_CYLINDER = 1 } ExtraShape;
 typedef struct {

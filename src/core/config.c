@@ -15,6 +15,8 @@ void params_default(Params* p) {
     p->steps = 3000;
     p->seed = 1;
     p->lrPlane = 0.01f;
+    p->lrBend = 0.01f;
+    p->maxBend = 0.0f;
     p->lrPhi = 0.03f;
     p->lrAngle = 0.05f;
     p->lrHollow = 0.01f;
@@ -86,10 +88,12 @@ static const ParamInfo kTable[] = {
     F("model", "size_mm", PT_FLOAT, sizeMm, 5, 10000, "The sphere's diameter, mm (the hinges' and clearances' mm are measured against it)."),
     F("model", "max_bodies", PT_INT, maxBodies, 1, 64, "No more bodies than this."),
     F("model", "max_hollows", PT_INT, maxHollows, 0, 64, "No more hollows (capsules carved from the sphere) than this."),
+    F("model", "max_bend", PT_FLOAT, maxBend, 0, 4, "How far cuts may bend: 0 flat cuts only; otherwise each cut may curve into a piece of a sphere as tight as 1/max_bend of the ball's radius (1: as round as the ball itself), and how much each one bends is optimized (every cut starts flat)."),
     F("model", "samples", PT_INT, samples, 12, 80, "Lattice points across the sphere for collisions, holding and one piece."),
     F("optimizer", "steps", PT_INT, steps, 0, 10000000, "Adam steps (rewrite lookaheads count too)."),
     F("optimizer", "seed", PT_UINT, seed, 0, 4e9f, "Random seed."),
     F("optimizer", "threads", PT_INT, threads, 0, 1024, "Worker threads (0: every core)."),
+    F("optimizer", "lr_bend", PT_FLOAT, lrBend, 0, 1, "Cut bend step (curvature, per sphere radius) when model.max_bend allows bent cuts."),
     F("optimizer", "lr_plane", PT_FLOAT, lrPlane, 0, 1, "Cut plane step (radians / sphere radii)."),
     F("optimizer", "lr_phi", PT_FLOAT, lrPhi, 0, 1, "Hinge position along its seam, step (radians)."),
     F("optimizer", "lr_angle", PT_FLOAT, lrAngle, 0, 1, "Hinge opening angle step (radians)."),

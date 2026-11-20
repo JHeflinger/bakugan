@@ -12,7 +12,8 @@ typedef struct {
     int steps;
     unsigned seed;
     int threads;
-    float lrPlane, lrPhi, lrAngle, lrHollow, lrPlace;
+    float lrPlane, lrPhi, lrAngle, lrHollow, lrPlace, lrBend;
+    float maxBend;
     int stepsPerRound, rewritesPerRound, lookahead;
     float rewriteMargin;
     // [loss]

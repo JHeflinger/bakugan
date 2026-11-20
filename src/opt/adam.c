@@ -20,6 +20,14 @@ void adam_step(Design* d, const Grad* g, const Params* p, float lrScale) {
         pl->n = v3norm(pl->n);
         pl->d -= p->lrPlane * lrScale * adam_one(g->plane[k][3], &pl->m[3], &pl->v[3], pl->t);
         pl->d = fb_clamp(pl->d, -0.95f * d->R, 0.95f * d->R);
+        // the bend (curvature, steps a share of 1/R): within max_bend, and the bent cut's centre kept clear of the
+        // plane's own point (1 + k d > 0.2, so its seam with the sphere stays a proper circle)
+        if (p->maxBend > 0.0f) {
+            pl->k -= p->lrBend / d->R * lrScale * adam_one(g->plane[k][4], &pl->m[4], &pl->v[4], pl->t);
+            const float kmax = p->maxBend / d->R;
+            pl->k = fb_clamp(pl->k, -kmax, kmax);
+            pl->k = plane_bend_ok(pl, d->R - d->inset);
+        } else pl->k = 0.0f;
     }
     for (int k = 0; k < d->nhinges; k++) {
         Hinge* h = &d->hinges[k];
@@ -34,8 +42,9 @@ void adam_step(Design* d, const Grad* g, const Params* p, float lrScale) {
     for (int k = 0; k < d->nhollows; k++) {
         Hollow* o = &d->hollows[k];
         o->t++;
-        float* v[7] = { &o->a.x, &o->a.y, &o->a.z, &o->b.x, &o->b.y, &o->b.z, &o->r };
-        for (int c = 0; c < 7; c++) *v[c] -= p->lrHollow * lrScale * fb_min(1.0f, o->t / 5.0f) * adam_one(g->hollow[k][c], &o->m[c], &o->v[c], o->t);
+        float* v[FB_HOLLOW_PARAMS];
+        const int n = hollow_params(o, v);
+        for (int c = 0; c < n; c++) *v[c] -= p->lrHollow * lrScale * fb_min(1.0f, o->t / 5.0f) * adam_one(g->hollow[k][c], &o->m[c], &o->v[c], o->t);
         o->r = fb_clamp(o->r, 0.0f, 0.6f * d->R);
     }
     d->pt++;

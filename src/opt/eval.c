@@ -352,8 +352,9 @@ static const float kEps = 1e-3f;
 
 static void hollow_param_grad(const Hollow* h, V3 q, float w, float* g) {
     Hollow t = *h;
-    float* v[7] = { &t.a.x, &t.a.y, &t.a.z, &t.b.x, &t.b.y, &t.b.z, &t.r };
-    for (int c = 0; c < 7; c++) {
+    float* v[FB_HOLLOW_PARAMS];
+    const int n = hollow_params(&t, v);
+    for (int c = 0; c < n; c++) {
         float keep = *v[c];
         *v[c] = keep + kEps;
         float fp = hollow_field(&t, q);
@@ -386,7 +387,7 @@ static void slope_task(void* vc, int chunk) {
         float f = body_field(d, s->body, q, &act);
         V3 gf;
         if (act.kind == 0) gf = v3norm(q);
-        else if (act.kind == 1) gf = v3scale(d->planes[act.index].n, (float)act.sign);
+        else if (act.kind == 1) gf = v3scale(plane_grad(&d->planes[act.index], q), (float)act.sign);
         else if (act.kind == 2) gf = v3scale(hollow_grad(&d->hollows[act.index], q), -1.0f);
         else gf = body_gradient(d, s->body, q);
         float w = s->w;
@@ -396,11 +397,9 @@ static void slope_task(void* vc, int chunk) {
             w = s->w * (-1.0f / gd);
         }
         if (act.kind == 1) {
-            float sg = (float)act.sign;
-            g->plane[act.index][0] += w * sg * q.x;
-            g->plane[act.index][1] += w * sg * q.y;
-            g->plane[act.index][2] += w * sg * q.z;
-            g->plane[act.index][3] -= w * sg;
+            float sg = (float)act.sign, pg[5];
+            plane_param_grad(&d->planes[act.index], q, pg);
+            for (int c = 0; c < 5; c++) g->plane[act.index][c] += w * sg * pg[c];
         } else if (act.kind == 2) {
             hollow_param_grad(&d->hollows[act.index], q, w, g->hollow[act.index]);
         }
@@ -450,7 +449,8 @@ static void transforms_nudged(const Design* d, const TParam* tp, float delta, fl
         else hinges[tp->index].angle += delta;
     } else {
         if (tp->comp < 3) v3set(&planes[tp->index].n, tp->comp, v3get(planes[tp->index].n, tp->comp) + delta);
-        else planes[tp->index].d += delta;
+        else if (tp->comp == 3) planes[tp->index].d += delta;
+        else planes[tp->index].k += delta;
     }
     design_transforms_h(d, planes, hinges, s, out);
 }
@@ -709,7 +709,7 @@ Score eval_run(Evaluator* e, const Design* d, Grad* grad, float collisionScale, 
             const float w = P->hingeWeight;
             Plane planes[FB_MAX_PLANES];
             memcpy(planes, d->planes, sizeof(Plane) * (size_t)d->nplanes);
-            for (int comp = 0; comp < 5; comp++) {
+            for (int comp = 0; comp < (P->maxBend > 0.0f ? 6 : 5); comp++) {
                 float cp, cm;
                 for (int side = 0; side < 2; side++) {
                     float delta = side == 0 ? kEps : -kEps;
@@ -718,7 +718,8 @@ Score eval_run(Evaluator* e, const Design* d, Grad* grad, float collisionScale, 
                     Plane keep = *pl;
                     if (comp == 0) h2.phi += delta;
                     else if (comp < 4) v3set(&pl->n, comp - 1, v3get(pl->n, comp - 1) + delta);
-                    else pl->d += delta;
+                    else if (comp == 4) pl->d += delta;
+                    else pl->k += delta;
                     V3 pv, ax;
                     hinge_frame(d, planes, &h2, &pv, &ax);
                     *pl = keep;
@@ -775,65 +776,31 @@ Score eval_run(Evaluator* e, const Design* d, Grad* grad, float collisionScale, 
         }
     }
 
-    // 7. one piece: per body, what lies apart from its largest part (6-connected lattice points)
+    // 7. one piece: per body, what lies apart from its largest part: pushed out of the body where it meets another
     if (P->onePieceWeight > 0.0f) {
         const size_t N = (size_t)M * M * M;
-        int* comp = FB_NEW(int, N);
-        int* stack = FB_NEW(int, N);
-        for (size_t k = 0; k < N; k++) comp[k] = -1;
-        int ncomp = 0;
-        FB_ARRAY(int) size = { 0 };
-        FB_ARRAY(int) owner = { 0 };
-        for (size_t s0 = 0; s0 < N; s0++) {
-            if (comp[s0] >= 0 || L.label[s0] < 0) continue;
-            int b = L.label[s0], cnt = 0, top = 0;
-            stack[top++] = (int)s0;
-            comp[s0] = ncomp;
-            while (top) {
-                int c = stack[--top];
-                cnt++;
-                int i = c % M, j = (c / M) % M, k = c / (M * M);
-                int nb[6] = { i > 0 ? c - 1 : -1, i < M - 1 ? c + 1 : -1, j > 0 ? c - M : -1, j < M - 1 ? c + M : -1, k > 0 ? c - M * M : -1,
-                              k < M - 1 ? c + M * M : -1 };
-                for (int q = 0; q < 6; q++)
-                    if (nb[q] >= 0 && comp[nb[q]] < 0 && L.label[nb[q]] == b) {
-                        comp[nb[q]] = ncomp;
-                        stack[top++] = nb[q];
-                    }
-            }
-            fb_push(&size, cnt);
-            fb_push(&owner, b);
-            ncomp++;
-        }
-        int largest[FB_MAX_BODIES];
-        for (int b = 0; b < NB; b++) largest[b] = -1;
-        for (int c = 0; c < ncomp; c++)
-            if (largest[owner.data[c]] < 0 || size.data[c] > size.data[largest[owner.data[c]]]) largest[owner.data[c]] = c;
-        double apart = 0;
-        for (int c = 0; c < ncomp; c++)
-            if (c != largest[owner.data[c]]) {
-                apart += size.data[c];
-                sc.fragmentParts++;
-            }
-        sc.fragments = (float)(apart / fb_maxi(total, 1));
+        unsigned char* flag = FB_NEW(unsigned char, N);
+        int parts = 0;
+        const int bad = lattice_apart(M, L.label, NB, flag, NULL, &parts);
+        sc.fragmentParts = parts;
+        sc.fragments = (float)bad / (float)fb_maxi(total, 1);
         sc.onePiece = sc.fragments;
-        if (grad && apart > 0) {
+        if (grad && bad > 0) {
             const float w = -P->onePieceWeight / (float)fb_maxi(total, 1) / cell;
             for (size_t s0 = 0; s0 < N; s0++) {
-                int c = comp[s0];
-                if (c < 0 || c == largest[owner.data[c]]) continue;
+                if (!flag[s0]) continue;
+                const int b = L.label[s0];
                 int i = (int)(s0 % M), j = (int)((s0 / M) % M), k = (int)(s0 / ((size_t)M * M));
-                bool edge = i == 0 || j == 0 || k == 0 || i == M - 1 || j == M - 1 || k == M - 1 || comp[s0 - 1] != c || comp[s0 + 1] != c ||
-                            comp[s0 - M] != c || comp[s0 + M] != c || comp[s0 - (size_t)M * M] != c || comp[s0 + (size_t)M * M] != c;
+                // (where it meets something else: there the boundary can move)
+                bool edge = i == 0 || j == 0 || k == 0 || i == M - 1 || j == M - 1 || k == M - 1;
+                const size_t nbs[6] = { s0 - 1, s0 + 1, s0 - M, s0 + M, s0 - (size_t)M * M, s0 + (size_t)M * M };
+                for (int e = 0; e < 6 && !edge; e++) edge = L.label[nbs[e]] != b || flag[nbs[e]] != flag[s0];
                 if (!edge) continue;
-                Slope sl = { 1, owner.data[c], -1, lattice_point(&L, i, j, k), v3(0, 0, 0), w, v3(0, 0, 0), 0 };
+                Slope sl = { 1, b, -1, lattice_point(&L, i, j, k), v3(0, 0, 0), w, v3(0, 0, 0), 0 };
                 fb_push(&slopes, sl);
             }
         }
-        fb_free_array(&size);
-        fb_free_array(&owner);
-        free(comp);
-        free(stack);
+        free(flag);
     }
 
     // 8. the surface: hollows carving into the sphere's surface cost (it should stay a sphere, to roll)
@@ -873,7 +840,7 @@ Score eval_run(Evaluator* e, const Design* d, Grad* grad, float collisionScale, 
     // 9. the slopes into the gradient
     if (grad) {
         // the parameters the transforms depend on: each hinge's phi and angle, each plane a hinge sits on
-        TParam* tp = FB_NEW(TParam, 2 * FB_MAX_BODIES + 4 * FB_MAX_PLANES);
+        TParam* tp = FB_NEW(TParam, 2 * FB_MAX_BODIES + 5 * FB_MAX_PLANES);
         int ntp = 0;
         bool planeUsed[FB_MAX_PLANES] = { 0 };
         for (int h = 0; h < d->nhinges; h++) {
@@ -883,7 +850,7 @@ Score eval_run(Evaluator* e, const Design* d, Grad* grad, float collisionScale, 
         }
         for (int p = 0; p < d->nplanes; p++)
             if (planeUsed[p])
-                for (int c = 0; c < 4; c++) tp[ntp++] = (TParam){ 1, p, c };
+                for (int c = 0; c < (P->maxBend > 0.0f ? 5 : 4); c++) tp[ntp++] = (TParam){ 1, p, c };   // (n, d, the bend)
         bool need[MAX_POSES] = { 0 };
         for (int k = 0; k < slopes.count; k++) need[slopes.data[k].pose] = true;
         Rigid*** pert = FB_NEW(Rigid**, np);
@@ -912,11 +879,11 @@ Score eval_run(Evaluator* e, const Design* d, Grad* grad, float collisionScale, 
         for (int c = 0; c < chunks; c++) {
             const Grad* pg = part[c];
             for (int pl = 0; pl < d->nplanes; pl++)
-                for (int q = 0; q < 4; q++) grad->plane[pl][q] += pg->plane[pl][q];
+                for (int q = 0; q < 5; q++) grad->plane[pl][q] += pg->plane[pl][q];
             for (int hi = 0; hi < d->nhinges; hi++)
                 for (int q = 0; q < 2; q++) grad->hinge[hi][q] += pg->hinge[hi][q];
             for (int ho = 0; ho < d->nhollows; ho++)
-                for (int q = 0; q < 7; q++) grad->hollow[ho][q] += pg->hollow[ho][q];
+                for (int q = 0; q < FB_HOLLOW_PARAMS; q++) grad->hollow[ho][q] += pg->hollow[ho][q];
             for (int q = 0; q < 4; q++) grad->place[q] += pg->place[q];
             free(part[c]);
         }
@@ -946,4 +913,68 @@ Score eval_run(Evaluator* e, const Design* d, Grad* grad, float collisionScale, 
     lattice_free(&L);
     sc.ms = (fb_now() - began) * 1e3;
     return sc;
+}
+
+// ---- what lies apart on a lattice
+
+int lattice_apart(int M, const int* label, int nlabels, unsigned char* flagOut, int* perBody, int* parts) {
+    const size_t N = (size_t)M * M * M;
+    int* comp = FB_NEW(int, N);
+    int* stack = FB_NEW(int, N);
+    unsigned char* flag = flagOut ? flagOut : FB_NEW(unsigned char, N);
+    memset(flag, 0, N);
+    for (size_t k = 0; k < N; k++) comp[k] = -1;
+    #define NBRS(c)                                                                                                     \
+        int ci_ = (c) % M, cj_ = ((c) / M) % M, ck_ = (c) / (M * M);                                                    \
+        int nb[6] = { ci_ > 0 ? (c) - 1 : -1, ci_ < M - 1 ? (c) + 1 : -1, cj_ > 0 ? (c) - M : -1, cj_ < M - 1 ? (c) + M : -1, \
+                      ck_ > 0 ? (c) - M * M : -1, ck_ < M - 1 ? (c) + M * M : -1 }
+    FB_ARRAY(int) size = { 0 };
+    FB_ARRAY(int) owner = { 0 };
+    for (size_t s0 = 0; s0 < N; s0++) {
+        if (comp[s0] >= 0 || label[s0] < 0) continue;
+        const int b = label[s0], id = size.count;
+        int cnt = 0, top = 0;
+        stack[top++] = (int)s0;
+        comp[s0] = id;
+        while (top) {
+            int c = stack[--top];
+            cnt++;
+            NBRS(c);
+            for (int q = 0; q < 6; q++)
+                if (nb[q] >= 0 && comp[nb[q]] < 0 && label[nb[q]] == b) {
+                    comp[nb[q]] = id;
+                    stack[top++] = nb[q];
+                }
+        }
+        fb_push(&size, cnt);
+        fb_push(&owner, b);
+    }
+    int* largest = FB_NEW(int, nlabels);
+    for (int b = 0; b < nlabels; b++) largest[b] = -1;
+    for (int c = 0; c < size.count; c++) {
+        const int b = owner.data[c];
+        if (b < nlabels && (largest[b] < 0 || size.data[c] > size.data[largest[b]])) largest[b] = c;
+    }
+    int np = 0;
+    for (int c = 0; c < size.count; c++)
+        if (owner.data[c] < nlabels && c != largest[owner.data[c]]) np++;
+    if (parts) *parts = np;
+    for (size_t k = 0; k < N; k++)
+        if (comp[k] >= 0 && label[k] < nlabels && comp[k] != largest[label[k]]) flag[k] = 1;
+    int count = 0;
+    if (perBody) memset(perBody, 0, sizeof(int) * (size_t)nlabels);
+    for (size_t k = 0; k < N; k++) {
+        if (label[k] < 0 || label[k] >= nlabels) continue;
+        if (flag[k]) {
+            count++;
+            if (perBody) perBody[label[k]]++;
+        }
+    }
+    free(largest);
+    fb_free_array(&size);
+    fb_free_array(&owner);
+    free(comp);
+    free(stack);
+    if (!flagOut) free(flag);
+    return count;
 }

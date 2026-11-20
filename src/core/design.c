@@ -81,6 +81,62 @@ float hollow_field(const Hollow* h, V3 q) {
     return v3dist(q, v3mad(h->a, ab, t)) - h->r;
 }
 
+void plane_param_grad(const Plane* p, V3 q, float g[5]) {
+    float a = v3dot(p->n, q) - p->d;
+    V3 u = v3sub(q, v3scale(p->n, p->d));
+    float u2 = v3dot(u, u);
+    if (p->k == 0.0f) {
+        // flat: q, -1, and the bend's pull, -(|u|^2 - a^2) / 2 (so a cut can start to bend from flat)
+        g[0] = q.x;
+        g[1] = q.y;
+        g[2] = q.z;
+        g[3] = -1.0f;
+        g[4] = -0.5f * (u2 - a * a);
+        return;
+    }
+    // bent: central differences, in double (the closed form's terms cancel)
+    double par[5] = { p->n.x, p->n.y, p->n.z, p->d, p->k };
+    for (int c = 0; c < 5; c++) {
+        double e = c == 4 ? 1e-4 : 1e-5, f2[2];
+        for (int s = 0; s < 2; s++) {
+            double x[5];
+            memcpy(x, par, sizeof x);
+            x[c] += s == 0 ? e : -e;
+            double A = x[0] * q.x + x[1] * q.y + x[2] * q.z - x[3];
+            double ux = q.x - x[0] * x[3], uy = q.y - x[1] * x[3], uz = q.z - x[2] * x[3], U = ux * ux + uy * uy + uz * uz;
+            f2[s] = (2.0 * A - x[4] * U) / (1.0 + sqrt(fmax(0.0, 1.0 - 2.0 * A * x[4] + x[4] * x[4] * U)));
+        }
+        g[c] = (float)((f2[0] - f2[1]) / (2.0 * e));
+    }
+}
+
+void plane_seam(const Plane* p, float r, float* h, float* rho) {
+    // the two spheres |q| = r and |q - n (d + 1/k)| = 1/|k| meet where n.q = (k (r^2 + d^2) + 2d) / (2 (1 + k d))
+    const float k = p->k, d = p->d;
+    float off = k == 0.0f ? d : (k * (r * r + d * d) + 2.0f * d) / (2.0f * fmaxf(1.0f + k * d, 0.05f));
+    off = fb_clamp(off, -r, r);
+    *h = off;
+    *rho = sqrtf(fb_max(r * r - off * off, 1e-6f));
+}
+
+static float seam_offset(float k, float d, float r) {
+    return k == 0.0f ? d : (k * (r * r + d * d) + 2.0f * d) / (2.0f * (1.0f + k * d));
+}
+
+float plane_bend_ok(const Plane* p, float r) {
+    const float lim = fmaxf(fabsf(p->d), 0.9f * r);
+    #define FINE(k) (1.0f + (k) * p->d >= 0.2f && fabsf(seam_offset((k), p->d, r)) <= lim)
+    if (FINE(p->k)) return p->k;
+    float lo = 0.0f, hi = p->k;      // lo fine, hi not
+    for (int it = 0; it < 30; it++) {
+        float mid = 0.5f * (lo + hi);
+        if (FINE(mid)) lo = mid;
+        else hi = mid;
+    }
+    #undef FINE
+    return lo;
+}
+
 float body_cell(const Design* d, int b, V3 q, Active* act) {
     const Body* body = &d->bodies[b];
     float best = FLT_MAX;
@@ -91,7 +147,7 @@ float body_cell(const Design* d, int b, V3 q, Active* act) {
         int vp = -1, vs = 0;
         for (int k = 0; k < cell->n; k++) {
             const Plane* p = &d->planes[cell->plane[k]];
-            float s = cell->sign[k] * (v3dot(p->n, q) - p->d);
+            float s = cell->sign[k] * plane_field(p, q);
             if (s > v) { v = s; vp = cell->plane[k]; vs = cell->sign[k]; }
         }
         if (v < best) { best = v; bp = vp; bs = vs; }
@@ -198,9 +254,9 @@ void hinge_frame(const Design* d, const Plane* planes, const Hinge* h, V3* pivot
     V3 e1 = v3sub(h->ref, v3scale(n, v3dot(n, h->ref)));
     e1 = v3len(e1) > 1e-6f ? v3norm(e1) : v3perp(n);
     V3 e2 = v3cross(n, e1);
-    float ri = d->R - d->inset;
-    float rho = sqrtf(fb_max(ri * ri - p->d * p->d, 1e-6f));
-    V3 c = v3scale(n, p->d);
+    float off, rho;
+    plane_seam(p, d->R - d->inset, &off, &rho);
+    V3 c = v3scale(n, off);
     float cs = cosf(h->phi), sn = sinf(h->phi);
     *pivot = v3add(c, v3scale(v3add(v3scale(e1, cs), v3scale(e2, sn)), rho));
     *axis = v3add(v3scale(e1, -sn), v3scale(e2, cs));
@@ -312,7 +368,8 @@ bool design_save(const Design* d, const char* path, char* err, int errSize) {
     fprintf(f, "mm %.9g nextid %d built %d\n", d->mmPerUnit, d->nextId, d->built ? 1 : 0);
     fprintf(f, "planes %d\n", d->nplanes);
     for (int p = 0; p < d->nplanes; p++)
-        fprintf(f, "%d %.9g %.9g %.9g %.9g\n", d->planes[p].id, d->planes[p].n.x, d->planes[p].n.y, d->planes[p].n.z, d->planes[p].d);
+        fprintf(f, "%d %.9g %.9g %.9g %.9g %.9g\n", d->planes[p].id, d->planes[p].n.x, d->planes[p].n.y, d->planes[p].n.z, d->planes[p].d,
+                d->planes[p].k);
     fprintf(f, "bodies %d %d\n", d->nbodies, d->root);
     for (int b = 0; b < d->nbodies; b++) {
         const Body* body = &d->bodies[b];
@@ -400,6 +457,10 @@ bool design_load(Design* d, const char* path, char* err, int errSize) {
     for (int p = 0; ok && p < n->nplanes; p++) {
         Plane* pl = &n->planes[p];
         ok = fscanf(f, "%d %f %f %f %f", &pl->id, &pl->n.x, &pl->n.y, &pl->n.z, &pl->d) == 5;
+        // (the bend: files from before bent cuts end the line here)
+        char rest[128];
+        pl->k = 0.0f;
+        if (ok && fgets(rest, sizeof(rest), f)) sscanf(rest, "%f", &pl->k);
     }
     ok = ok && fscanf(f, " bodies %d %d", &n->nbodies, &n->root) == 2 && n->nbodies >= 1 && n->nbodies <= FB_MAX_BODIES;
     for (int b = 0; ok && b < n->nbodies; b++) {

@@ -39,7 +39,8 @@ writes the best design too. The run's folder (`foldball_out/<mesh>_<n>/`) keeps 
 `report.txt`, `history.csv` and (with `--post`) the built design and its STL parts.
 
 In the GUI: Load mesh, Start (Pause / Resume / Stop), watch the design (drag to orbit, the pose slider or
-"animate" moves it between closed and open), the loss over the steps, and the pictures the loss compares (red the
+"animate" moves it between closed and open; checkboxes show or hide the target, the hinges, the closed sphere and
+the floor grid), the loss over the steps, and the pictures the loss compares (red the
 design, green the target, white both). Load design starts from a saved design; Save design and Save / Load settings
 keep them. Post process and Export STL finish it. Every setting is in the panel (hover for what it does).
 
@@ -67,6 +68,16 @@ sphere exactly. Everything is an exact analytic distance field (the sphere, half
 so nothing is limited by a resolution but the meshes made for drawing and printing. Material can be taken from the
 sphere by *hollows* (capsules), and every bit of the sphere's surface a hollow takes costs (`surface_weight`): the
 ball should stay a ball, to roll.
+
+**Bent cuts** (`model.max_bend`, 0 by default: flat cuts only). A cut can bend into a piece of a sphere of radius
+1/|k| through the plane's own point n d (its centre n (d + 1/k): k > 0 bulges toward -n, k < 0 toward +n), and k is
+one more parameter Adam moves (`optimizer.lr_bend`), within max_bend / R (1: as round as the ball). Its field is the
+exact signed distance to that sphere, written as (2a - k|u|^2) / (1 + sqrt(1 - 2ak + k^2|u|^2)) with a = n.q - d and
+u = q - n d, so it is exactly n.q - d at k = 0 and has no 1/k to blow up near it; the gradient in k at flat,
+-(|u|^2 - a^2) / 2, is what lets a cut start to bend. Every cut starts flat, so nothing jumps when one is made. Two
+spheres meet in a circle, so a bent cut's seam is still a circle (in the plane n.q = (k(r^2 + d^2) + 2d) / (2(1 + kd)))
+and its hinges sit exactly on it, the axis along it. A bend is held back where the cut would stop crossing the hinges'
+sphere (it would close into a bubble inside the ball, which no hinge could reach).
 
 A hinge sits on the seam of the plane it was cut along: where that plane meets the sphere, inset by the knuckle
 radius (`knuckle_radius_mm`), its axis along the seam. Its parameters are where on the seam (an angle, `phi`) and how

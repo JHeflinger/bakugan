@@ -73,7 +73,7 @@ static unsigned long long shape_signature(const Design* d) {
     #define MIX(ptr, bytes) do { const unsigned char* p_ = (const unsigned char*)(ptr); \
             for (size_t i_ = 0; i_ < (size_t)(bytes); i_++) { h ^= p_[i_]; h *= 1099511628211ull; } } while (0)
     MIX(&d->nplanes, sizeof(int));
-    for (int k = 0; k < d->nplanes; k++) { MIX(&d->planes[k].n, sizeof(V3)); MIX(&d->planes[k].d, sizeof(float)); }
+    for (int k = 0; k < d->nplanes; k++) { MIX(&d->planes[k].n, sizeof(V3)); MIX(&d->planes[k].d, sizeof(float)); MIX(&d->planes[k].k, sizeof(float)); }
     MIX(&d->nbodies, sizeof(int));
     for (int b = 0; b < d->nbodies; b++) {
         MIX(&d->bodies[b].ncells, sizeof(int));

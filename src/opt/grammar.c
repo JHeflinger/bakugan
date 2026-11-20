@@ -30,6 +30,7 @@ static int cmp_f(const void* a, const void* b) {
 
 typedef FB_ARRAY(V3) Points;
 
+
 // ---- split
 
 typedef struct {
@@ -332,30 +333,18 @@ static bool rule_merge(Design* d, const Params* p, Rng* rng) {
     return true;
 }
 
-static bool rule_join(Design* d, const Params* p, Rng* rng) {
-    if (d->nbodies < 3) return false;
-    Lattice L;
-    lattice_build(d, fb_maxi(p->samples, 16), &L);
+static bool join_body(Design* d, int X, const Lattice* Lp) {
+    const Lattice L = *Lp;
     const int M = L.M;
     const size_t N = (size_t)M * M * M;
-    int count[FB_MAX_BODIES] = { 0 }, total = 0;
-    for (size_t k = 0; k < N; k++)
-        if (L.label[k] >= 0) { count[L.label[k]]++; total++; }
-    int cand[FB_MAX_BODIES], nc = 0;
-    for (int b = 0; b < d->nbodies; b++) {
-        if (d->bodies[b].id == d->root || design_parent_hinge(d, d->bodies[b].id) < 0) continue;
-        if (total > 0 && (float)count[b] / total > p->joinShare) continue;
-        cand[nc++] = b;
-    }
-    if (nc == 0) { lattice_free(&L); return false; }
-    for (int a = 0; a < nc; a++)
-        for (int b = a + 1; b < nc; b++)
-            if (count[cand[b]] < count[cand[a]]) { int t = cand[a]; cand[a] = cand[b]; cand[b] = t; }
-    int pick = 0;
-    while (pick + 1 < nc && rng_uniform(rng) < 0.5f) pick++;
-    const int X = cand[pick], xid = d->bodies[X].id;
+    const int xid = d->bodies[X].id;
     const int upIndex = design_parent_hinge(d, xid);
+    if (upIndex < 0) return false;
     const Hinge up = d->hinges[upIndex];
+    {
+        const int Pb = design_body(d, up.parent);
+        if (Pb < 0 || d->bodies[Pb].ncells + d->bodies[X].ncells > FB_MAX_CELLS) return false;
+    }
     const Rigid Rup = rabout(up.pivot, up.axis, up.angle);
     // each hinge that hung from X: its angle chosen to take its pieces (opened) as near as it can to where X's hinge
     // and its own took them (its axis stays on its seam)
@@ -387,12 +376,38 @@ static bool rule_join(Design* d, const Params* p, Rng* rng) {
         j->angle = best;
         j->order = fb_mini(j->order, up.order);
     }
-    lattice_free(&L);
     const int P = design_body(d, up.parent);
     remove_hinge(d, upIndex);
     if (P < 0 || !absorb(d, P, design_body(d, xid))) return false;
     design_tidy(d);
     return true;
+}
+
+static bool rule_join(Design* d, const Params* p, Rng* rng) {
+    if (d->nbodies < 3) return false;
+    Lattice L;
+    lattice_build(d, fb_maxi(p->samples, 16), &L);
+    const int M = L.M;
+    const size_t N = (size_t)M * M * M;
+    int count[FB_MAX_BODIES] = { 0 }, total = 0;
+    for (size_t k = 0; k < N; k++)
+        if (L.label[k] >= 0) { count[L.label[k]]++; total++; }
+    int cand[FB_MAX_BODIES], nc = 0;
+    for (int b = 0; b < d->nbodies; b++) {
+        if (d->bodies[b].id == d->root || design_parent_hinge(d, d->bodies[b].id) < 0) continue;
+        if (total > 0 && (float)count[b] / total > p->joinShare) continue;
+        cand[nc++] = b;
+    }
+    if (nc == 0) { lattice_free(&L); return false; }
+    for (int a = 0; a < nc; a++)
+        for (int b = a + 1; b < nc; b++)
+            if (count[cand[b]] < count[cand[a]]) { int t = cand[a]; cand[a] = cand[b]; cand[b] = t; }
+    int pick = 0;
+    while (pick + 1 < nc && rng_uniform(rng) < 0.5f) pick++;
+    const int X = cand[pick];
+    bool ok = join_body(d, X, &L);
+    lattice_free(&L);
+    return ok;
 }
 
 // ---- carve and uncarve
@@ -436,6 +451,7 @@ static bool rule_uncarve(Design* d, const Params* p, Rng* rng) {
     d->hollows[pick] = d->hollows[--d->nhollows];
     return true;
 }
+
 
 bool rule_apply(int rule, Design* d, const Params* p, Rng* rng, struct Evaluator* ev, float collisionScale) {
     switch (rule) {
