@@ -61,9 +61,10 @@ for i in "${!PANES[@]}"; do
     config="${FILES[$i]}"
 
     echo "Launching $INPUT_SHAPE with $config"
-
+	
+    tmux send-keys -t "$pane" "source ~/ort11/env.sh" C-m
     tmux send-keys -t "$pane" "cd ../../" C-m
-    tmux send-keys -t "$pane" "tiny -r optimize \"../../assets/test_shapes/$INPUT_SHAPE\" -c \"$config\"" C-m
+    tmux send-keys -t "$pane" "tiny -r optimize \"../../models/OBJ/naked/$INPUT_SHAPE\" -c \"$config\"" C-m
 done
 
 # Attach
